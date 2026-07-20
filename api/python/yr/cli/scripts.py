@@ -1334,7 +1334,11 @@ yrcli download {package_key} to download this package."""
     if function_json:
         name = function_json.get("name")
         if name is None:
-            raise click.ClickException("function name is required to deploy function.")
+            raise click.ClickException(
+                "function name is required to deploy function. use <func_name>, "
+                "0-<service_name>-<func_name>, or 0@<service_name>@<func_name> "
+                "(1-128 chars: letters, digits, '.', and '-')."
+            )
         version = "latest" if function_json.get("kind", "faas") == "faas" else "$latest"
         name = FunctionName(name, version)
         query_ret, function_info = query_function(name, __user)
