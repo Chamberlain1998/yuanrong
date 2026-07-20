@@ -143,7 +143,8 @@ url = 'http://{frontend_endpoint}/serverless/v1/stream/subscribe'
 headers = {
     'X-Stream-Name': 'this-stream',
     'X-Expect-Num': '10',
-    'X-Timeout-Ms': '5000'
+    'X-Timeout-Ms': '5000',
+    'X-Tenant-Id': 'default'
 }
 
 # 发送请求并启用流式响应
