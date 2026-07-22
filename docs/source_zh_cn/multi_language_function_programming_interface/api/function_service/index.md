@@ -25,6 +25,10 @@
    update_reserve_instance
    get_reserve_instance
    delete_reserve_instance
+
+   create_agent_instance
+   delete_agent_instance
+   agent_invoke_channels
 ```
 
 本节向您介绍函数服务 API，用于开发、管理 Serverless 服务类应用。
@@ -57,3 +61,9 @@
 - [更新预留实例配置](./update_reserve_instance.md)
 - [查询预留实例配置](./get_reserve_instance.md)
 - [删除预留实例配置](./delete_reserve_instance.md)
+
+## Agent 实例管理
+
+- [创建 Agent 实例](./create_agent_instance.md)
+- [删除 Agent 实例](./delete_agent_instance.md)
+- [Agent 实例协议调用通道](./agent_invoke_channels.md)

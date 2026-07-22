@@ -25,6 +25,10 @@
    update_reserve_instance
    get_reserve_instance
    delete_reserve_instance
+
+   create_agent_instance
+   delete_agent_instance
+   agent_invoke_channels
 ```
 
 This section introduces the Function Service API for developing, managing, and invoking Serverless service applications.
@@ -57,3 +61,9 @@ This section introduces the Function Service API for developing, managing, and i
 - [Update Reserved Instance Configuration](./update_reserve_instance.md)
 - [Query Reserved Instance Configuration](./get_reserve_instance.md)
 - [Delete Reserved Instance Configuration](./delete_reserve_instance.md)
+
+## Agent Instance Management
+
+- [Create Agent Instance](./create_agent_instance.md)
+- [Delete Agent Instance](./delete_agent_instance.md)
+- [Agent Instance Protocol Invocation Channels](./agent_invoke_channels.md)
