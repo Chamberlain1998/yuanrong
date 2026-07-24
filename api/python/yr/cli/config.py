@@ -27,7 +27,7 @@ from typing import Optional
 try:
     import tomllib
 except ImportError:
-    from pip._vendor import tomli as tomllib
+    import tomli as tomllib
 
 import tomli_w
 from jinja2 import Environment, StrictUndefined

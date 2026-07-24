@@ -62,6 +62,86 @@ def load_setup_module(setup_type=""):
 
 
 class SetupPackagingTest(unittest.TestCase):
+    def test_python_dependency_ranges_preserve_existing_lower_bounds(self):
+        expected_requirements = [
+            "cloudpickle==3.1.2",
+            "msgpack>=1.0.5",
+            'protobuf>=4.25.5,<8; python_version < "3.14"',
+            'protobuf>=7.35.1,<8; python_version >= "3.14"',
+            "pyyaml>=6.0.0",
+            "click>=8.0.0,<9",
+            'tomli>=2; python_version < "3.11"',
+            "tomli-w>=1.2.0",
+            "Jinja2>=3.1.6",
+            "requests>=2.32.5",
+            "websockets>=15.0",
+            "aiohttp>=3.9.0",
+            "httpx>=0.27.0",
+        ]
+        requirements = (REPO_ROOT / "api" / "python" / "requirements.txt").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(requirements.splitlines(), expected_requirements)
+
+        expected_by_setup_type = {
+            "sdk": [
+                "cloudpickle==3.1.2",
+                "msgpack>=1.0.5",
+                'protobuf>=4.25.5,<8; python_version < "3.14"',
+                'protobuf>=7.35.1,<8; python_version >= "3.14"',
+                "pyyaml>=6.0.0",
+                "click>=8.0.0,<9",
+                'tomli>=2; python_version < "3.11"',
+                "tomli-w>=1.2.0",
+                "Jinja2>=3.1.6",
+                "requests>=2.32.5",
+                "websockets>=15.0",
+                "aiohttp>=3.9.0",
+                "httpx>=0.27.0",
+            ],
+            "full": [
+                "cloudpickle==3.1.2",
+                "msgpack>=1.0.5",
+                'protobuf>=4.25.5,<8; python_version < "3.14"',
+                'protobuf>=7.35.1,<8; python_version >= "3.14"',
+                "pyyaml>=6.0.2",
+                "click>=8.1.8",
+                "requests>=2.32.5",
+                "websockets>=15.0.1",
+                "aiohttp>=3.9.0",
+                "httpx>=0.27.0",
+                'tomli>=2; python_version < "3.11"',
+                "tomli-w>=1.2.0",
+                "Jinja2>=3.1.6",
+            ],
+            "": [
+                "cloudpickle==3.1.2",
+                "msgpack>=1.0.5",
+                'protobuf>=4.25.5,<8; python_version < "3.14"',
+                'protobuf>=7.35.1,<8; python_version >= "3.14"',
+                "pyyaml>=6.0.0",
+                "click>=8.0.0,<9",
+                "requests>=2.32.5",
+                "websockets>=13.0",
+                "aiohttp>=3.9.0",
+                "httpx>=0.27.0",
+                'tomli>=2; python_version < "3.11"',
+                "tomli-w>=1.2.0",
+                "Jinja2>=3.1.6",
+            ],
+        }
+        for setup_type, expected in expected_by_setup_type.items():
+            with self.subTest(setup_type=setup_type or "default"):
+                setup_mod = load_setup_module(setup_type)
+                self.assertEqual(setup_mod.setup_spec.install_requires, expected)
+
+    def test_cli_config_uses_declared_tomli_fallback(self):
+        config_source = (
+            REPO_ROOT / "api" / "python" / "yr" / "cli" / "config.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("import tomli as tomllib", config_source)
+        self.assertNotIn("pip._vendor", config_source)
+
     def test_runtime_bazel_package_includes_metrics_exporters(self):
         build_rule = (REPO_ROOT / "api" / "python" / "BUILD.bazel").read_text()
         package_rule_start = build_rule.index('name = "yr_python_pkg"')
