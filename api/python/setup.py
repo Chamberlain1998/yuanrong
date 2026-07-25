@@ -144,16 +144,18 @@ if setup_type_env == "sdk":
     )
     setup_spec.install_requires = [
         "cloudpickle==3.1.2",
-        "msgpack==1.0.5",
-        'protobuf==4.25.5; python_version < "3.14"',
+        "msgpack>=1.0.5",
+        'protobuf>=4.25.5,<8; python_version < "3.14"',
         'protobuf>=7.35.1,<8; python_version >= "3.14"',
-        "cython==3.0.10",
         "pyyaml>=6.0.0",
         "click>=8.0.0,<9",
-        "requests==2.32.5",
+        'tomli>=2; python_version < "3.11"',
+        "tomli-w>=1.2.0",
+        "Jinja2>=3.1.6",
+        "requests>=2.32.5",
         "websockets>=15.0",
-        "aiohttp>=3.9.0",   # tunnel_server Port B HTTP/WS server
-        "httpx>=0.27.0",    # tunnel_client async HTTP forwarding
+        "aiohttp>=3.9.0",  # tunnel_server Port B HTTP/WS server
+        "httpx>=0.27.0",   # tunnel_client async HTTP forwarding
     ]
     setup_spec.entry_points = {
         "console_scripts": [
@@ -205,17 +207,18 @@ elif setup_type_env == "full":
     )
     setup_spec.install_requires = [
         "cloudpickle==3.1.2",
-        "msgpack==1.0.5",
-        "protobuf==4.25.5",
-        "cython==3.0.10",
-        "pyyaml==6.0.2",
-        "click==8.1.8",
-        "requests==2.32.5",
-        "websockets==15.0.1",
+        "msgpack>=1.0.5",
+        'protobuf>=4.25.5,<8; python_version < "3.14"',
+        'protobuf>=7.35.1,<8; python_version >= "3.14"',
+        "pyyaml>=6.0.2",
+        "click>=8.1.8",
+        "requests>=2.32.5",
+        "websockets>=15.0.1",
         "aiohttp>=3.9.0",
         "httpx>=0.27.0",
-        "tomli_w==1.2.0",
-        "Jinja2==3.1.6",
+        'tomli>=2; python_version < "3.11"',
+        "tomli-w>=1.2.0",
+        "Jinja2>=3.1.6",
     ]
     setup_spec.entry_points = {
         "console_scripts": [
@@ -231,17 +234,18 @@ else:
     )
     setup_spec.install_requires = [
         "cloudpickle==3.1.2",
-        "msgpack==1.0.5",
-        "protobuf==4.25.5",
-        "cython==3.0.10",
+        "msgpack>=1.0.5",
+        'protobuf>=4.25.5,<8; python_version < "3.14"',
+        'protobuf>=7.35.1,<8; python_version >= "3.14"',
         "pyyaml>=6.0.0",
         "click>=8.0.0,<9",
-        "requests==2.32.5",
+        "requests>=2.32.5",
         "websockets>=13.0",
         "aiohttp>=3.9.0",
         "httpx>=0.27.0",
-        "tomli_w==1.2.0",
-        "Jinja2==3.1.6",
+        'tomli>=2; python_version < "3.11"',
+        "tomli-w>=1.2.0",
+        "Jinja2>=3.1.6",
     ]
     setup_spec.extras["cpp"] = [f"{base_name}_cpp_sdk==" + setup_spec.version]
     setup_spec.extras["dashboard"] = [f"{base_name}_dashboard==" + setup_spec.version]

@@ -45,6 +45,48 @@ logger = logging.getLogger(__name__)
 _WS_CHANNEL_QUEUE_MAX = 100
 _PENDING_RESPONSE_TTL = 120.0  # seconds
 _CONNECT_FAILURE_WARNING_THRESHOLD = 5
+_HOP_BY_HOP_REQUEST_HEADERS = frozenset({
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+})
+
+
+def _headers_for_rebuilt_request(
+    headers: dict[str, str],
+    body: bytes,
+) -> dict[str, str]:
+    """Build headers for a new upstream HTTP connection.
+
+    TunnelServer has already decoded the first hop's body framing. Connection
+    metadata from that hop must therefore not be reused when httpx creates the
+    upstream request.
+    """
+    connection_tokens = {
+        token.strip().lower()
+        for name, value in headers.items()
+        if name.lower() == "connection"
+        for token in value.split(",")
+        if token.strip()
+    }
+    excluded = (
+        _HOP_BY_HOP_REQUEST_HEADERS
+        | connection_tokens
+        | {"content-length", "host"}
+    )
+    outgoing_headers = {
+        name: value
+        for name, value in headers.items()
+        if name.lower() not in excluded
+    }
+    outgoing_headers["Content-Length"] = str(len(body))
+    return outgoing_headers
 
 
 def _env_truthy(name: str) -> bool:
@@ -404,7 +446,10 @@ class TunnelClient:
                 resp = await http.request(
                     method=frame.method,
                     url=frame.path,
-                    headers=frame.headers,
+                    headers=_headers_for_rebuilt_request(
+                        frame.headers,
+                        frame.body,
+                    ),
                     content=frame.body,
                 )
                 resp_frame = HttpRespFrame(

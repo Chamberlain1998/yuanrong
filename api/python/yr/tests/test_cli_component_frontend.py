@@ -74,24 +74,61 @@ class TestFrontendInitArgsPatch(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             template = Path(tmpdir) / "init_frontend_args.json"
             dest = Path(tmpdir) / "init_frontend_args_temp.json"
-            template.write_text('{"leaseBypass": {frontend_lease_bypass}, "listen": "{faas_frontend_http_ip}"}')
+            template.write_text(
+                '{"leaseBypass": {frontend_lease_bypass}, "listen": "{faas_frontend_http_ip}"}'
+            )
 
-            self.make_launcher(launcher_cls, name).patch_init_frontend_args(template, dest)
+            self.make_launcher(launcher_cls, name).patch_init_frontend_args(
+                template, dest
+            )
 
             text = dest.read_text()
             self.assertNotIn("{frontend_lease_bypass}", text)
             config = json.loads(text)
             self.assertFalse(config["leaseBypass"])
 
+    def assert_patches_complete_frontend_template(self, launcher_cls, name):
+        repo_root = Path(__file__).resolve().parents[4]
+        template = repo_root / "frontend/build/init_frontend_args.json"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dest = Path(tmpdir) / "init_frontend_args_temp.json"
+
+            self.make_launcher(launcher_cls, name).patch_init_frontend_args(
+                template, dest
+            )
+
+            config = json.loads(dest.read_text())
+            self.assertEqual(config["functionInvokeBackend"], 0)
+
     def test_frontend_launcher_sets_default_lease_bypass(self):
-        frontend_launcher_cls = self.load_launcher_cls("api/python/yr/cli/component/frontend.py", "FrontendLauncher")
+        frontend_launcher_cls = self.load_launcher_cls(
+            "api/python/yr/cli/component/frontend.py", "FrontendLauncher"
+        )
         self.assert_patches_frontend_lease_bypass(frontend_launcher_cls, "frontend")
 
     def test_faas_frontend_launcher_sets_default_lease_bypass(self):
         faas_frontend_launcher_cls = self.load_launcher_cls(
             "api/python/yr/cli/component/faas_frontend.py", "FaaSFrontendLauncher"
         )
-        self.assert_patches_frontend_lease_bypass(faas_frontend_launcher_cls, "faas_frontend")
+        self.assert_patches_frontend_lease_bypass(
+            faas_frontend_launcher_cls, "faas_frontend"
+        )
+
+    def test_frontend_launcher_renders_complete_template(self):
+        frontend_launcher_cls = self.load_launcher_cls(
+            "api/python/yr/cli/component/frontend.py", "FrontendLauncher"
+        )
+        self.assert_patches_complete_frontend_template(
+            frontend_launcher_cls, "frontend"
+        )
+
+    def test_faas_frontend_launcher_renders_complete_template(self):
+        faas_frontend_launcher_cls = self.load_launcher_cls(
+            "api/python/yr/cli/component/faas_frontend.py", "FaaSFrontendLauncher"
+        )
+        self.assert_patches_complete_frontend_template(
+            faas_frontend_launcher_cls, "faas_frontend"
+        )
 
 
 if __name__ == "__main__":
