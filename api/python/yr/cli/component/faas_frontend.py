@@ -98,6 +98,7 @@ class FaaSFrontendLauncher(ComponentLauncher):
         frontend_lease_bypass = str(
             faas_values.get("frontend_lease_bypass", False)
         ).lower()
+        function_invoke_backend = str(faas_values.get("function_invoke_backend", 0))
         auth_enabled = str(faas_values.get("auth_enabled", False)).lower()
         meta_service_address = str(
             faas_args.get("meta_service_address", "")
@@ -139,6 +140,7 @@ class FaaSFrontendLauncher(ComponentLauncher):
             "{auth_enabled}": auth_enabled,
             "{meta_service_address}": meta_service_address,
             "{frontend_lease_bypass}": frontend_lease_bypass,
+            "{function_invoke_backend}": function_invoke_backend,
             "{frontendSslEnable}": frontend_https_enable,
         }
 
