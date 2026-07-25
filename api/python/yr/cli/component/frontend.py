@@ -91,6 +91,10 @@ class FrontendLauncher(ComponentLauncher):
         # they stay literal and the rendered init_frontend_args.json is invalid JSON
         # and the frontend fails to start. k8s default: auth off, IAM/meta address
         # taken from config when present, else empty (still valid JSON).
+        # functionInvokeBackend selects the function invoke backend (int). The template
+        # carries the raw {function_invoke_backend} token (no quotes), so it must be a
+        # bare integer; default 0 (libruntime direct) when unset by config.
+        function_invoke_backend = str(faas_values.get("function_invoke_backend", 0))
         frontend_https_enable = ssl_enable
         enable_func_token_auth = str(
             faas_values.get("enable_func_token_auth", False)
@@ -142,6 +146,7 @@ class FrontendLauncher(ComponentLauncher):
             "{frontend_lease_bypass}": frontend_lease_bypass,
             "{function_invoke_backend}": function_invoke_backend,
             "{frontendSslEnable}": frontend_https_enable,
+            "{function_invoke_backend}": function_invoke_backend,
         }
 
         for placeholder, value in replacements.items():
