@@ -95,6 +95,11 @@ ip = "{{ values.host_ip }}"
 port = "{{ 22772|check_port() }}"
 grpc_listen_port = "{{ 22773|check_port() }}"
 exec_grpc_port = "{{ 22774|check_port() }}"
+# TCP tunnel (frontend SSH -> instance sshd). Listener enabled only when
+# values.frontend.ssh_enable is true. Port uses check_port() so it auto-shifts
+# on conflict; override via -s values.function_proxy.tcp_tunnel_port.
+tcp_tunnel_port = "{{ 22775|check_port() }}"
+tcp_tunnel_max_connections = 1024
 
 [values.runtime_launcher]
 enable = false
@@ -126,6 +131,22 @@ sandbox_router_validate_iam = true
 ssl_enable = false
 client_auth_type = "RequireAndVerifyClientCert"
 enable_function_token_auth = false
+# SSH bastion (frontend) + TCP tunnel (function_proxy) + platform pubkey mount.
+# Off by default. sshproxy validates at startup that ssh_host_key /
+# ssh_backend_key / ssh_backend_public_key_dir are present and readable when
+# ssh_enable=true, and fails fast otherwise.
+ssh_enable = false
+# Require external client public-key auth (ssh_authorized_keys). Set false only
+# in isolated test environments (NoClientAuth); never enables password login.
+ssh_auth_enable = true
+# Binds 0.0.0.0:2222 by design (external clients connect here). Constrain
+# exposure via firewall/reverse proxy on the deployment side.
+ssh_address = ":2222"
+ssh_host_key = ""
+ssh_authorized_keys = ""
+ssh_backend_key = ""
+ssh_max_connections = 1024
+ssh_backend_public_key_dir = ""
 
 [values.function_scheduler]
 bin_path = "{{ values.yr_package_path }}/runtime/service/go/bin/goruntime"

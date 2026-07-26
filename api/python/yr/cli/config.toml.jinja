@@ -357,6 +357,14 @@ ssl_base_path = "{{ values.fs.tls.base_path }}"
 ssl_root_file = "{{ values.fs.tls.ca_file }}"
 ssl_cert_file = "{{ values.fs.tls.cert_file }}"
 ssl_key_file = "{{ values.fs.tls.key_file }}"
+# TCP tunnel for frontend SSH -> instance sshd. All three fields are gated on
+# values.frontend.ssh_enable so the listener and its port/limit appear together
+# (mirrors deploy/process/config.sh where --ssh_enable gates both sides).
+{% if values.frontend.ssh_enable %}
+enable_tcp_tunnel = true
+tcp_tunnel_port = "{{ values.function_proxy.tcp_tunnel_port }}"
+tcp_tunnel_max_connections = {{ values.function_proxy.tcp_tunnel_max_connections }}
+{% endif %}
 etcd_auth_type = "{{ values.etcd.auth_type }}"
 etcd_root_ca_file = "{{ values.etcd.auth.ca_file }}"
 etcd_cert_file = "{{ values.etcd.auth.client_cert_file }}"
@@ -629,6 +637,19 @@ YR_DATASYSTEM_DEFAULT_WRITE_MODE="{{ values.runtime.default_write_mode }}"
 INSTANCE_ID="driver-frontend-{{ values.node_id }}"
 FAAS_LOG_PATH="{{ values.fs.log.path }}"
 LOG_CONFIG = '''{{ fs_log_config | tojson }}'''
+# SSH bastion env consumed by frontend sshproxy via os.Getenv. Values mirror
+# deploy/process/config.sh defaults. Only YR_FRONTEND_SSH_ENABLE toggles the
+# SSH listener; the key paths are validated by sshproxy when SSH is enabled.
+YR_FRONTEND_SSH_ENABLE="{{ 'true' if values.frontend.ssh_enable else 'false' }}"
+YR_FRONTEND_SSH_AUTH_ENABLE="{{ 'true' if values.frontend.ssh_auth_enable else 'false' }}"
+YR_FRONTEND_SSH_ADDR="{{ values.frontend.ssh_address }}"
+YR_FRONTEND_SSH_HOST_KEY="{{ values.frontend.ssh_host_key }}"
+YR_FRONTEND_SSH_AUTHORIZED_KEYS="{{ values.frontend.ssh_authorized_keys }}"
+YR_FRONTEND_SSH_BACKEND_KEY="{{ values.frontend.ssh_backend_key }}"
+YR_FRONTEND_SSH_MAX_CONNECTIONS="{{ values.frontend.ssh_max_connections }}"
+# Host directory mounted read-only into agent sandboxes at
+# /run/openyuanrong/ssh; consumed by /api/agent when SSH is enabled.
+YR_SSH_BACKEND_PUBLIC_KEY_DIR="{{ values.frontend.ssh_backend_public_key_dir }}"
 
 [frontend.health_check]
 enable = true

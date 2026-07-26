@@ -85,15 +85,9 @@ class FrontendLauncher(ComponentLauncher):
             faas_values.get("sandbox_router_validate_iam", False)
         ).lower()
 
-        # frontend auth/meta placeholders. The template carries these (added by the
-        # Keycloak/Casdoor/metaservice frontend features); process deploy fills them
-        # via functionsystem install.sh. The k8s path must fill them too, otherwise
-        # they stay literal and the rendered init_frontend_args.json is invalid JSON
-        # and the frontend fails to start. k8s default: auth off, IAM/meta address
-        # taken from config when present, else empty (still valid JSON).
-        # functionInvokeBackend selects the function invoke backend (int). The template
-        # carries the raw {function_invoke_backend} token (no quotes), so it must be a
-        # bare integer; default 0 (libruntime direct) when unset by config.
+        # Template placeholders that must be filled, otherwise the rendered
+        # init_frontend_args.json is invalid and frontend fails to start.
+        # functionInvokeBackend is a raw {token} (no quotes) -> bare integer, default 0.
         function_invoke_backend = str(faas_values.get("function_invoke_backend", 0))
         frontend_https_enable = ssl_enable
         enable_func_token_auth = str(
@@ -102,7 +96,6 @@ class FrontendLauncher(ComponentLauncher):
         frontend_lease_bypass = str(
             faas_values.get("frontend_lease_bypass", False)
         ).lower()
-        function_invoke_backend = str(faas_values.get("function_invoke_backend", 0))
         auth_enabled = str(faas_values.get("auth_enabled", False)).lower()
         meta_service_address = str(
             faas_args.get("meta_service_address", "")
@@ -146,7 +139,6 @@ class FrontendLauncher(ComponentLauncher):
             "{frontend_lease_bypass}": frontend_lease_bypass,
             "{function_invoke_backend}": function_invoke_backend,
             "{frontendSslEnable}": frontend_https_enable,
-            "{function_invoke_backend}": function_invoke_backend,
         }
 
         for placeholder, value in replacements.items():
