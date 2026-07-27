@@ -45,6 +45,30 @@ func newTestPool(t *testing.T) *LiteFunctionPool {
 	return p
 }
 
+func TestLiteTTL(t *testing.T) {
+	originalLeaseSpan := config.GlobalConfig.LeaseSpan
+	defer func() { config.GlobalConfig.LeaseSpan = originalLeaseSpan }()
+
+	tests := []struct {
+		name      string
+		leaseSpan int
+		expected  time.Duration
+	}{
+		{name: "zero uses minimum", leaseSpan: 0, expected: types.MinLeaseInterval},
+		{name: "below minimum uses minimum", leaseSpan: 100, expected: types.MinLeaseInterval},
+		{name: "minimum is retained", leaseSpan: 500, expected: types.MinLeaseInterval},
+		{name: "value above minimum is retained", leaseSpan: 1000, expected: time.Second},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config.GlobalConfig.LeaseSpan = tt.leaseSpan
+			if actual := liteTTL(); actual != tt.expected {
+				t.Errorf("liteTTL() = %s, want %s", actual, tt.expected)
+			}
+		})
+	}
+}
+
 func TestAcquireSessionSticky(t *testing.T) {
 	convey.Convey("same session returns same instance", t, func() {
 		ls := &LiteScheduler{pools: map[string]*LiteFunctionPool{}, allocations: map[string]*Allocation{}}
