@@ -1,6 +1,15 @@
 load("@rules_cc//cc:defs.bzl", "cc_library")
 load("//bazel:yr.bzl", "COPTS", "LOPTS")
 
+METRICS_PLUGIN_LINKER_INPUTS = [":plugin_exports.lds"]
+
+METRICS_PLUGIN_LINKOPTS = select({
+    "//:is_macos": [],
+    "//conditions:default": [
+        "-Wl,--version-script=$(location :plugin_exports.lds)",
+    ],
+})
+
 # Common utilities for metrics
 cc_library(
     name = "metrics_common",
@@ -203,7 +212,9 @@ cc_library(
 cc_binary(
     name = "libobservability-metrics-file-exporter.so",
     srcs = ["exporters/file_exporter/factory_impl.cpp"],
+    additional_linker_inputs = METRICS_PLUGIN_LINKER_INPUTS,
     linkshared = True,
+    linkopts = METRICS_PLUGIN_LINKOPTS,
     copts = COPTS + ["-fPIC"],
     visibility = ["//visibility:public"],
     deps = [":file_exporter"],
@@ -212,7 +223,9 @@ cc_binary(
 cc_binary(
     name = "libobservability-prometheus-push-exporter.so",
     srcs = ["exporters/prometheus_push_exporter/factory_impl.cpp"],
+    additional_linker_inputs = METRICS_PLUGIN_LINKER_INPUTS,
     linkshared = True,
+    linkopts = METRICS_PLUGIN_LINKOPTS,
     copts = COPTS + ["-fPIC"],
     visibility = ["//visibility:public"],
     deps = [":prometheus_push_exporter"],
@@ -221,7 +234,9 @@ cc_binary(
 cc_binary(
     name = "libobservability-prometheus-pull-exporter.so",
     srcs = ["exporters/prometheus_pull_exporter/factory_impl.cpp"],
+    additional_linker_inputs = METRICS_PLUGIN_LINKER_INPUTS,
     linkshared = True,
+    linkopts = METRICS_PLUGIN_LINKOPTS,
     copts = COPTS + ["-fPIC"],
     visibility = ["//visibility:public"],
     deps = [":prometheus_pull_exporter"],

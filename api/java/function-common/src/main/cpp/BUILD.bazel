@@ -3,6 +3,7 @@ load("//bazel:yr.bzl", "COPTS")
 cc_binary(
     name = "libruntime_lib_jni.so",
     srcs = glob([ "*.cpp", "*.h" ]),
+    additional_linker_inputs = [":jni_exports.lds"],
     deps = [
         "//:runtime_lib",
         "@bazel_tools//tools/jdk:jni",
@@ -10,6 +11,12 @@ cc_binary(
     copts = COPTS + select({
         "//:disable_datasystem": [],
         "//conditions:default": ["-DENABLE_DATASYSTEM"],
+    }),
+    linkopts = select({
+        "//:is_macos": [],
+        "//conditions:default": [
+            "-Wl,--version-script=$(location :jni_exports.lds)",
+        ],
     }),
     linkstatic = True,
     linkshared = True,
