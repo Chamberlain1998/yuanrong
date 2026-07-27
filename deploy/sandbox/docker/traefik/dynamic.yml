@@ -9,7 +9,7 @@ http:
     frontend-terminal:
       entryPoints:
         - web
-      rule: "PathPrefix(`/terminal`) || PathPrefix(`/api/instances`) || PathPrefix(`/api/jobs`) || PathPrefix(`/api/sandbox`) || PathPrefix(`/functions`) || PathPrefix(`/api-docs`) || PathPrefix(`/admin/v1/functions`) || PathPrefix(`/serverless/v1/functions`) || PathPrefix(`/serverless/v1/stream`) || PathPrefix(`/serverless/v1/componentshealth`) || PathPrefix(`/serverless/v1/posix`) || PathPrefix(`/frontend/v1/instance`) || PathPrefix(`/datasystem/v1`) || PathPrefix(`/serverless/v2`) || PathPrefix(`/app/v1`) || PathPrefix(`/client/v1/lease`) || PathPrefix(`/invocations`) || Path(`/healthz`)"
+      rule: "PathPrefix(`/terminal`) || PathPrefix(`/api/instances`) || PathPrefix(`/api/jobs`) || PathPrefix(`/api/sandbox`) || PathPrefix(`/global-scheduler`) || PathPrefix(`/functions`) || PathPrefix(`/api-docs`) || PathPrefix(`/admin/v1/functions`) || PathPrefix(`/serverless/v1/functions`) || PathPrefix(`/serverless/v1/stream`) || PathPrefix(`/serverless/v1/componentshealth`) || PathPrefix(`/serverless/v1/posix`) || PathPrefix(`/frontend/v1/instance`) || PathPrefix(`/datasystem/v1`) || PathPrefix(`/serverless/v2`) || PathPrefix(`/app/v1`) || PathPrefix(`/client/v1/lease`) || PathPrefix(`/invocations`) || Path(`/healthz`)"
       service: frontend
 
     direct-router:
