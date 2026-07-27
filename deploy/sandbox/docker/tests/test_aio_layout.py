@@ -87,6 +87,8 @@ class AioLayoutTests(unittest.TestCase):
     def test_services_use_runtime_image(self):
         services_text = read_text("services.yaml")
         self.assertIn('imageurl: "aio-yr-runtime:latest"', services_text)
+        self.assertIn("rrt:\n      cpu: 0\n      memory: 0\n      runtime: python3.9", services_text)
+        self.assertIn('root: "/opt/uv/python"', services_text)
         self.assertNotIn("runtime: rust", services_text)
         self.assertNotIn("export RRT_HTTP_PORT=", services_text)
         self.assertNotIn("export RRT_TUNNEL_WS_PORT=", services_text)
@@ -99,6 +101,7 @@ class AioLayoutTests(unittest.TestCase):
         self.assertIn("http:", traefik_text)
         self.assertNotIn("etcd:", traefik_text)
         self.assertIn("frontend-root", dynamic_text)
+        self.assertIn("PathPrefix(`/global-scheduler`)", dynamic_text)
         self.assertIn('url: "http://__AIO_NODE_IP__:8889"', dynamic_text)
         self.assertNotIn("tunnel-router", dynamic_text)
         self.assertNotIn("redirect-to-https", dynamic_text)
@@ -130,7 +133,15 @@ class AioLayoutTests(unittest.TestCase):
         self.assertIn("--block true", script_text)
         self.assertIn('-s "values.host_ip=\\"${AIO_NODE_IP}\\""', script_text)
         self.assertIn("-s 'mode.master.frontend=true'", script_text)
-        self.assertIn("-s 'frontend.port=8889'", script_text)
+        self.assertIn("-s 'values.frontend.port=8889'", script_text)
+        self.assertIn(
+            '-s "values.frontend.sandbox_router_enable_jwt=${ENABLE_TOKEN}"',
+            script_text,
+        )
+        self.assertIn(
+            '-s "values.frontend.sandbox_router_validate_iam=${ENABLE_TOKEN}"',
+            script_text,
+        )
         self.assertIn("-s 'values.function_scheduler.lease_port=8890'", script_text)
         self.assertIn("-s 'mode.master.meta_service=true'", script_text)
         self.assertIn("function_master.args.enable_traefik_provider=true", script_text)

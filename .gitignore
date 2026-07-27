@@ -35,6 +35,7 @@ test/st/python/**/*.log*
 test/st/python/pkg
 
 # test
+buildkite-artifacts/
 test/st/cpp/gtest
 test/st/yuanrong/
 test/st/**/output.txt

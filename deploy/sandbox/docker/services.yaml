@@ -55,6 +55,7 @@
     rrt:
       cpu: 0
       memory: 0
+      runtime: python3.9
       rootfs:
         runtime: runc
         type: image
@@ -63,7 +64,7 @@
         mountpoint: /mnt
       bootstrap:
         type: path
-        root: "/opt/uv/python/cpython-3.10-linux-x86_64-gnu/lib/python3.10/site-packages/yr/inner/runtime/service"
+        root: "/opt/uv/python"
         entrypoint: "set -e; export LD_LIBRARY_PATH=/__yuanrong/python/yr/cpp/lib:/__yuanrong/python/yr/datasystem/lib:${LD_LIBRARY_PATH}; exec \"$(python -c 'import openyuanrong_rrt;print(openyuanrong_rrt.runtime_path())')\""
     java:
       cpu: 500
