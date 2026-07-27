@@ -27,6 +27,7 @@ import (
 	commonTypes "yuanrong.org/kernel/pkg/common/faas_common/types"
 	"yuanrong.org/kernel/pkg/functionscaler/config"
 	"yuanrong.org/kernel/pkg/functionscaler/selfregister"
+	"yuanrong.org/kernel/pkg/functionscaler/types"
 )
 
 // litePollInterval is the cadence at which waitForInstance rechecks the pool for a
@@ -35,7 +36,11 @@ const litePollInterval = 50 * time.Millisecond
 
 // liteTTL reuses FaaSScheduler lease interval (config.GlobalConfig.LeaseSpan ms).
 func liteTTL() time.Duration {
-	return time.Duration(config.GlobalConfig.LeaseSpan) * time.Millisecond
+	ttl := time.Duration(config.GlobalConfig.LeaseSpan) * time.Millisecond
+	if ttl < types.MinLeaseInterval {
+		return types.MinLeaseInterval
+	}
+	return ttl
 }
 
 func (ls *LiteScheduler) getPool(funcKey string) *LiteFunctionPool {
