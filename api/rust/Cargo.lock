@@ -920,7 +920,11 @@ name = "rrt-daemon"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "bytes",
  "futures-util",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "libc",
  "portable-pty",
  "prost",

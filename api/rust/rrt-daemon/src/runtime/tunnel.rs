@@ -1,35 +1,48 @@
 //! Native Rust reverse-tunnel server (replaces spawning the python tunnel_server).
 //!
 //! Port A (ws_port, 0.0.0.0): WebSocket endpoint the external TunnelClient connects to.
-//! Port B (http_port, 127.0.0.1): HTTP/WS surface the sandbox's own code hits; each
+//! Port B (http_port, 127.0.0.1): HTTP surface the sandbox's own code hits; each
 //! request is framed (JSON, base64 body) and forwarded over the Port-A WS to the
 //! client, which relays it to the real upstream and frames the response back.
 //!
-//! Wire-compatible with yr/sandbox/tunnel_protocol.py (the TunnelClient stays Python):
-//! JSON text frames {type, id, ...}; bodies / binary ws payloads are base64. The server
-//! answers the client's app-level PingFrame with a PongFrame (heartbeat), forwards
-//! Port-B HTTP as http_req / WS as ws_connect, and resolves http_resp / ws_* by id.
+//! The paired sandbox-sdk TunnelClient uses JSON text frames {type, id, ...};
+//! bodies are base64 and headers are ordered [name, value] pairs. The server
+//! answers the client's app-level PingFrame with a PongFrame (heartbeat),
+//! forwards Port-B HTTP as http_req, and resolves http_resp by id. WebSocket
+//! upgrades are rejected until both peers implement reverse WebSocket proxying.
 
 use super::codec::yr_deserialize;
 use crate::posix::common::Arg;
 use base64::Engine;
+use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
+use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
+use hyper::body::Incoming;
+use hyper::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_LENGTH, UPGRADE};
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::{Method, Request, Response, StatusCode};
+use hyper_util::rt::TokioIo;
 use rmpv::Value;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::convert::Infallible;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::AbortHandle;
 use tokio_tungstenite::tungstenite::protocol::Message;
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(600);
-const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// In-flight HTTP requests are cached this long for resend on client reconnect.
 const PENDING_REQUEST_TTL: Duration = Duration::from_secs(120);
+const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
+const MAX_HTTP_HEADERS: usize = 200;
+const MAX_HTTP_BODY_BYTES: usize = 64 * 1024 * 1024;
+
+type HeaderList = Vec<(String, String)>;
 
 fn b64() -> base64::engine::general_purpose::GeneralPurpose {
     base64::engine::general_purpose::STANDARD
@@ -51,7 +64,7 @@ enum Frame {
         id: String,
         method: String,
         path: String,
-        headers: HashMap<String, String>,
+        headers: HeaderList,
         #[serde(default)]
         body: String,
     },
@@ -60,32 +73,9 @@ enum Frame {
         id: String,
         status: u16,
         #[serde(default)]
-        headers: HashMap<String, String>,
+        headers: HeaderList,
         #[serde(default)]
         body: String,
-    },
-    #[serde(rename = "ws_connect")]
-    WsConnect {
-        id: String,
-        path: String,
-        headers: HashMap<String, String>,
-    },
-    #[serde(rename = "ws_connected")]
-    WsConnected { id: String },
-    #[serde(rename = "ws_message")]
-    WsMessage {
-        id: String,
-        data: String,
-        #[serde(default)]
-        binary: bool,
-    },
-    #[serde(rename = "ws_close")]
-    WsClose {
-        id: String,
-        #[serde(default = "default_close_code")]
-        code: u16,
-        #[serde(default)]
-        reason: String,
     },
     #[serde(rename = "error")]
     Error { id: String, message: String },
@@ -93,10 +83,6 @@ enum Frame {
     Ping { id: String, timestamp: f64 },
     #[serde(rename = "pong")]
     Pong { id: String, timestamp: f64 },
-}
-
-fn default_close_code() -> u16 {
-    1000
 }
 
 impl Frame {
@@ -112,8 +98,6 @@ struct State {
     sdk_tx: Mutex<Option<mpsc::UnboundedSender<Message>>>,
     /// HTTP request id -> oneshot waiting for the http_resp / error frame.
     pending_http: Mutex<HashMap<String, oneshot::Sender<Frame>>>,
-    /// WS channel id -> queue of frames from the client for that channel.
-    pending_ws: Mutex<HashMap<String, mpsc::UnboundedSender<Frame>>>,
     /// In-flight HTTP request frames, cached for resend when a client reconnects.
     pending_requests: Mutex<HashMap<String, (Frame, Instant)>>,
 }
@@ -254,15 +238,6 @@ async fn handle_client(stream: TcpStream, state: Arc<State>) -> Result<(), Strin
     }
 
     out.abort();
-    // Notify any open WS channels of the disconnect (parity with python finally).
-    let drained: Vec<_> = state.pending_ws.lock().unwrap().drain().collect();
-    for (_, q) in drained {
-        let _ = q.send(Frame::WsClose {
-            id: String::new(),
-            code: 1001,
-            reason: "tunnel client disconnected".into(),
-        });
-    }
     rrt_info!("[rrt-runtime] tunnel client disconnected");
     Ok(())
 }
@@ -324,31 +299,24 @@ fn dispatch_from_client(frame: Frame, state: &Arc<State>) {
             }
         }
         Frame::Error { id, .. } => {
-            // Deliver to whichever side is waiting on this id.
-            let http = state.pending_http.lock().unwrap().remove(id);
-            if let Some(tx) = http {
+            if let Some(tx) = state.pending_http.lock().unwrap().remove(id) {
                 let _ = tx.send(frame);
-            } else if let Some(q) = state.pending_ws.lock().unwrap().get(id) {
-                let _ = q.send(frame);
-            }
-        }
-        Frame::WsConnected { id } | Frame::WsMessage { id, .. } | Frame::WsClose { id, .. } => {
-            if let Some(q) = state.pending_ws.lock().unwrap().get(id) {
-                let _ = q.send(frame);
             }
         }
         _ => {}
     }
 }
 
-// ───────────────────────── Port B: sandbox HTTP/WS ─────────────────────────
+// ───────────────────────── Port B: sandbox HTTP ─────────────────────────
 async fn accept_port_b(listener: TcpListener, state: Arc<State>) {
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
                 let st = state.clone();
                 tokio::spawn(async move {
-                    let _ = handle_port_b(stream, st).await;
+                    if let Err(error) = handle_port_b(stream, st).await {
+                        rrt_warn!("[rrt-runtime] tunnel port_b_connection_ended error={error}");
+                    }
                 });
             }
             Err(e) => {
@@ -360,80 +328,140 @@ async fn accept_port_b(listener: TcpListener, state: Arc<State>) {
 }
 
 async fn handle_port_b(stream: TcpStream, state: Arc<State>) -> Result<(), String> {
-    // Peek (don't consume) to branch HTTP vs WS upgrade; tungstenite then does
-    // the WS handshake itself on the un-consumed stream.
-    let mut peek = [0u8; 8192];
-    let n = stream.peek(&mut peek).await.map_err(|e| e.to_string())?;
-    let head = String::from_utf8_lossy(&peek[..n]).to_lowercase();
-    let is_ws = head.contains("upgrade: websocket");
-    if is_ws {
-        handle_port_b_ws(stream, state).await
-    } else {
-        handle_port_b_http(stream, state).await
-    }
+    handle_port_b_http(stream, state).await
 }
 
-/// Read one HTTP/1.1 request (request line + headers + Content-Length body).
-async fn read_http_request(
-    stream: &mut TcpStream,
-) -> Result<(String, String, HashMap<String, String>, Vec<u8>), String> {
-    let mut buf = Vec::with_capacity(8192);
-    let mut tmp = [0u8; 4096];
-    let header_end = loop {
-        if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
-            break pos;
+fn is_fixed_hop_by_hop(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "proxy-connection"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    )
+}
+
+fn connection_tokens(headers: &HeaderList) -> HashSet<String> {
+    headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("connection"))
+        .flat_map(|(_, value)| value.split(','))
+        .map(|token| token.trim().to_ascii_lowercase())
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+fn header_list(headers: &HeaderMap) -> HeaderList {
+    headers
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_string(),
+                String::from_utf8_lossy(value.as_bytes()).into_owned(),
+            )
+        })
+        .collect()
+}
+
+fn request_headers_for_frame(headers: &HeaderMap) -> HeaderList {
+    let headers = header_list(headers);
+    let dynamic = connection_tokens(&headers);
+    headers
+        .into_iter()
+        .filter(|(name, _)| {
+            let lower = name.to_ascii_lowercase();
+            !is_fixed_hop_by_hop(&lower)
+                && !dynamic.contains(&lower)
+                && !matches!(lower.as_str(), "host" | "content-length" | "expect")
+        })
+        .collect()
+}
+
+fn response_headers_for_downstream(
+    headers: HeaderList,
+    method: &Method,
+    status: StatusCode,
+    body_len: usize,
+) -> HeaderList {
+    let dynamic = connection_tokens(&headers);
+    let representation_length = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .filter_map(|(_, value)| value.parse::<usize>().ok())
+        .next();
+    let mut result: HeaderList = headers
+        .into_iter()
+        .filter(|(name, _)| {
+            let lower = name.to_ascii_lowercase();
+            !is_fixed_hop_by_hop(&lower) && !dynamic.contains(&lower) && lower != "content-length"
+        })
+        .collect();
+
+    if method == Method::HEAD {
+        if let Some(length) = representation_length {
+            result.push(("content-length".into(), length.to_string()));
         }
-        let r = stream.read(&mut tmp).await.map_err(|e| e.to_string())?;
-        if r == 0 {
-            return Err("connection closed before headers".into());
-        }
-        buf.extend_from_slice(&tmp[..r]);
-        if buf.len() > 1 << 20 {
-            return Err("request headers too large".into());
+    } else if !status.is_informational()
+        && status != StatusCode::NO_CONTENT
+        && status != StatusCode::NOT_MODIFIED
+    {
+        result.push(("content-length".into(), body_len.to_string()));
+    }
+    result
+}
+
+fn plain_response(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(status)
+        .header(CONTENT_LENGTH, message.len())
+        .body(Full::new(Bytes::copy_from_slice(message.as_bytes())))
+        .expect("static HTTP response is valid")
+}
+
+async fn proxy_http_request(
+    request: Request<Incoming>,
+    state: Arc<State>,
+) -> Response<Full<Bytes>> {
+    let (parts, body) = request.into_parts();
+    let method = parts.method;
+    let is_websocket_upgrade = parts
+        .headers
+        .get_all(UPGRADE)
+        .iter()
+        .any(|value| value.as_bytes().eq_ignore_ascii_case(b"websocket"));
+    if is_websocket_upgrade {
+        return plain_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "Reverse WebSocket tunnel is not implemented",
+        );
+    }
+    let path = parts
+        .uri
+        .path_and_query()
+        .map(|value| value.as_str().to_string())
+        .unwrap_or_else(|| "/".into());
+    let headers = request_headers_for_frame(&parts.headers);
+    let body = match Limited::new(body, MAX_HTTP_BODY_BYTES).collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(error) => {
+            let message = error.to_string();
+            let status = if error.downcast_ref::<LengthLimitError>().is_some() {
+                StatusCode::PAYLOAD_TOO_LARGE
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            return plain_response(status, &message);
         }
     };
-    let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
-    let mut lines = head.split("\r\n");
-    let req_line = lines.next().unwrap_or("");
-    let mut parts = req_line.split_whitespace();
-    let method = parts.next().unwrap_or("GET").to_string();
-    let path = parts.next().unwrap_or("/").to_string();
-    let mut headers = HashMap::new();
-    for line in lines {
-        if let Some((k, v)) = line.split_once(':') {
-            headers.insert(k.trim().to_string(), v.trim().to_string());
-        }
-    }
-    let clen: usize = headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
-        .and_then(|(_, v)| v.parse().ok())
-        .unwrap_or(0);
-    let mut body = buf[header_end + 4..].to_vec();
-    while body.len() < clen {
-        let r = stream.read(&mut tmp).await.map_err(|e| e.to_string())?;
-        if r == 0 {
-            break;
-        }
-        body.extend_from_slice(&tmp[..r]);
-    }
-    if body.len() > clen {
-        body.truncate(clen);
-    }
-    Ok((method, path, headers, body))
-}
-
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
-}
-
-async fn handle_port_b_http(mut stream: TcpStream, state: Arc<State>) -> Result<(), String> {
-    let (method, path, mut headers, body) = read_http_request(&mut stream).await?;
-    headers.retain(|k, _| !k.eq_ignore_ascii_case("host"));
     let id = make_id();
     let frame = Frame::HttpReq {
         id: id.clone(),
-        method,
+        method: method.to_string(),
         path,
         headers,
         body: b64().encode(&body),
@@ -453,146 +481,74 @@ async fn handle_port_b_http(mut stream: TcpStream, state: Arc<State>) -> Result<
     state.pending_http.lock().unwrap().remove(&id);
     state.pending_requests.lock().unwrap().remove(&id);
 
-    match result {
+    let (status, headers, response_body) = match result {
         Ok(Ok(Frame::HttpResp {
             status,
             headers,
             body,
             ..
         })) => {
-            let body_bytes = b64().decode(body.as_bytes()).unwrap_or_default();
-            // Strip hop-by-hop / framing headers; we set Content-Length ourselves.
-            let mut out = format!("HTTP/1.1 {} {}\r\n", status, reason_phrase(status));
-            for (k, v) in &headers {
-                let lk = k.to_ascii_lowercase();
-                if lk == "content-length" || lk == "transfer-encoding" || lk == "connection" {
-                    continue;
+            let response_body = match b64().decode(body.as_bytes()) {
+                Ok(body) => body,
+                Err(_) => {
+                    return plain_response(StatusCode::BAD_GATEWAY, "Invalid tunnel response body");
                 }
-                out.push_str(&format!("{k}: {v}\r\n"));
-            }
-            out.push_str(&format!("Content-Length: {}\r\n", body_bytes.len()));
-            out.push_str("Connection: close\r\n\r\n");
-            stream
-                .write_all(out.as_bytes())
-                .await
-                .map_err(|e| e.to_string())?;
-            stream
-                .write_all(&body_bytes)
-                .await
-                .map_err(|e| e.to_string())?;
-            let _ = stream.flush().await;
-            Ok(())
+            };
+            (
+                StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+                headers,
+                response_body,
+            )
         }
         Ok(Ok(Frame::Error { .. })) => {
-            // Close TCP without a response so the caller sees a transport-level
-            // error (matches connecting to an unreachable upstream).
-            Ok(())
+            return plain_response(StatusCode::BAD_GATEWAY, "Tunnel upstream error");
         }
-        Ok(Ok(_)) | Ok(Err(_)) => Ok(()),
+        Ok(Ok(_)) | Ok(Err(_)) => {
+            return plain_response(StatusCode::BAD_GATEWAY, "Invalid tunnel response");
+        }
         Err(_) => {
-            let msg = "Tunnel timeout";
-            let resp = format!(
-                "HTTP/1.1 504 Gateway Timeout\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                msg.len(),
-                msg
-            );
-            let _ = stream.write_all(resp.as_bytes()).await;
-            Ok(())
+            return plain_response(StatusCode::GATEWAY_TIMEOUT, "Tunnel timeout");
         }
-    }
-}
-
-async fn handle_port_b_ws(stream: TcpStream, state: Arc<State>) -> Result<(), String> {
-    // Capture the request path/headers via the tungstenite handshake callback.
-    let captured: Arc<Mutex<(String, HashMap<String, String>)>> =
-        Arc::new(Mutex::new((String::from("/"), HashMap::new())));
-    let cap = captured.clone();
-    let ws = tokio_tungstenite::accept_hdr_async(
-        stream,
-        |req: &tokio_tungstenite::tungstenite::handshake::server::Request,
-         resp: tokio_tungstenite::tungstenite::handshake::server::Response| {
-            let mut g = cap.lock().unwrap();
-            g.0 = req
-                .uri()
-                .path_and_query()
-                .map(|p| p.as_str().to_string())
-                .unwrap_or_else(|| "/".into());
-            for (k, v) in req.headers() {
-                if !k.as_str().eq_ignore_ascii_case("host") {
-                    g.1.insert(k.as_str().to_string(), v.to_str().unwrap_or("").to_string());
-                }
-            }
-            Ok(resp)
-        },
-    )
-    .await
-    .map_err(|e| format!("port B ws accept: {e}"))?;
-    let (path, headers) = {
-        let g = captured.lock().unwrap();
-        (g.0.clone(), g.1.clone())
     };
 
-    let (mut sink, mut src) = ws.split();
-    let id = make_id();
-    let (q_tx, mut q_rx) = mpsc::unbounded_channel::<Frame>();
-    state.pending_ws.lock().unwrap().insert(id.clone(), q_tx);
-
-    if state
-        .send_to_client(&Frame::WsConnect {
-            id: id.clone(),
-            path,
-            headers,
-        })
-        .is_err()
-    {
-        state.pending_ws.lock().unwrap().remove(&id);
-        return Ok(());
-    }
-    // Await ws_connected ack (10s).
-    match tokio::time::timeout(WS_CONNECT_TIMEOUT, q_rx.recv()).await {
-        Ok(Some(Frame::WsConnected { .. })) => {}
-        _ => {
-            state.pending_ws.lock().unwrap().remove(&id);
-            return Ok(());
+    let downstream_headers =
+        response_headers_for_downstream(headers, &method, status, response_body.len());
+    let suppress_body = method == Method::HEAD
+        || status.is_informational()
+        || status == StatusCode::NO_CONTENT
+        || status == StatusCode::NOT_MODIFIED;
+    let mut response = Response::builder().status(status);
+    for (name, value) in downstream_headers {
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(&value),
+        ) {
+            response
+                .headers_mut()
+                .expect("response builder")
+                .append(name, value);
         }
     }
+    response
+        .body(Full::new(if suppress_body {
+            Bytes::new()
+        } else {
+            Bytes::from(response_body)
+        }))
+        .unwrap_or_else(|_| plain_response(StatusCode::BAD_GATEWAY, "Invalid response headers"))
+}
 
-    // Bidirectional pump. Port-B-ws -> client (WsMessage); client queue -> Port-B-ws.
-    loop {
-        tokio::select! {
-            biased;
-            msg = src.next() => match msg {
-                Some(Ok(Message::Text(t))) => {
-                    let _ = state.send_to_client(&Frame::WsMessage { id: id.clone(), data: t, binary: false });
-                }
-                Some(Ok(Message::Binary(b))) => {
-                    let _ = state.send_to_client(&Frame::WsMessage { id: id.clone(), data: b64().encode(&b), binary: true });
-                }
-                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
-                    let _ = state.send_to_client(&Frame::WsClose { id: id.clone(), code: 1000, reason: String::new() });
-                    break;
-                }
-                _ => {}
-            },
-            f = q_rx.recv() => match f {
-                Some(Frame::WsMessage { data, binary, .. }) => {
-                    let out = if binary {
-                        Message::Binary(b64().decode(data.as_bytes()).unwrap_or_default())
-                    } else {
-                        Message::Text(data)
-                    };
-                    if sink.send(out).await.is_err() { break; }
-                }
-                Some(Frame::WsClose { .. }) | Some(Frame::Error { .. }) | None => {
-                    let _ = sink.send(Message::Close(None)).await;
-                    break;
-                }
-                _ => {}
-            },
-        }
-    }
-    state.pending_ws.lock().unwrap().remove(&id);
-    Ok(())
+async fn handle_port_b_http(stream: TcpStream, state: Arc<State>) -> Result<(), String> {
+    let service = service_fn(move |request| {
+        let state = state.clone();
+        async move { Ok::<Response<Full<Bytes>>, Infallible>(proxy_http_request(request, state).await) }
+    });
+    http1::Builder::new()
+        .max_headers(MAX_HTTP_HEADERS)
+        .max_buf_size(MAX_HTTP_HEADER_BYTES)
+        .serve_connection(TokioIo::new(stream), service)
+        .await
+        .map_err(|error| format!("port B HTTP connection: {error}"))
 }
 
 // ───────────────────────── E2E regression tests ─────────────────────────
@@ -602,6 +558,7 @@ async fn handle_port_b_ws(stream: TcpStream, state: Arc<State>) -> Result<(), St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_tungstenite::connect_async;
 
     async fn spawn_test_server() -> (u16, u16) {
@@ -646,14 +603,25 @@ mod tests {
         String::from_utf8_lossy(&buf).to_string()
     }
 
+    async fn raw_http(port: u16, request: &[u8]) -> String {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        stream.write_all(request).await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
+            .await
+            .expect("HTTP response timed out")
+            .unwrap();
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
     #[test]
     fn frame_json_matches_python_protocol() {
-        // body is base64; tagged by "type" — wire-compatible with tunnel_protocol.py.
+        // Header pairs retain duplicate fields and their original order.
         let f = Frame::HttpReq {
             id: "x".into(),
             method: "GET".into(),
             path: "/p".into(),
-            headers: HashMap::new(),
+            headers: Vec::new(),
             body: b64().encode(b"hi"),
         };
         let j: serde_json::Value =
@@ -661,16 +629,197 @@ mod tests {
         assert_eq!(j["type"], "http_req");
         assert_eq!(j["id"], "x");
         assert_eq!(j["body"], "aGk="); // base64("hi")
-                                       // parse a client http_resp frame
-        let raw =
-            r#"{"type":"http_resp","id":"x","status":201,"headers":{"X-A":"b"},"body":"cG9uZw=="}"#;
+        assert!(j["headers"].is_array(), "headers={}", j["headers"]);
+
+        let raw = r#"{"type":"http_resp","id":"x","status":201,"headers":[["Set-Cookie","a=1"],["Set-Cookie","b=2"]],"body":"cG9uZw=="}"#;
         match serde_json::from_str::<Frame>(raw).unwrap() {
-            Frame::HttpResp { status, body, .. } => {
+            Frame::HttpResp {
+                status,
+                headers,
+                body,
+                ..
+            } => {
                 assert_eq!(status, 201);
+                assert_eq!(headers.len(), 2);
                 assert_eq!(b64().decode(body.as_bytes()).unwrap(), b"pong");
             }
             o => panic!("{o:?}"),
         }
+    }
+
+    #[test]
+    fn response_content_length_obeys_method_and_status_semantics() {
+        let representation_headers = vec![
+            ("Content-Length".into(), "123".into()),
+            ("Set-Cookie".into(), "a=1".into()),
+            ("Set-Cookie".into(), "b=2".into()),
+        ];
+
+        let head = response_headers_for_downstream(
+            representation_headers.clone(),
+            &Method::HEAD,
+            StatusCode::OK,
+            0,
+        );
+        assert_eq!(
+            head.iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                .map(|(_, value)| value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["123"]
+        );
+
+        let no_content = response_headers_for_downstream(
+            representation_headers.clone(),
+            &Method::GET,
+            StatusCode::NO_CONTENT,
+            0,
+        );
+        assert!(
+            no_content
+                .iter()
+                .all(|(name, _)| !name.eq_ignore_ascii_case("content-length")),
+            "headers={no_content:?}"
+        );
+
+        let not_modified = response_headers_for_downstream(
+            representation_headers,
+            &Method::GET,
+            StatusCode::NOT_MODIFIED,
+            0,
+        );
+        assert!(
+            not_modified
+                .iter()
+                .all(|(name, _)| !name.eq_ignore_ascii_case("content-length")),
+            "headers={not_modified:?}"
+        );
+        assert_eq!(
+            not_modified
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case("set-cookie"))
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ambiguous_request_framing_is_handled_safely() {
+        let (_ws_port, http_port) = spawn_test_server().await;
+        let response = raw_http(
+            http_port,
+            b"POST /ambiguous HTTP/1.1\r\nHost: local\r\nContent-Length: 1\r\nContent-Length: 2\r\nConnection: close\r\n\r\nx",
+        )
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 400"),
+            "response={response:?}"
+        );
+
+        let (ws_port, http_port) = spawn_test_server().await;
+        let mut client = connect_client(ws_port).await;
+        let request = tokio::spawn(async move {
+            raw_http(
+                http_port,
+                b"POST /canonical HTTP/1.1\r\nHost: local\r\nContent-Length: 99\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n1\r\nx\r\n0\r\n\r\n",
+            )
+            .await
+        });
+        let id = match next_frame(&mut client).await {
+            Frame::HttpReq {
+                id, headers, body, ..
+            } => {
+                assert_eq!(b64().decode(body.as_bytes()).unwrap(), b"x");
+                assert!(headers.iter().all(|(name, _)| {
+                    !name.eq_ignore_ascii_case("content-length")
+                        && !name.eq_ignore_ascii_case("transfer-encoding")
+                }));
+                id
+            }
+            other => panic!("expected canonical http_req, got {other:?}"),
+        };
+        client
+            .send(
+                Frame::HttpResp {
+                    id,
+                    status: 200,
+                    headers: Vec::new(),
+                    body: b64().encode(b"ok"),
+                }
+                .to_msg(),
+            )
+            .await
+            .unwrap();
+        assert!(request.await.unwrap().starts_with("HTTP/1.1 200"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn excessive_header_count_is_rejected() {
+        let (_ws_port, http_port) = spawn_test_server().await;
+        let mut request = String::from("GET /headers HTTP/1.1\r\nHost: local\r\n");
+        for index in 0..=MAX_HTTP_HEADERS {
+            request.push_str(&format!("X-Test-{index}: value\r\n"));
+        }
+        request.push_str("Connection: close\r\n\r\n");
+        let response = raw_http(http_port, request.as_bytes()).await;
+        assert!(
+            response.starts_with("HTTP/1.1 431"),
+            "response={response:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn chunked_request_is_decoded_before_framing() {
+        let (ws_port, http_port) = spawn_test_server().await;
+        let mut client = connect_client(ws_port).await;
+        let request_task = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(("127.0.0.1", http_port)).await.unwrap();
+            stream
+                .write_all(
+                    b"POST /chunked HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nTransfer-Encoding: chunked\r\nContent-Type: application/json\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let mut response = Vec::new();
+            let _ = stream.read_to_end(&mut response).await;
+            response
+        });
+
+        let frame = tokio::time::timeout(Duration::from_secs(2), next_frame(&mut client))
+            .await
+            .expect("RRT did not frame the chunked request");
+        let id = match frame {
+            Frame::HttpReq {
+                id, headers, body, ..
+            } => {
+                assert_eq!(b64().decode(body.as_bytes()).unwrap(), b"hello world");
+                assert!(
+                    headers
+                        .iter()
+                        .all(|(name, _)| { !name.eq_ignore_ascii_case("transfer-encoding") }),
+                    "headers={headers:?}"
+                );
+                id
+            }
+            other => panic!("expected http_req, got {other:?}"),
+        };
+        client
+            .send(
+                Frame::HttpResp {
+                    id,
+                    status: 200,
+                    headers: Vec::new(),
+                    body: b64().encode(b"ok"),
+                }
+                .to_msg(),
+            )
+            .await
+            .unwrap();
+        let response = request_task.await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&response).contains("200"),
+            "response={response:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -694,7 +843,7 @@ mod tests {
                     Frame::HttpResp {
                         id,
                         status: 200,
-                        headers: HashMap::new(),
+                        headers: Vec::new(),
                         body: b64().encode(b"pong"),
                     }
                     .to_msg(),
@@ -732,7 +881,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn http_error_closes_without_response() {
+    async fn http_error_returns_bad_gateway() {
         let (ws_port, http_port) = spawn_test_server().await;
         let mut client = connect_client(ws_port).await;
         let task = tokio::spawn(async move {
@@ -752,56 +901,22 @@ mod tests {
                 .unwrap();
         });
         let resp = http_get(http_port, "/boom").await;
-        // Error -> TCP closed with no HTTP response (transport-level failure).
-        assert!(!resp.contains("HTTP/1.1 200"), "resp={resp}");
+        assert!(resp.starts_with("HTTP/1.1 502"), "resp={resp}");
+        assert!(resp.ends_with("Tunnel upstream error"), "resp={resp}");
         task.await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn ws_tunnel_roundtrip() {
-        let (ws_port, http_port) = spawn_test_server().await;
-        let mut client = connect_client(ws_port).await;
-        let task = tokio::spawn(async move {
-            // ws_connect -> ws_connected, then echo one ws_message.
-            let id = match next_frame(&mut client).await {
-                Frame::WsConnect { id, path, .. } => {
-                    assert_eq!(path, "/chat");
-                    id
-                }
-                o => panic!("expected ws_connect, got {o:?}"),
-            };
-            client
-                .send(Frame::WsConnected { id: id.clone() }.to_msg())
-                .await
-                .unwrap();
-            match next_frame(&mut client).await {
-                Frame::WsMessage { data, binary, .. } => {
-                    assert!(!binary);
-                    assert_eq!(data, "hi");
-                }
-                o => panic!("expected ws_message, got {o:?}"),
+    async fn ws_upgrade_is_rejected_until_supported() {
+        let (_ws_port, http_port) = spawn_test_server().await;
+        match connect_async(format!("ws://127.0.0.1:{http_port}/chat")).await {
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
             }
-            client
-                .send(
-                    Frame::WsMessage {
-                        id,
-                        data: "hi-echo".into(),
-                        binary: false,
-                    }
-                    .to_msg(),
-                )
-                .await
-                .unwrap();
-        });
-        let (mut bws, _) = connect_async(format!("ws://127.0.0.1:{http_port}/chat"))
-            .await
-            .unwrap();
-        bws.send(Message::Text("hi".into())).await.unwrap();
-        match bws.next().await {
-            Some(Ok(Message::Text(t))) => assert_eq!(t, "hi-echo"),
-            o => panic!("expected echo, got {o:?}"),
+            other => {
+                panic!("expected HTTP 501 WebSocket rejection, got {other:?}");
+            }
         }
-        task.await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -829,7 +944,7 @@ mod tests {
             Frame::HttpResp {
                 id,
                 status: 200,
-                headers: HashMap::new(),
+                headers: Vec::new(),
                 body: b64().encode(b"resent-ok"),
             }
             .to_msg(),
@@ -841,25 +956,5 @@ mod tests {
             resp.contains("200") && resp.ends_with("resent-ok"),
             "resp={resp}"
         );
-    }
-}
-
-fn reason_phrase(status: u16) -> &'static str {
-    match status {
-        200 => "OK",
-        201 => "Created",
-        204 => "No Content",
-        301 => "Moved Permanently",
-        302 => "Found",
-        304 => "Not Modified",
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        403 => "Forbidden",
-        404 => "Not Found",
-        500 => "Internal Server Error",
-        502 => "Bad Gateway",
-        503 => "Service Unavailable",
-        504 => "Gateway Timeout",
-        _ => "OK",
     }
 }

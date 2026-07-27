@@ -39,6 +39,10 @@ libc = "0.2"
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
 base64 = "0.22"
+bytes = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 
 [dev-dependencies]
 tempfile = "3"
