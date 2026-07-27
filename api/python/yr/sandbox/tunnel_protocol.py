@@ -19,7 +19,7 @@ import os
 import re
 import uuid
 from dataclasses import dataclass, field
-from typing import Dict
+from typing import Dict, List, Optional, Tuple
 
 
 _HTTP_METHOD_RE = re.compile(r"^[A-Z]+$")
@@ -27,6 +27,20 @@ _DEFAULT_MAX_BODY_SIZE = 256 << 20   # 256 MB
 _DEFAULT_MAX_FRAME_SIZE = 384 << 20  # Allows 256 MB base64 bodies plus JSON overhead.
 _CRLF_RE = re.compile(r"[\r\n]")
 _PATH_TRAVERSAL_RE = re.compile(r"(?:^|/)\.\.(?:/|$)")
+_HEADER_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
+
+HeaderItems = List[Tuple[str, str]]
+HOP_BY_HOP_HEADERS = frozenset({
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+})
 
 
 def _read_size_env(name: str, default: int) -> int:
@@ -46,16 +60,128 @@ _MAX_FRAME_SIZE = MAX_TUNNEL_FRAME_SIZE
 def _validate_path(path: str) -> str:
     if not isinstance(path, str):
         raise ValueError("path must be a string")
+    if not path.startswith("/") or path.startswith("//"):
+        raise ValueError(f"HTTP request target must use origin-form: {path!r}")
     if _PATH_TRAVERSAL_RE.search(path):
         raise ValueError(f"Path traversal not allowed: {path!r}")
     return path
 
 
 def _validate_headers(headers: Dict[str, str]) -> Dict[str, str]:
+    if not isinstance(headers, dict):
+        raise ValueError("headers must be an object")
     for k, v in headers.items():
+        if not isinstance(k, str) or not _HEADER_NAME_RE.fullmatch(k):
+            raise ValueError(f"Invalid header name: {k!r}")
+        if not isinstance(v, str):
+            raise ValueError(f"Header value for {k!r} must be a string")
         if _CRLF_RE.search(v):
             raise ValueError(f"CRLF in header value for key {k!r}")
     return headers
+
+
+def _validate_header_items(header_items) -> HeaderItems:
+    if not isinstance(header_items, list):
+        raise ValueError("header_items must be an array")
+    result = []
+    for item in header_items:
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            raise ValueError("header_items entries must be [name, value] pairs")
+        name, value = item
+        _validate_headers({name: value})
+        result.append((name, value))
+    return result
+
+
+def header_items_to_legacy_headers(header_items: HeaderItems) -> Dict[str, str]:
+    """Return a deterministic last-value map for legacy tunnel peers."""
+    result = {}
+    names_by_lower = {}
+    for name, value in _validate_header_items(list(header_items)):
+        lower = name.lower()
+        previous = names_by_lower.get(lower)
+        if previous is not None:
+            result.pop(previous, None)
+        result[name] = value
+        names_by_lower[lower] = name
+    return result
+
+
+def _http_headers_from_frame(data: dict) -> Tuple[Dict[str, str], HeaderItems]:
+    legacy = _validate_headers(data.get("headers", {}))
+    if "header_items" in data:
+        items = _validate_header_items(data["header_items"])
+    else:
+        items = list(legacy.items())
+    return header_items_to_legacy_headers(items), items
+
+
+def filter_hop_by_hop_header_items(
+    header_items: HeaderItems,
+    excluded=(),
+) -> HeaderItems:
+    """Remove fixed and Connection-nominated fields from a header list."""
+    items = _validate_header_items(list(header_items))
+    connection_tokens = {
+        token.strip().lower()
+        for name, value in items
+        if name.lower() == "connection"
+        for token in value.split(",")
+        if token.strip()
+    }
+    blocked = HOP_BY_HOP_HEADERS | connection_tokens | {
+        name.lower() for name in excluded
+    }
+    return [
+        (name, value)
+        for name, value in items
+        if name.lower() not in blocked
+    ]
+
+
+def rebuilt_request_header_items(
+    header_items: HeaderItems,
+    body_length: int,
+) -> HeaderItems:
+    """Build second-hop request headers from decoded first-hop bytes."""
+    result = filter_hop_by_hop_header_items(
+        header_items,
+        excluded=("host", "content-length", "expect"),
+    )
+    result.append(("Content-Length", str(body_length)))
+    return result
+
+
+def rebuilt_response_header_items(
+    header_items: HeaderItems,
+    method: str,
+    status: int,
+    body_length: int,
+) -> HeaderItems:
+    """Build downstream response headers from actual response bytes."""
+    items = _validate_header_items(list(header_items))
+    content_lengths = [
+        value.strip()
+        for name, value in items
+        if name.lower() == "content-length"
+    ]
+    representation_length = None
+    if content_lengths and len(set(content_lengths)) == 1:
+        value = content_lengths[0]
+        if value.isdigit():
+            representation_length = value
+
+    result = filter_hop_by_hop_header_items(
+        items,
+        excluded=("content-length",),
+    )
+    method = method.upper()
+    if method == "HEAD" or status == 304:
+        if representation_length is not None:
+            result.append(("Content-Length", representation_length))
+    elif not (100 <= status < 200) and status != 204:
+        result.append(("Content-Length", str(body_length)))
+    return result
 
 
 def make_id() -> str:
@@ -100,12 +226,23 @@ class HttpReqFrame:
     path: str
     headers: Dict[str, str]
     body: bytes
+    header_items: Optional[HeaderItems] = None
     type: str = field(default="http_req", init=False)
+
+    def __post_init__(self):
+        items = (
+            list(_validate_headers(self.headers).items())
+            if self.header_items is None
+            else _validate_header_items(self.header_items)
+        )
+        self.header_items = items
+        self.headers = header_items_to_legacy_headers(items)
 
     def to_json(self) -> str:
         return json.dumps({
             "type": self.type, "id": self.id, "method": self.method,
             "path": self.path, "headers": self.headers,
+            "header_items": self.header_items,
             "body": base64.b64encode(self.body).decode(),
         })
 
@@ -116,12 +253,23 @@ class HttpRespFrame:
     status: int
     headers: Dict[str, str]
     body: bytes
+    header_items: Optional[HeaderItems] = None
     type: str = field(default="http_resp", init=False)
+
+    def __post_init__(self):
+        items = (
+            list(_validate_headers(self.headers).items())
+            if self.header_items is None
+            else _validate_header_items(self.header_items)
+        )
+        self.header_items = items
+        self.headers = header_items_to_legacy_headers(items)
 
     def to_json(self) -> str:
         return json.dumps({
             "type": self.type, "id": self.id, "status": self.status,
             "headers": self.headers,
+            "header_items": self.header_items,
             "body": base64.b64encode(self.body).decode(),
         })
 
@@ -207,16 +355,20 @@ def parse_frame(raw: str):
         raise ValueError("Frame must be a JSON object")
     t = data.get("type")
     if t == "http_req":
+        headers, header_items = _http_headers_from_frame(data)
         return HttpReqFrame(
             id=data["id"], method=_validate_http_method(data["method"]),
             path=_validate_path(data["path"]),
-            headers=_validate_headers(data.get("headers", {})),
+            headers=headers,
+            header_items=header_items,
             body=_decode_body(data),
         )
     if t == "http_resp":
+        headers, header_items = _http_headers_from_frame(data)
         return HttpRespFrame(
             id=data["id"], status=_validate_http_status(data["status"]),
-            headers=_validate_headers(data.get("headers", {})),
+            headers=headers,
+            header_items=header_items,
             body=_decode_body(data),
         )
     if t == "ws_connect":

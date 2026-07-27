@@ -227,3 +227,12 @@ py_test(
     deps = ["//api/python:yr_lib"],
     env = SAN_ENV,
 )
+py_test(
+    name="test_tunnel_http_fidelity",
+    size="small",
+    srcs=["test_tunnel_http_fidelity.py"],
+    tags = ["smoke"],
+    imports = ["../../"],
+    deps = ["//api/python:yr_lib"],
+    env = SAN_ENV,
+)
