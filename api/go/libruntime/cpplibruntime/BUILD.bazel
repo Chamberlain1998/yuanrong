@@ -25,6 +25,7 @@ cc_library(
 
 cc_binary(
     name = "libcpplibruntime.so",
+    additional_linker_inputs = [":cpplibruntime_exports.lds"],
     deps = select(
         {
             "test_mode": [":mockcpplibruntime_lib"],
@@ -35,7 +36,12 @@ cc_binary(
         "//:disable_datasystem": [],
         "//conditions:default": ["-DENABLE_DATASYSTEM"],
     }),
-    linkopts = LOPTS,
+    linkopts = LOPTS + select({
+        "//:is_linux": [
+            "-Wl,--version-script=$(location :cpplibruntime_exports.lds)",
+        ],
+        "//conditions:default": [],
+    }),
     linkshared = True,
     linkstatic = True,
     visibility = ["//visibility:public"],
