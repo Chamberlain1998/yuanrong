@@ -18,6 +18,7 @@
 package litescheduler
 
 import (
+	"encoding/json"
 	"time"
 
 	"go.uber.org/zap"
@@ -232,7 +233,7 @@ func (ls *LiteScheduler) startSessionUnbindTimer(pool *LiteFunctionPool, session
 
 // handleRetain refreshes a lease. Lock order is carefully designed to avoid
 // deadlock with handleAcquire/assignInstance, which takes pool.Lock(Writer)
-// while holding allocMu (lock order A: allocMu -> pool.Lock).
+// before allocMu (lock order A: pool.Lock -> allocMu).
 //
 // To break the AB-BA cycle (retain wants allocMu -> pool.RLock, but
 // pool.RLock is blocked by an outstanding pool.Lock), handleRetain NEVER
@@ -240,6 +241,24 @@ func (ls *LiteScheduler) startSessionUnbindTimer(pool *LiteFunctionPool, session
 // in three short critical sections; pool.RLock is taken only after
 // releasing allocMu.
 func (ls *LiteScheduler) handleRetain(req *LiteRequest, startTime time.Time) *commonTypes.InstanceResponse {
+	var metrics *types.InstanceThreadMetrics
+	if len(req.MetricsData) != 0 {
+		metrics = &types.InstanceThreadMetrics{}
+		if err := json.Unmarshal(req.MetricsData, metrics); err != nil {
+			log.GetLogger().With(zap.String("traceID", req.TraceID)).
+				Warnf("lite retain metrics unmarshal failed: %v", err)
+			metrics = nil
+		}
+	}
+	return ls.handleRetainWithMetrics(req, metrics, startTime)
+}
+
+// handleRetainWithMetrics refreshes an existing allocation, or reconstructs it
+// from frontend-supplied ReacquireData when the in-memory allocation was lost.
+// Batch retain calls this helper directly after unmarshalling its metrics map
+// once, avoiding one marshal/unmarshal cycle per allocation.
+func (ls *LiteScheduler) handleRetainWithMetrics(req *LiteRequest, metrics *types.InstanceThreadMetrics,
+	startTime time.Time) *commonTypes.InstanceResponse {
 	logger := log.GetLogger().With(zap.String("traceID", req.TraceID), zap.String("allocID", req.AllocationIDs[0]))
 	allocID := req.AllocationIDs[0]
 
@@ -249,12 +268,15 @@ func (ls *LiteScheduler) handleRetain(req *LiteRequest, startTime time.Time) *co
 	alloc, ok := ls.allocations[allocID]
 	if !ok {
 		ls.allocMu.Unlock()
-		logger.Warnf("lite retain allocation not found, lease expired or released")
-		return liteErrResp(statuscode.LeaseIDNotFoundCode, statuscode.LeaseIDNotFoundMsg, startTime)
+		return ls.reacquireAllocation(req, metrics, startTime)
 	}
 	funcKey := alloc.FuncKey
 	instanceID := alloc.InstanceID
 	ls.allocMu.Unlock()
+	if req.NeedReverseLookup && !ls.isFuncEnabled(funcKey) {
+		logger.Warnf("lite retain func %s is no longer enabled", funcKey)
+		return liteErrResp(statuscode.FuncMetaNotFoundErrCode, statuscode.FuncMetaNotFoundErrMsg, startTime)
+	}
 
 	// (2) Resolve the pool outside allocMu. getPool takes poolsMu.RLock only.
 	pool := ls.getPool(funcKey)
@@ -306,27 +328,161 @@ func (ls *LiteScheduler) handleRetain(req *LiteRequest, startTime time.Time) *co
 	// leaseHolder.extendLease -> timeWheel.
 	ls.updateExpiryTask(allocID)
 
-	if ls.metrics != nil {
-		policy := "unknown"
-		if pool.dispatcher != nil {
-			policy = pool.dispatcher.Policy()
-		}
-		ls.metrics.incRetain(alloc.FuncKey, alloc.TenantID, policy, "success")
-	}
+	ls.recordRetainSuccess(pool, alloc)
 	logger.Debugf("lite retain refreshed: instance %s, new expiry %s", instanceID, newExpire.Format(time.RFC3339Nano))
 	return liteSuccessResp(slot, alloc.AllocationID, alloc.FuncKey, startTime)
 }
 
+// reacquireAllocation rebuilds one missing Lite allocation from the retain
+// request's ReacquireData. It deliberately restores the original allocation ID
+// and its encoded instance ID instead of invoking normal acquire, which could
+// choose another instance and generate a different allocation ID.
+func (ls *LiteScheduler) reacquireAllocation(req *LiteRequest, metrics *types.InstanceThreadMetrics,
+	startTime time.Time) *commonTypes.InstanceResponse {
+	allocID := req.AllocationIDs[0]
+	logger := log.GetLogger().With(zap.String("traceID", req.TraceID), zap.String("allocID", allocID))
+	if metrics == nil || len(metrics.ReacquireData) == 0 {
+		logger.Warnf("lite retain allocation not found and reacquireData is empty")
+		return liteErrResp(statuscode.LeaseIDNotFoundCode, statuscode.LeaseIDNotFoundMsg, startTime)
+	}
+	isLite, expectedSessionHash, instanceID, _ := parseLiteAllocationID(allocID)
+	if !isLite {
+		logger.Warnf("lite retain reacquire allocation ID is invalid")
+		return liteErrResp(statuscode.LeaseIDIllegalCode, statuscode.LeaseIDIllegalMsg, startTime)
+	}
+	sessionID, sessionTTL, _ := extractSessionConfig(metrics.ReacquireData)
+	if sessionID == "" || sessionTTL < 0 {
+		logger.Warnf("lite retain reacquire session config is invalid: sessionID empty=%t, sessionTTL=%d",
+			sessionID == "", sessionTTL)
+		return liteErrResp(statuscode.InstanceSessionInvalidErrCode, "session config invalid", startTime)
+	}
+	if sessionHash(sessionID) != expectedSessionHash {
+		logger.Warnf("lite retain reacquire session hash does not match allocation ID")
+		return liteErrResp(statuscode.LeaseIDIllegalCode, statuscode.LeaseIDIllegalMsg, startTime)
+	}
+	funcKey := metrics.FunctionKey
+	if funcKey == "" || !ls.isFuncEnabled(funcKey) {
+		logger.Warnf("lite retain reacquire function %s is missing or not enabled", funcKey)
+		return liteErrResp(statuscode.FuncMetaNotFoundErrCode, statuscode.FuncMetaNotFoundErrMsg, startTime)
+	}
+	tenantID := splitFuncKey(funcKey).tenantID
+	if ls.ownerProxy != nil {
+		ownerID, owned := ls.ownerProxy.CheckHashOwner(tenantID + "/" + sessionID)
+		if !owned {
+			logger.Warnf("lite retain reacquire is not session owner, reroute to %s", ownerID)
+			// Keep ErrorMessage as the raw InstanceID. The frontend consumes it
+			// directly when rerouting a failed batch retain.
+			return liteErrResp(statuscode.AcquireNonOwnerSchedulerErrorCode, ownerID, startTime)
+		}
+	}
+	pool := ls.getPool(funcKey)
+	if pool == nil {
+		logger.Warnf("lite retain reacquire pool not found")
+		return liteErrResp(statuscode.FuncMetaNotFoundErrCode, statuscode.FuncMetaNotFoundErrMsg, startTime)
+	}
+
+	pool.Lock()
+	slot := pool.instances[instanceID]
+	if slot == nil || (slot.FuncKey != "" && slot.FuncKey != funcKey) {
+		pool.Unlock()
+		logger.Warnf("lite retain reacquire instance %s not found in function pool", instanceID)
+		return liteErrResp(statuscode.InstanceNotFoundErrCode, statuscode.InstanceNotFoundErrMsg, startTime)
+	}
+	if slot.Status == InstanceStatusUnavailable {
+		pool.Unlock()
+		logger.Warnf("lite retain reacquire instance %s is unavailable", instanceID)
+		return liteErrResp(statuscode.InstanceStatusAbnormalCode,
+			constant.LeaseErrorInstanceIsAbnormalMessage, startTime)
+	}
+	if binding, ok := pool.sessions[sessionID]; ok && binding.instanceID != instanceID {
+		pool.Unlock()
+		logger.Warnf("lite retain reacquire session is already bound to instance %s, requested %s",
+			binding.instanceID, instanceID)
+		return liteErrResp(statuscode.InstanceSessionInvalidErrCode,
+			"session is bound to a different instance", startTime)
+	}
+
+	// Serialize reconstruction with normal acquire and other reconstruction
+	// attempts. The second map lookup makes recovery idempotent: concurrent
+	// retains for the same missing allocation only increment InUse once.
+	now := time.Now()
+	ls.allocMu.Lock()
+	alloc, exists := ls.allocations[allocID]
+	if exists {
+		alloc.ExpireAt = now.Add(liteTTL())
+		ls.allocMu.Unlock()
+		pool.Unlock()
+		ls.updateExpiryTask(allocID)
+		ls.recordRetainSuccess(pool, alloc)
+		logger.Infof("lite retain reacquire raced with another recovery, refreshed existing allocation")
+		return liteSuccessResp(slot, alloc.AllocationID, alloc.FuncKey, startTime)
+	}
+	if ls.allocations == nil {
+		ls.allocations = make(map[string]*Allocation)
+	}
+	alloc = &Allocation{
+		AllocationID: allocID,
+		SessionID:    sessionID,
+		SessionTTL:   sessionTTL,
+		TenantID:     tenantID,
+		InstanceID:   instanceID,
+		FuncKey:      funcKey,
+		ExpireAt:     now.Add(liteTTL()),
+		CreatedAt:    now,
+	}
+	ls.allocations[allocID] = alloc
+	slot.InUse++
+	pool.bindSessionOnAcquire(sessionID, instanceID)
+	overCapacity := slot.InUse > slot.Capacity
+	newInUse := slot.InUse
+	capacity := slot.Capacity
+	ls.allocMu.Unlock()
+	pool.Unlock()
+
+	// UpdateTask refreshes a stale task when one exists and adds a new task
+	// otherwise. This is preferable to AddTask for a recovered allocation.
+	ls.updateExpiryTask(allocID)
+	ls.recordRetainSuccess(pool, alloc)
+	if overCapacity {
+		// Designated lease recovery mirrors the legacy path: it may restore an
+		// already-issued lease even when local capacity appears full.
+		logger.Warnf("lite retain reacquired allocation over capacity: instance %s inUse %d/%d",
+			instanceID, newInUse, capacity)
+	} else {
+		logger.Infof("lite retain reacquired allocation: instance %s inUse %d/%d",
+			instanceID, newInUse, capacity)
+	}
+	return liteSuccessResp(slot, allocID, funcKey, startTime)
+}
+
+func (ls *LiteScheduler) recordRetainSuccess(pool *LiteFunctionPool, alloc *Allocation) {
+	if ls.metrics == nil || alloc == nil {
+		return
+	}
+	policy := "unknown"
+	if pool != nil && pool.dispatcher != nil {
+		policy = pool.dispatcher.Policy()
+	}
+	ls.metrics.incRetain(alloc.FuncKey, alloc.TenantID, policy, "success")
+}
+
 func (ls *LiteScheduler) handleBatchRetain(req *LiteRequest, startTime time.Time) *commonTypes.BatchInstanceResponse {
 	logger := log.GetLogger().With(zap.String("traceID", req.TraceID))
+	metricsByAllocation := make(map[string]*types.InstanceThreadMetrics)
+	if len(req.MetricsData) != 0 {
+		if err := json.Unmarshal(req.MetricsData, &metricsByAllocation); err != nil {
+			logger.Warnf("lite batchRetain metrics unmarshal failed: %v", err)
+		}
+	}
 	resp := &commonTypes.BatchInstanceResponse{
 		InstanceAllocSucceed: map[string]commonTypes.InstanceAllocationSucceedInfo{},
 		InstanceAllocFailed:  map[string]commonTypes.InstanceAllocationFailedInfo{},
 		LeaseInterval:        int64(liteTTL().Milliseconds()),
 	}
 	for _, allocID := range req.AllocationIDs {
-		sub := &LiteRequest{Op: "retain", AllocationIDs: []string{allocID}, TraceID: req.TraceID}
-		insResp := ls.handleRetain(sub, startTime)
+		sub := &LiteRequest{Op: "retain", AllocationIDs: []string{allocID}, TraceID: req.TraceID,
+			NeedReverseLookup: true}
+		insResp := ls.handleRetainWithMetrics(sub, metricsByAllocation[allocID], startTime)
 		if insResp.ErrorCode == constant.InsReqSuccessCode {
 			resp.InstanceAllocSucceed[allocID] = commonTypes.InstanceAllocationSucceedInfo{
 				FuncKey: insResp.FuncKey, FuncSig: insResp.FuncSig,

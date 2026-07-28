@@ -185,11 +185,18 @@ func (ls *LiteScheduler) Process(req *LiteRequest, traceID, traceParent string,
 	}()
 	if req.NeedReverseLookup {
 		if fillErr := ls.reverseLookup(req); fillErr != nil {
-			logger.Warnf("lite Process reverse lookup failed: code %d, %s", fillErr.code, fillErr.msg)
-			data, _ := json.Marshal(liteErrResp(fillErr.code, fillErr.msg, startTime))
-			return data, nil
-		}
-		if !ls.isFuncEnabled(req.FuncKey) {
+			// A retain carrying ReacquireData can rebuild a missing in-memory
+			// allocation. Do not reject it before the retain handler gets a
+			// chance to perform that recovery. Release has no recovery contract
+			// and still fails immediately. Batch retain resolves every item in
+			// the handler so one missing allocation does not block the rest.
+			if req.Op != "retain" && req.Op != "batchRetain" {
+				logger.Warnf("lite Process reverse lookup failed: code %d, %s", fillErr.code, fillErr.msg)
+				data, _ := json.Marshal(liteErrResp(fillErr.code, fillErr.msg, startTime))
+				return data, nil
+			}
+			logger.Infof("lite Process reverse lookup missed for %s, defer to retain recovery", req.Op)
+		} else if !ls.isFuncEnabled(req.FuncKey) {
 			logger.Warnf("lite Process func %s not enabled after reverse lookup (whitelist excluded)", req.FuncKey)
 			data, _ := json.Marshal(liteErrResp(statuscode.FuncMetaNotFoundErrCode, statuscode.FuncMetaNotFoundErrMsg, startTime))
 			return data, nil
@@ -234,17 +241,10 @@ type lookupErr struct {
 	msg  string
 }
 
-// reverseLookup fills SessionID/TenantID/FuncKey from the allocations map.
-//
-// For batch requests carrying multiple allocationIDs the loop overwrites
-// SessionID/TenantID/FuncKey on each iteration, so the LAST alloc's fields win.
-// This is intentional: ParseRequest guarantees that batchRetain only enters the
-// lite branch when ALL allocationIDs share the lite prefix and originate from the
-// same session (mixed lite/non-lite or all-non-lite fall back to the legacy path).
-// Under that invariant every alloc in the batch maps to the same session/tenant/
-// funcKey, so "last wins" is equivalent to "any wins"; isFuncEnabled thus checks
-// the batch's representative funcKey reliably. If that invariant ever weakens
-// (e.g. cross-session batches admitted), this function must be revisited.
+// reverseLookup fills SessionID/TenantID/FuncKey from the allocations map. It is
+// the authoritative lookup for release and a fast-path validation for retain.
+// Batch retain resolves and validates each allocation independently in its
+// handler; the representative fields written here are not used for recovery.
 func (ls *LiteScheduler) reverseLookup(req *LiteRequest) *lookupErr {
 	ls.allocMu.RLock()
 	defer ls.allocMu.RUnlock()
