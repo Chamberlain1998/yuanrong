@@ -4,10 +4,10 @@ load("//bazel:yr.bzl", "COPTS", "LOPTS")
 METRICS_PLUGIN_LINKER_INPUTS = [":plugin_exports.lds"]
 
 METRICS_PLUGIN_LINKOPTS = select({
-    "//:is_macos": [],
-    "//conditions:default": [
+    "//:is_linux": [
         "-Wl,--version-script=$(location :plugin_exports.lds)",
     ],
+    "//conditions:default": [],
 })
 
 # Common utilities for metrics

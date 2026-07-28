@@ -99,6 +99,7 @@ class NativeSymbolExportsTest(unittest.TestCase):
         self.assertIn("*;", exports)
         self.assertIn('additional_linker_inputs = [":jni_exports.lds"]', build)
         self.assertIn("-Wl,--version-script=$(location :jni_exports.lds)", build)
+        self.assertIn('"//:is_linux": [', build)
 
     def test_metrics_plugins_export_only_factory_hook(self):
         self.assertTrue(METRICS_EXPORTS.is_file(), "metrics plugin linker version script is missing")
@@ -111,6 +112,7 @@ class NativeSymbolExportsTest(unittest.TestCase):
         self.assertEqual(3, build.count("additional_linker_inputs = METRICS_PLUGIN_LINKER_INPUTS"))
         self.assertEqual(3, build.count("linkopts = METRICS_PLUGIN_LINKOPTS"))
         self.assertIn("-Wl,--version-script=$(location :plugin_exports.lds)", build)
+        self.assertIn('"//:is_linux": [', build)
 
 
 if __name__ == "__main__":

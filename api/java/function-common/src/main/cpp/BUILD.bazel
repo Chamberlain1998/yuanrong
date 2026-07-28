@@ -13,10 +13,10 @@ cc_binary(
         "//conditions:default": ["-DENABLE_DATASYSTEM"],
     }),
     linkopts = select({
-        "//:is_macos": [],
-        "//conditions:default": [
+        "//:is_linux": [
             "-Wl,--version-script=$(location :jni_exports.lds)",
         ],
+        "//conditions:default": [],
     }),
     linkstatic = True,
     linkshared = True,
