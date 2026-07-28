@@ -19,6 +19,7 @@ package litescheduler
 
 import (
 	"testing"
+	"time"
 
 	"github.com/smartystreets/goconvey/convey"
 	"yuanrong.org/kernel/pkg/common/faas_common/constant"
@@ -60,10 +61,22 @@ func TestHandleInstanceUpdateFatalRemovesSlot(t *testing.T) {
 func TestFunctionDeleteRemovesPool(t *testing.T) {
 	convey.Convey("function delete removes pool and allocations", t, func() {
 		ls := &LiteScheduler{pools: map[string]*LiteFunctionPool{}, allocations: map[string]*Allocation{}}
-		ls.pools["t1/fA/v1"] = &LiteFunctionPool{funcKey: "t1/fA/v1", instances: map[string]*LiteInstance{}, sessions: map[string]*sessionBinding{}}
+		pool := newTestPool(t)
+		ls.pools["t1/fA/v1"] = pool
+		resp := ls.handleAcquire(&LiteRequest{Op: "acquire", FuncKey: "t1/fA/v1",
+			SessionID: "sess1", SessionTTL: 3600, TenantID: "t1", TraceID: "tr"}, time.Now())
+		ls.handleRelease(&LiteRequest{Op: "release", AllocationIDs: []string{resp.ThreadID}, TraceID: "tr"},
+			time.Now())
+		pool.RLock()
+		binding := pool.sessions["sess1"]
+		timerStored := binding != nil && binding.timer != nil
+		pool.RUnlock()
+		convey.So(timerStored, convey.ShouldBeTrue)
 		ls.allocations["lite:x:ins1:thread:1"] = &Allocation{FuncKey: "t1/fA/v1"}
 		ls.deletePool("t1/fA/v1")
 		convey.So(ls.pools["t1/fA/v1"], convey.ShouldBeNil)
 		convey.So(ls.allocations["lite:x:ins1:thread:1"], convey.ShouldBeNil)
+		convey.So(pool.sessions, convey.ShouldBeEmpty)
+		convey.So(binding.timer, convey.ShouldBeNil)
 	})
 }

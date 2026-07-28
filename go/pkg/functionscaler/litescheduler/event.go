@@ -168,8 +168,8 @@ func (ls *LiteScheduler) deletePool(funcKey string) {
 	if ok {
 		// Stop all session idle-unbind timers before deleting the pool.
 		pool.Lock()
-		for _, binding := range pool.sessions {
-			binding.stopTimer()
+		for sessionID := range pool.sessions {
+			pool.removeSessionBinding(sessionID)
 		}
 		pool.Unlock()
 	}
