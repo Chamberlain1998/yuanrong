@@ -46,13 +46,17 @@ pyx_library(
         "yr/includes/*.pxi",
     ]),
     cc_kwargs = dict(
+        additional_linker_inputs = [":fnruntime_exports.lds"],
         copts = COPTS + select({
             "//:disable_datasystem": [],
             "//conditions:default": ["-DENABLE_DATASYSTEM"],
         }),
         linkopts = select({
-            "//:is_macos": [],
-            "//conditions:default": ["-Wl,-Bsymbolic"],
+            "//:is_linux": [
+                "-Wl,-Bsymbolic",
+                "-Wl,--version-script=$(location :fnruntime_exports.lds)",
+            ],
+            "//conditions:default": [],
         }),
     ),
     visibility = ["__subpackages__"],

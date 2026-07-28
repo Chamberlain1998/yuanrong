@@ -68,9 +68,15 @@ cc_library(
 
 cc_binary(
     name = "libyr-api.so",
+    additional_linker_inputs = [":yr_api_exports.lds"],
     copts = COPTS,
 
-    linkopts = LOPTS,
+    linkopts = LOPTS + select({
+        "//:is_linux": [
+            "-Wl,--version-script=$(location :yr_api_exports.lds)",
+        ],
+        "//conditions:default": [],
+    }),
     linkshared = True,
     linkstatic = True,
     visibility = ["//visibility:public"],
