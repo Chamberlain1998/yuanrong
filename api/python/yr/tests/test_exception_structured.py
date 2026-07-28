@@ -47,24 +47,36 @@ def test_runtime_error_has_structured_fields_and_runtime_compatibility():
 
 
 def test_error_info_is_preserved():
-    """ErrorInfo can be carried without parsing str(error)."""
+    """ErrorInfo fields stay structured while the legacy message remains parseable."""
     info = ErrorInfo(ErrorCode.ERR_GET_OPERATION_FAILED, ModuleCode.RUNTIME, "get failed")
     error = YRRuntimeError.from_error_info(info)
 
     assert error.error_info is info
     assert error.code == ErrorCode.ERR_GET_OPERATION_FAILED
     assert error.module_code == ModuleCode.RUNTIME
-    assert error.message == "get failed"
+    assert error.message == "code: 4005, module code 20, msg: get failed"
+    assert str(error) == "code: 4005, module code 20, msg: get failed"
 
 
 def test_error_info_message_prefix_is_preserved():
-    """ErrorInfo context prefixes are preserved in the public message."""
+    """ErrorInfo prefixes and numeric codes remain in the public message."""
     info = ErrorInfo(ErrorCode.ERR_GET_OPERATION_FAILED, ModuleCode.RUNTIME, "boom")
     error = YRRuntimeError.from_error_info(info, message_prefix="failed to get object")
 
     assert error.error_info is info
-    assert error.message == "failed to get object, msg: boom"
-    assert str(error) == "failed to get object, msg: boom"
+    assert error.message == "failed to get object, code: 4005, module code 20, msg: boom"
+    assert str(error) == "failed to get object, code: 4005, module code 20, msg: boom"
+
+
+def test_integer_error_info_codes_remain_in_legacy_messages():
+    """Cython integer error fields remain parseable with and without a prefix."""
+    info = ErrorInfo(4005, 20, "get failed")
+
+    error = YRRuntimeError.from_error_info(info)
+    prefixed_error = YRRuntimeError.from_error_info(info, message_prefix="failed to get object")
+
+    assert error.message == "code: 4005, module code 20, msg: get failed"
+    assert prefixed_error.message == "failed to get object, code: 4005, module code 20, msg: get failed"
 
 
 def test_timeout_value_and_type_errors_keep_builtin_catch_compatibility():
