@@ -18,6 +18,8 @@
 package litescheduler
 
 import (
+	"errors"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -29,6 +31,40 @@ import (
 	"yuanrong.org/kernel/pkg/functionscaler/config"
 	"yuanrong.org/kernel/pkg/functionscaler/types"
 )
+
+type expiryWaitResult struct {
+	readyList []string
+	err       error
+}
+
+type scriptedExpiryWheel struct {
+	results  chan expiryWaitResult
+	stopCh   chan struct{}
+	stopOnce sync.Once
+}
+
+func newScriptedExpiryWheel() *scriptedExpiryWheel {
+	return &scriptedExpiryWheel{
+		results: make(chan expiryWaitResult, 1),
+		stopCh:  make(chan struct{}),
+	}
+}
+
+func (w *scriptedExpiryWheel) Wait() ([]string, error) {
+	select {
+	case result := <-w.results:
+		return result.readyList, result.err
+	case <-w.stopCh:
+		return nil, nil
+	}
+}
+
+func (w *scriptedExpiryWheel) AddTask(string, time.Duration, int) error    { return nil }
+func (w *scriptedExpiryWheel) DelTask(string) error                        { return nil }
+func (w *scriptedExpiryWheel) UpdateTask(string, time.Duration, int) error { return nil }
+func (w *scriptedExpiryWheel) Stop() {
+	w.stopOnce.Do(func() { close(w.stopCh) })
+}
 
 // newExpiryTestScheduler constructs a LiteScheduler with a real expiryWheel
 // whose perimeter (pace*slots) is small enough to accept a short test TTL.
@@ -359,6 +395,15 @@ func TestAcquireCancelsIdleUnbindTimer(t *testing.T) {
 		relReq := &LiteRequest{Op: "release",
 			AllocationIDs: []string{allocID1}, FuncKey: "t1/fA/v1", TraceID: "tr"}
 		ls.handleRelease(relReq, time.Now())
+		pool := ls.pools["t1/fA/v1"]
+		pool.RLock()
+		binding := pool.sessions["sess1"]
+		timerStored := binding != nil && binding.timer != nil
+		expiring := binding != nil && binding.expiring
+		pool.RUnlock()
+		convey.So(binding, convey.ShouldNotBeNil)
+		convey.So(timerStored, convey.ShouldBeTrue)
+		convey.So(expiring, convey.ShouldBeTrue)
 
 		// Wait 200ms (well within the 2s sessionTTL), then re-acquire.
 		time.Sleep(200 * time.Millisecond)
@@ -366,15 +411,156 @@ func TestAcquireCancelsIdleUnbindTimer(t *testing.T) {
 			SessionID: "sess1", SessionTTL: 2, TenantID: "t1", TraceID: "tr"}
 		resp2 := ls.handleAcquire(req2, time.Now())
 		convey.So(resp2.ErrorCode, convey.ShouldEqual, constant.InsReqSuccessCode)
+		pool.RLock()
+		binding = pool.sessions["sess1"]
+		timerCleared := binding != nil && binding.timer == nil
+		expiring = binding != nil && binding.expiring
+		pool.RUnlock()
+		convey.So(binding, convey.ShouldNotBeNil)
+		convey.So(timerCleared, convey.ShouldBeTrue)
+		convey.So(expiring, convey.ShouldBeFalse)
 
 		// Wait beyond the original 2s sessionTTL; session should still be bound
 		// because the timer was cancelled by the re-acquire.
 		time.Sleep(3 * time.Second)
-		pool := ls.pools["t1/fA/v1"]
 		pool.RLock()
 		binding, hasBinding := pool.sessions["sess1"]
+		activeAllocs := 0
+		if binding != nil {
+			activeAllocs = binding.activeAllocs
+		}
 		pool.RUnlock()
 		convey.So(hasBinding, convey.ShouldBeTrue)
-		convey.So(binding.activeAllocs, convey.ShouldEqual, 1)
+		convey.So(activeAllocs, convey.ShouldEqual, 1)
 	})
+}
+
+// TestCancelledTimerCannotRemoveNewIdleGeneration verifies that a callback from
+// an older idle period cannot remove the binding created by a later release.
+func TestCancelledTimerCannotRemoveNewIdleGeneration(t *testing.T) {
+	pool := newTestPool(t)
+	ls := &LiteScheduler{
+		pools:       map[string]*LiteFunctionPool{"t1/fA/v1": pool},
+		allocations: map[string]*Allocation{},
+	}
+	firstReq := &LiteRequest{Op: "acquire", FuncKey: "t1/fA/v1",
+		SessionID: "sess1", SessionTTL: 1, TenantID: "t1", TraceID: "tr"}
+	firstResp := ls.handleAcquire(firstReq, time.Now())
+	ls.handleRelease(&LiteRequest{Op: "release", AllocationIDs: []string{firstResp.ThreadID}, TraceID: "tr"},
+		time.Now())
+
+	time.Sleep(600 * time.Millisecond)
+	secondReq := &LiteRequest{Op: "acquire", FuncKey: "t1/fA/v1",
+		SessionID: "sess1", SessionTTL: 2, TenantID: "t1", TraceID: "tr"}
+	secondResp := ls.handleAcquire(secondReq, time.Now())
+	ls.handleRelease(&LiteRequest{Op: "release", AllocationIDs: []string{secondResp.ThreadID}, TraceID: "tr"},
+		time.Now())
+
+	// The first deadline has elapsed, but the second idle period still has more
+	// than one second remaining. The binding must belong to the second timer.
+	time.Sleep(600 * time.Millisecond)
+	pool.Lock()
+	binding, exists := pool.sessions["sess1"]
+	if !exists || binding.timer == nil || !binding.expiring {
+		pool.Unlock()
+		t.Fatalf("new idle generation was removed by an old timer: exists=%v binding=%+v", exists, binding)
+	}
+	pool.removeSessionBinding("sess1")
+	pool.Unlock()
+}
+
+// TestSessionTimerDoesNotLeakGoroutines is a regression for the OOM root cause:
+// each old implementation release left one goroutine blocked on timer.C.
+func TestSessionTimerDoesNotLeakGoroutines(t *testing.T) {
+	const cycles = 256
+	pool := newTestPool(t)
+	ls := &LiteScheduler{
+		pools:       map[string]*LiteFunctionPool{"t1/fA/v1": pool},
+		allocations: map[string]*Allocation{},
+	}
+	req := &LiteRequest{Op: "acquire", FuncKey: "t1/fA/v1",
+		SessionID: "leak-session", SessionTTL: 3600, TenantID: "t1", TraceID: "tr"}
+	baseline := runtime.NumGoroutine()
+	for i := 0; i < cycles; i++ {
+		resp := ls.handleAcquire(req, time.Now())
+		if resp.ErrorCode != constant.InsReqSuccessCode {
+			t.Fatalf("cycle %d acquire failed: %d %s", i, resp.ErrorCode, resp.ErrorMessage)
+		}
+		ls.handleRelease(&LiteRequest{Op: "release", AllocationIDs: []string{resp.ThreadID}, TraceID: "tr"},
+			time.Now())
+	}
+	pool.Lock()
+	pool.removeSessionBinding("leak-session")
+	pool.Unlock()
+	runtime.Gosched()
+	time.Sleep(50 * time.Millisecond)
+	if delta := runtime.NumGoroutine() - baseline; delta > 20 {
+		t.Fatalf("session timer goroutines grew with release cycles: delta=%d cycles=%d", delta, cycles)
+	}
+}
+
+func TestProcessExpiryEventsHandlesReadyListWithError(t *testing.T) {
+	pool := newTestPool(t)
+	pool.instances["ins1"].InUse = 1
+	wheel := newScriptedExpiryWheel()
+	stopCh := make(chan struct{})
+	ls := &LiteScheduler{
+		pools:       map[string]*LiteFunctionPool{"t1/fA/v1": pool},
+		allocations: map[string]*Allocation{},
+		stopCh:      stopCh,
+		expiryWheel: wheel,
+	}
+	const allocID = "lite:hash:ins1:thread:1"
+	ls.allocations[allocID] = &Allocation{
+		AllocationID: allocID, SessionID: "sess1", TenantID: "t1",
+		InstanceID: "ins1", FuncKey: "t1/fA/v1",
+	}
+	wheel.results <- expiryWaitResult{readyList: []string{allocID}, err: errors.New("backlog warning")}
+	done := make(chan struct{})
+	go func() {
+		ls.processExpiryEvents()
+		close(done)
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		ls.allocMu.RLock()
+		_, exists := ls.allocations[allocID]
+		ls.allocMu.RUnlock()
+		if !exists {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	ls.allocMu.RLock()
+	_, exists := ls.allocations[allocID]
+	ls.allocMu.RUnlock()
+	if exists {
+		t.Fatal("ready allocation was discarded when Wait returned a warning")
+	}
+	close(stopCh)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("expiry event loop did not stop")
+	}
+}
+
+func TestProcessExpiryEventsStopsWhileWaitIsBlocked(t *testing.T) {
+	stopCh := make(chan struct{})
+	ls := &LiteScheduler{
+		stopCh:      stopCh,
+		expiryWheel: timewheel.NewSimpleTimeWheel(2*time.Millisecond, 2),
+	}
+	done := make(chan struct{})
+	go func() {
+		ls.processExpiryEvents()
+		close(done)
+	}()
+	close(stopCh)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("expiry event loop remained blocked in TimeWheel.Wait after stop")
+	}
 }

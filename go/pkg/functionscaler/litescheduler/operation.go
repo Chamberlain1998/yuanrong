@@ -192,32 +192,42 @@ func (ls *LiteScheduler) handleRelease(req *LiteRequest, startTime time.Time) *c
 	return liteSuccessResp(slot, alloc.AllocationID, alloc.FuncKey, startTime)
 }
 
-// startSessionUnbindTimer starts a goroutine that waits for sessionTTL and then
-// removes the session→instance binding if no new acquire arrived in between.
-// Mirrors legacy's startUnbindInstanceSession + unbindInstanceSession pattern.
+// startSessionUnbindTimer schedules removal of the session→instance binding if
+// no new acquire arrives before sessionTTL. The timer is stored on the binding
+// so reacquire, instance deletion and function deletion can cancel it.
 func (ls *LiteScheduler) startSessionUnbindTimer(pool *LiteFunctionPool, sessionID string, sessionTTL int) {
 	ttl := sessionTTLFor(sessionTTL)
-	go func() {
-		timer := time.NewTimer(ttl)
-		defer timer.Stop()
-		<-timer.C
+	pool.Lock()
+	binding, ok := pool.sessions[sessionID]
+	// A new acquire or an instance/function deletion can run after the caller
+	// marks the binding expiring and before this method obtains pool.Lock.
+	if !ok || !binding.expiring || binding.activeAllocs != 0 {
+		pool.Unlock()
+		return
+	}
+	binding.stopTimer()
+	var timer *time.Timer
+	timer = time.AfterFunc(ttl, func() {
 		pool.Lock()
-		// Re-check: a concurrent acquire may have already cancelled the timer
-		// (expiring=false) or removed the binding entirely.
-		binding, ok := pool.sessions[sessionID]
-		if !ok || !binding.expiring {
+		current, exists := pool.sessions[sessionID]
+		// Match both binding and timer generations. An old callback may already
+		// be runnable when Stop returns false; it must not remove a newer binding
+		// or a newly-started timer for the same session.
+		if !exists || current != binding || current.timer != timer ||
+			!current.expiring || current.activeAllocs != 0 {
 			pool.Unlock()
 			return
 		}
-		// Still expiring and no active allocs: remove the binding.
-		if binding.activeAllocs == 0 {
-			binding.stopTimer()
-			delete(pool.sessions, sessionID)
-			log.GetLogger().With(zap.String("sessionID", sessionID), zap.String("funcKey", pool.funcKey)).
-				Infof("lite session idle-unbind: session %s unbound after TTL (func %s)", sessionID, pool.funcKey)
-		}
+		current.timer = nil
+		current.expiring = false
+		delete(pool.sessions, sessionID)
+		funcKey := pool.funcKey
 		pool.Unlock()
-	}()
+		log.GetLogger().With(zap.String("sessionID", sessionID), zap.String("funcKey", funcKey)).
+			Infof("lite session idle-unbind: session %s unbound after TTL (func %s)", sessionID, funcKey)
+	})
+	binding.timer = timer
+	pool.Unlock()
 }
 
 // handleRetain refreshes a lease. Lock order is carefully designed to avoid

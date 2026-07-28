@@ -57,6 +57,8 @@ type SimpleTimeWheel struct {
 	notifyCh    chan struct{}
 	readyCh     chan *[]string
 	stopCh      chan struct{}
+	doneCh      chan struct{}
+	stopOnce    sync.Once
 }
 
 // NewSimpleTimeWheel will create a SimpleTimeWheel
@@ -78,6 +80,7 @@ func NewSimpleTimeWheel(pace time.Duration, slotNum int64) TimeWheel {
 		notifyCh:  make(chan struct{}, notifyChannelSize),
 		readyCh:   make(chan *[]string, readyChan),
 		stopCh:    make(chan struct{}),
+		doneCh:    make(chan struct{}),
 	}
 	for i := range timeWheel.slots {
 		timeWheel.slots[i] = &sync.Map{}
@@ -87,6 +90,7 @@ func NewSimpleTimeWheel(pace time.Duration, slotNum int64) TimeWheel {
 }
 
 func (gt *SimpleTimeWheel) run() {
+	defer close(gt.doneCh)
 	for {
 		select {
 		case <-gt.ticker.C:
@@ -129,7 +133,6 @@ func (gt *SimpleTimeWheel) checkAndFireTrigger(currSlot int64) {
 		case gt.readyCh <- &readyList:
 		case <-gt.stopCh:
 			return
-		default:
 		}
 	}
 }
@@ -193,8 +196,11 @@ func (gt *SimpleTimeWheel) DelTask(taskID string) error {
 
 // Stop will stop time wheel
 func (gt *SimpleTimeWheel) Stop() {
-	close(gt.stopCh)
-	close(gt.readyCh)
+	gt.stopOnce.Do(func() {
+		close(gt.stopCh)
+		<-gt.doneCh
+		close(gt.readyCh)
+	})
 }
 
 // UpdateTask del and add a task

@@ -232,8 +232,7 @@ func (p *LiteFunctionPool) bindSessionOnAcquire(sessionID, instanceID string) {
 }
 
 // unbindSessionOnRelease decrements activeAllocs and, if it reaches 0, starts the
-// idle-unbind timer. Returns the sessionID so the caller can launch the timer
-// goroutine (the goroutine must be started OUTSIDE pool.Lock to avoid blocking).
+// idle-unbind timer. The caller schedules the timer outside pool.Lock.
 // Caller must hold pool.Lock.
 func (p *LiteFunctionPool) unbindSessionOnRelease(sessionID string) (needTimer bool, ttl time.Duration) {
 	binding, ok := p.sessions[sessionID]

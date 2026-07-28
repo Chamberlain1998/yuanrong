@@ -220,6 +220,56 @@ func TestSimpleTimeWheel_Stop(t *testing.T) {
 	_ = err
 }
 
+func TestSimpleTimeWheel_StopIsConcurrentAndIdempotent(t *testing.T) {
+	tw := NewSimpleTimeWheel(10*time.Millisecond, 10)
+	const callers = 8
+	var wg sync.WaitGroup
+	wg.Add(callers)
+	for i := 0; i < callers; i++ {
+		go func() {
+			defer wg.Done()
+			tw.Stop()
+		}()
+	}
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("concurrent Stop calls did not return")
+	}
+}
+
+func TestSimpleTimeWheelReadyNotificationIsNotDroppedWhenChannelIsFull(t *testing.T) {
+	tw := NewSimpleTimeWheel(2*time.Millisecond, 2)
+	defer tw.Stop()
+	simple := tw.(*SimpleTimeWheel)
+	dummy := []string{"dummy"}
+	for i := 0; i < cap(simple.readyCh); i++ {
+		simple.readyCh <- &dummy
+	}
+	if err := tw.AddTask("must-deliver", 20*time.Millisecond, 0); err != nil {
+		t.Fatalf("failed to add task: %v", err)
+	}
+	// Let the wheel reach the task while readyCh has no capacity. The producer
+	// must retain backpressure instead of dropping the notification.
+	time.Sleep(100 * time.Millisecond)
+	for i := 0; i < cap(simple.readyCh); i++ {
+		<-simple.readyCh
+	}
+	select {
+	case tasks := <-simple.readyCh:
+		if len(*tasks) != 1 || (*tasks)[0] != "must-deliver" {
+			t.Fatalf("unexpected ready tasks: %v", *tasks)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ready notification was dropped while channel was full")
+	}
+}
+
 func TestSimpleTimeWheel_WaitAfterStop(t *testing.T) {
 	tw := NewSimpleTimeWheel(10*time.Millisecond, 10)
 	tw.Stop()

@@ -71,33 +71,41 @@ func (ls *LiteScheduler) removeExpiryTask(allocID string) {
 // InUse, delete the allocation, and remove the session binding.
 func (ls *LiteScheduler) processExpiryEvents() {
 	logger := log.GetLogger()
-	for {
+	if ls.expiryWheel == nil {
+		logger.Warn("lite expiry wheel is nil, expiry scan loop exiting")
+		return
+	}
+	// Wait blocks on the time wheel's ready channel, so forward scheduler stop
+	// directly to the wheel. Stop closes the ready channel and wakes Wait.
+	stopForwardDone := make(chan struct{})
+	go func() {
 		select {
 		case <-ls.stopCh:
-			if ls.expiryWheel != nil {
-				ls.expiryWheel.Stop()
-			}
-			logger.Info("lite expiry scan loop exiting")
-			return
-		default:
+			ls.expiryWheel.Stop()
+		case <-stopForwardDone:
 		}
-		if ls.expiryWheel == nil {
-			logger.Warn("lite expiry wheel is nil, expiry scan loop exiting")
-			return
-		}
+	}()
+	defer close(stopForwardDone)
+	for {
 		readyList, err := ls.expiryWheel.Wait()
 		if err != nil {
 			logger.Warnf("lite expiry wheel wait: %v", err)
-			continue
 		}
 		if len(readyList) == 0 {
-			continue
-		}
-		go func(ids []string) {
-			for _, allocID := range ids {
-				ls.reapExpiredAllocation(allocID)
+			select {
+			case <-ls.stopCh:
+				logger.Info("lite expiry scan loop exiting")
+			default:
+				logger.Warn("lite expiry wheel stopped, expiry scan loop exiting")
 			}
-		}(readyList)
+			return
+		}
+		// Process every returned batch even when Wait reports backlog. Handling
+		// synchronously provides bounded backpressure instead of spawning an
+		// unbounded number of reap goroutines under an expiry burst.
+		for _, allocID := range readyList {
+			ls.reapExpiredAllocation(allocID)
+		}
 	}
 }
 
