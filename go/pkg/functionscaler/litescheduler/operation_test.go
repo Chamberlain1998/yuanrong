@@ -18,6 +18,7 @@
 package litescheduler
 
 import (
+	"encoding/json"
 	"fmt"
 	"sync"
 	"testing"
@@ -26,6 +27,7 @@ import (
 	"github.com/smartystreets/goconvey/convey"
 	"yuanrong.org/kernel/pkg/common/faas_common/constant"
 	"yuanrong.org/kernel/pkg/common/faas_common/statuscode"
+	commonTypes "yuanrong.org/kernel/pkg/common/faas_common/types"
 	"yuanrong.org/kernel/pkg/functionscaler/config"
 	"yuanrong.org/kernel/pkg/functionscaler/types"
 )
@@ -43,6 +45,33 @@ func newTestPool(t *testing.T) *LiteFunctionPool {
 	p.instances["ins2"] = &LiteInstance{InstanceID: "ins2", FuncKey: "t1/fA/v1", Capacity: 2, InUse: 0,
 		Status: InstanceStatusRunning, FuncSig: "sig"}
 	return p
+}
+
+func newLiteReacquireMetrics(t *testing.T, funcKey, sessionID string,
+	sessionTTL int) *types.InstanceThreadMetrics {
+	t.Helper()
+	sessionData, err := json.Marshal(commonTypes.InstanceSessionConfig{
+		SessionID: sessionID, SessionTTL: sessionTTL, Concurrency: 1,
+	})
+	if err != nil {
+		t.Fatalf("marshal session config: %v", err)
+	}
+	reacquireData, err := json.Marshal(map[string][]byte{
+		constant.InstanceSessionConfig: sessionData,
+	})
+	if err != nil {
+		t.Fatalf("marshal reacquire data: %v", err)
+	}
+	return &types.InstanceThreadMetrics{FunctionKey: funcKey, ReacquireData: reacquireData}
+}
+
+func marshalRetainMetrics(t *testing.T, metrics interface{}) []byte {
+	t.Helper()
+	data, err := json.Marshal(metrics)
+	if err != nil {
+		t.Fatalf("marshal retain metrics: %v", err)
+	}
+	return data
 }
 
 func TestLiteTTL(t *testing.T) {
@@ -116,6 +145,186 @@ func TestRetainDoesNotChangeConcurrency(t *testing.T) {
 		ls.handleRetain(retReq, time.Now())
 		convey.So(ls.allocations[allocID].ExpireAt.After(oldExpire), convey.ShouldBeTrue)
 		convey.So(pool.instances["ins1"].InUse+pool.instances["ins2"].InUse, convey.ShouldEqual, 1) // unchanged
+	})
+}
+
+func TestRetainReacquiresMissingAllocation(t *testing.T) {
+	convey.Convey("retain miss with reacquireData restores the original lite allocation", t, func() {
+		orig := config.GlobalConfig.LiteScheduler
+		defer func() { config.GlobalConfig.LiteScheduler = orig }()
+		config.GlobalConfig.LiteScheduler = types.LiteSchedulerConfig{Enable: true, EnableAllTenants: true}
+
+		ls := &LiteScheduler{pools: map[string]*LiteFunctionPool{}, allocations: map[string]*Allocation{}}
+		pool := newTestPool(t)
+		ls.pools[pool.funcKey] = pool
+		allocID := genAllocationID("sess1", "ins1", 7)
+		metrics := newLiteReacquireMetrics(t, pool.funcKey, "sess1", 30)
+		req := &LiteRequest{Op: "retain", AllocationIDs: []string{allocID}, TraceID: "tr",
+			MetricsData: marshalRetainMetrics(t, metrics), NeedReverseLookup: true}
+
+		data, err := ls.Process(req, req.TraceID, "", req.MetricsData)
+		convey.So(err, convey.ShouldBeNil)
+		resp := &commonTypes.InstanceResponse{}
+		convey.So(json.Unmarshal(data, resp), convey.ShouldBeNil)
+		convey.So(resp.ErrorCode, convey.ShouldEqual, constant.InsReqSuccessCode)
+		convey.So(resp.ThreadID, convey.ShouldEqual, allocID)
+		convey.So(resp.InstanceID, convey.ShouldEqual, "ins1")
+		convey.So(ls.allocations, convey.ShouldContainKey, allocID)
+		convey.So(ls.allocations[allocID].SessionID, convey.ShouldEqual, "sess1")
+		convey.So(pool.instances["ins1"].InUse, convey.ShouldEqual, 1)
+		convey.So(pool.sessions["sess1"].activeAllocs, convey.ShouldEqual, 1)
+	})
+}
+
+func TestRetainMissWithoutReacquireData(t *testing.T) {
+	convey.Convey("retain miss without reacquireData keeps LeaseIDNotFound behavior", t, func() {
+		orig := config.GlobalConfig.LiteScheduler
+		defer func() { config.GlobalConfig.LiteScheduler = orig }()
+		config.GlobalConfig.LiteScheduler = types.LiteSchedulerConfig{Enable: true, EnableAllTenants: true}
+
+		ls := &LiteScheduler{pools: map[string]*LiteFunctionPool{}, allocations: map[string]*Allocation{}}
+		pool := newTestPool(t)
+		ls.pools[pool.funcKey] = pool
+		allocID := genAllocationID("sess1", "ins1", 1)
+		req := &LiteRequest{Op: "retain", AllocationIDs: []string{allocID}, TraceID: "tr",
+			MetricsData:       marshalRetainMetrics(t, &types.InstanceThreadMetrics{FunctionKey: pool.funcKey}),
+			NeedReverseLookup: true}
+		resp := ls.handleRetain(req, time.Now())
+
+		convey.So(resp.ErrorCode, convey.ShouldEqual, statuscode.LeaseIDNotFoundCode)
+		convey.So(ls.allocations, convey.ShouldNotContainKey, allocID)
+		convey.So(pool.instances["ins1"].InUse, convey.ShouldEqual, 0)
+	})
+}
+
+func TestRetainReacquireRejectsSessionHashMismatch(t *testing.T) {
+	convey.Convey("reacquireData session must match allocation ID hash", t, func() {
+		orig := config.GlobalConfig.LiteScheduler
+		defer func() { config.GlobalConfig.LiteScheduler = orig }()
+		config.GlobalConfig.LiteScheduler = types.LiteSchedulerConfig{Enable: true, EnableAllTenants: true}
+
+		ls := &LiteScheduler{pools: map[string]*LiteFunctionPool{}, allocations: map[string]*Allocation{}}
+		pool := newTestPool(t)
+		ls.pools[pool.funcKey] = pool
+		allocID := genAllocationID("another-session", "ins1", 1)
+		req := &LiteRequest{Op: "retain", AllocationIDs: []string{allocID}, TraceID: "tr",
+			MetricsData:       marshalRetainMetrics(t, newLiteReacquireMetrics(t, pool.funcKey, "sess1", 30)),
+			NeedReverseLookup: true}
+		resp := ls.handleRetain(req, time.Now())
+
+		convey.So(resp.ErrorCode, convey.ShouldEqual, statuscode.LeaseIDIllegalCode)
+		convey.So(ls.allocations, convey.ShouldNotContainKey, allocID)
+	})
+}
+
+func TestRetainReacquireReturnsCurrentSessionOwner(t *testing.T) {
+	convey.Convey("reacquire on a non-owner returns the raw owner instance ID", t, func() {
+		orig := config.GlobalConfig.LiteScheduler
+		defer func() { config.GlobalConfig.LiteScheduler = orig }()
+		config.GlobalConfig.LiteScheduler = types.LiteSchedulerConfig{Enable: true, EnableAllTenants: true}
+
+		ls := &LiteScheduler{pools: map[string]*LiteFunctionPool{}, allocations: map[string]*Allocation{},
+			ownerProxy: newTestProxyWithOwner("")}
+		pool := newTestPool(t)
+		ls.pools[pool.funcKey] = pool
+		allocID := genAllocationID("sess1", "ins1", 1)
+		req := &LiteRequest{Op: "retain", AllocationIDs: []string{allocID}, TraceID: "tr",
+			MetricsData:       marshalRetainMetrics(t, newLiteReacquireMetrics(t, pool.funcKey, "sess1", 30)),
+			NeedReverseLookup: true}
+		resp := ls.handleRetain(req, time.Now())
+
+		convey.So(resp.ErrorCode, convey.ShouldEqual, statuscode.AcquireNonOwnerSchedulerErrorCode)
+		convey.So(resp.ErrorMessage, convey.ShouldEqual, "owner-id-1")
+		convey.So(ls.allocations, convey.ShouldNotContainKey, allocID)
+		convey.So(pool.instances["ins1"].InUse, convey.ShouldEqual, 0)
+	})
+}
+
+func TestRetainReacquireAllowsDesignatedOverCapacity(t *testing.T) {
+	convey.Convey("designated allocation recovery is allowed when local capacity is full", t, func() {
+		orig := config.GlobalConfig.LiteScheduler
+		defer func() { config.GlobalConfig.LiteScheduler = orig }()
+		config.GlobalConfig.LiteScheduler = types.LiteSchedulerConfig{Enable: true, EnableAllTenants: true}
+
+		ls := &LiteScheduler{pools: map[string]*LiteFunctionPool{}, allocations: map[string]*Allocation{}}
+		pool := newTestPool(t)
+		ls.pools[pool.funcKey] = pool
+		pool.instances["ins1"].InUse = pool.instances["ins1"].Capacity
+		allocID := genAllocationID("sess1", "ins1", 1)
+		req := &LiteRequest{Op: "retain", AllocationIDs: []string{allocID}, TraceID: "tr",
+			MetricsData:       marshalRetainMetrics(t, newLiteReacquireMetrics(t, pool.funcKey, "sess1", 30)),
+			NeedReverseLookup: true}
+		resp := ls.handleRetain(req, time.Now())
+
+		convey.So(resp.ErrorCode, convey.ShouldEqual, constant.InsReqSuccessCode)
+		convey.So(pool.instances["ins1"].InUse, convey.ShouldEqual, pool.instances["ins1"].Capacity+1)
+		convey.So(ls.allocations, convey.ShouldContainKey, allocID)
+	})
+}
+
+func TestConcurrentRetainReacquireIsIdempotent(t *testing.T) {
+	convey.Convey("concurrent reacquire increments instance and session usage once", t, func() {
+		orig := config.GlobalConfig.LiteScheduler
+		defer func() { config.GlobalConfig.LiteScheduler = orig }()
+		config.GlobalConfig.LiteScheduler = types.LiteSchedulerConfig{Enable: true, EnableAllTenants: true}
+
+		ls := &LiteScheduler{pools: map[string]*LiteFunctionPool{}, allocations: map[string]*Allocation{}}
+		pool := newTestPool(t)
+		ls.pools[pool.funcKey] = pool
+		allocID := genAllocationID("sess1", "ins1", 1)
+		metricsData := marshalRetainMetrics(t, newLiteReacquireMetrics(t, pool.funcKey, "sess1", 30))
+		const workers = 16
+		var wg sync.WaitGroup
+		results := make(chan int, workers)
+		for i := 0; i < workers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				resp := ls.handleRetain(&LiteRequest{Op: "retain", AllocationIDs: []string{allocID},
+					TraceID: "tr", MetricsData: metricsData, NeedReverseLookup: true}, time.Now())
+				results <- resp.ErrorCode
+			}()
+		}
+		wg.Wait()
+		close(results)
+		for code := range results {
+			convey.So(code, convey.ShouldEqual, constant.InsReqSuccessCode)
+		}
+		convey.So(len(ls.allocations), convey.ShouldEqual, 1)
+		convey.So(pool.instances["ins1"].InUse, convey.ShouldEqual, 1)
+		convey.So(pool.sessions["sess1"].activeAllocs, convey.ShouldEqual, 1)
+	})
+}
+
+func TestBatchRetainReacquiresMissingAllocationIndependently(t *testing.T) {
+	convey.Convey("batch retain keeps hit, recovers eligible miss, and reports unrecoverable miss", t, func() {
+		orig := config.GlobalConfig.LiteScheduler
+		defer func() { config.GlobalConfig.LiteScheduler = orig }()
+		config.GlobalConfig.LiteScheduler = types.LiteSchedulerConfig{Enable: true, EnableAllTenants: true}
+
+		ls := &LiteScheduler{pools: map[string]*LiteFunctionPool{}, allocations: map[string]*Allocation{}}
+		pool := newTestPool(t)
+		ls.pools[pool.funcKey] = pool
+		acquireResp := ls.handleAcquire(&LiteRequest{Op: "acquire", FuncKey: pool.funcKey,
+			SessionID: "existing-session", SessionTTL: 30, TenantID: "t1", TraceID: "tr"}, time.Now())
+		existingID := acquireResp.ThreadID
+		recoveredID := genAllocationID("recovered-session", "ins2", 8)
+		failedID := genAllocationID("missing-session", "ins1", 9)
+		metrics := map[string]*types.InstanceThreadMetrics{
+			existingID:  {FunctionKey: pool.funcKey},
+			recoveredID: newLiteReacquireMetrics(t, pool.funcKey, "recovered-session", 30),
+		}
+		req := &LiteRequest{Op: "batchRetain", AllocationIDs: []string{existingID, recoveredID, failedID},
+			TraceID: "tr", MetricsData: marshalRetainMetrics(t, metrics), NeedReverseLookup: true}
+
+		resp := ls.handleBatchRetain(req, time.Now())
+		convey.So(resp.InstanceAllocSucceed, convey.ShouldContainKey, existingID)
+		convey.So(resp.InstanceAllocSucceed, convey.ShouldContainKey, recoveredID)
+		convey.So(resp.InstanceAllocFailed, convey.ShouldContainKey, failedID)
+		convey.So(resp.InstanceAllocFailed[failedID].ErrorCode, convey.ShouldEqual,
+			statuscode.LeaseIDNotFoundCode)
+		convey.So(ls.allocations, convey.ShouldContainKey, recoveredID)
+		convey.So(pool.currentInUse(), convey.ShouldEqual, 2)
 	})
 }
 
