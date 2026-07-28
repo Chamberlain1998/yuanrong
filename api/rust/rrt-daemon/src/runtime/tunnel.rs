@@ -1,15 +1,15 @@
 //! Native Rust reverse-tunnel server (replaces spawning the python tunnel_server).
 //!
 //! Port A (ws_port, 0.0.0.0): WebSocket endpoint the external TunnelClient connects to.
-//! Port B (http_port, 127.0.0.1): HTTP surface the sandbox's own code hits; each
-//! request is framed (JSON, base64 body) and forwarded over the Port-A WS to the
-//! client, which relays it to the real upstream and frames the response back.
+//! Port B (http_port, 127.0.0.1): HTTP/WS surface the sandbox's own code hits;
+//! each request is framed and forwarded over the Port-A WS to the client, which
+//! relays it to the real upstream and frames the response back.
 //!
 //! The paired sandbox-sdk TunnelClient uses JSON text frames {type, id, ...};
 //! bodies are base64 and headers are ordered [name, value] pairs. The server
 //! answers the client's app-level PingFrame with a PongFrame (heartbeat),
-//! forwards Port-B HTTP as http_req, and resolves http_resp by id. WebSocket
-//! upgrades are rejected until both peers implement reverse WebSocket proxying.
+//! forwards Port-B HTTP as http_req / WS as ws_connect, and resolves
+//! http_resp / ws_* by id.
 
 use super::codec::yr_deserialize;
 use crate::posix::common::Arg;
@@ -36,6 +36,7 @@ use tokio::task::AbortHandle;
 use tokio_tungstenite::tungstenite::protocol::Message;
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(600);
+const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// In-flight HTTP requests are cached this long for resend on client reconnect.
 const PENDING_REQUEST_TTL: Duration = Duration::from_secs(120);
 const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
@@ -77,12 +78,39 @@ enum Frame {
         #[serde(default)]
         body: String,
     },
+    #[serde(rename = "ws_connect")]
+    WsConnect {
+        id: String,
+        path: String,
+        headers: HashMap<String, String>,
+    },
+    #[serde(rename = "ws_connected")]
+    WsConnected { id: String },
+    #[serde(rename = "ws_message")]
+    WsMessage {
+        id: String,
+        data: String,
+        #[serde(default)]
+        binary: bool,
+    },
+    #[serde(rename = "ws_close")]
+    WsClose {
+        id: String,
+        #[serde(default = "default_close_code")]
+        code: u16,
+        #[serde(default)]
+        reason: String,
+    },
     #[serde(rename = "error")]
     Error { id: String, message: String },
     #[serde(rename = "ping")]
     Ping { id: String, timestamp: f64 },
     #[serde(rename = "pong")]
     Pong { id: String, timestamp: f64 },
+}
+
+fn default_close_code() -> u16 {
+    1000
 }
 
 impl Frame {
@@ -98,6 +126,8 @@ struct State {
     sdk_tx: Mutex<Option<mpsc::UnboundedSender<Message>>>,
     /// HTTP request id -> oneshot waiting for the http_resp / error frame.
     pending_http: Mutex<HashMap<String, oneshot::Sender<Frame>>>,
+    /// WS channel id -> queue of frames from the client for that channel.
+    pending_ws: Mutex<HashMap<String, mpsc::UnboundedSender<Frame>>>,
     /// In-flight HTTP request frames, cached for resend when a client reconnects.
     pending_requests: Mutex<HashMap<String, (Frame, Instant)>>,
 }
@@ -238,6 +268,15 @@ async fn handle_client(stream: TcpStream, state: Arc<State>) -> Result<(), Strin
     }
 
     out.abort();
+    // Notify open WS channels so Port B connections can close promptly.
+    let drained: Vec<_> = state.pending_ws.lock().unwrap().drain().collect();
+    for (_, queue) in drained {
+        let _ = queue.send(Frame::WsClose {
+            id: String::new(),
+            code: 1001,
+            reason: "tunnel client disconnected".into(),
+        });
+    }
     rrt_info!("[rrt-runtime] tunnel client disconnected");
     Ok(())
 }
@@ -301,6 +340,13 @@ fn dispatch_from_client(frame: Frame, state: &Arc<State>) {
         Frame::Error { id, .. } => {
             if let Some(tx) = state.pending_http.lock().unwrap().remove(id) {
                 let _ = tx.send(frame);
+            } else if let Some(queue) = state.pending_ws.lock().unwrap().get(id) {
+                let _ = queue.send(frame);
+            }
+        }
+        Frame::WsConnected { id } | Frame::WsMessage { id, .. } | Frame::WsClose { id, .. } => {
+            if let Some(queue) = state.pending_ws.lock().unwrap().get(id) {
+                let _ = queue.send(frame);
             }
         }
         _ => {}
@@ -328,7 +374,17 @@ async fn accept_port_b(listener: TcpListener, state: Arc<State>) {
 }
 
 async fn handle_port_b(stream: TcpStream, state: Arc<State>) -> Result<(), String> {
-    handle_port_b_http(stream, state).await
+    // Preserve the existing reverse-WebSocket path while Hyper owns normal
+    // HTTP/1.1 parsing and body framing. Peeking leaves the handshake bytes on
+    // the stream for tungstenite.
+    let mut peek = [0u8; 8192];
+    let count = stream.peek(&mut peek).await.map_err(|e| e.to_string())?;
+    let head = String::from_utf8_lossy(&peek[..count]).to_ascii_lowercase();
+    if head.contains("upgrade: websocket") {
+        handle_port_b_ws(stream, state).await
+    } else {
+        handle_port_b_http(stream, state).await
+    }
 }
 
 fn is_fixed_hop_by_hop(name: &str) -> bool {
@@ -549,6 +605,123 @@ async fn handle_port_b_http(stream: TcpStream, state: Arc<State>) -> Result<(), 
         .serve_connection(TokioIo::new(stream), service)
         .await
         .map_err(|error| format!("port B HTTP connection: {error}"))
+}
+
+async fn handle_port_b_ws(stream: TcpStream, state: Arc<State>) -> Result<(), String> {
+    // Capture the request path and end-to-end handshake headers before
+    // tungstenite writes the downstream 101 response.
+    let captured: Arc<Mutex<(String, HashMap<String, String>)>> =
+        Arc::new(Mutex::new((String::from("/"), HashMap::new())));
+    let capture = captured.clone();
+    let ws = tokio_tungstenite::accept_hdr_async(
+        stream,
+        |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+         response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+            let mut captured = capture.lock().unwrap();
+            captured.0 = request
+                .uri()
+                .path_and_query()
+                .map(|path| path.as_str().to_string())
+                .unwrap_or_else(|| "/".into());
+            for (name, value) in request.headers() {
+                if !name.as_str().eq_ignore_ascii_case("host") {
+                    captured.1.insert(
+                        name.as_str().to_string(),
+                        value.to_str().unwrap_or("").to_string(),
+                    );
+                }
+            }
+            Ok(response)
+        },
+    )
+    .await
+    .map_err(|error| format!("port B ws accept: {error}"))?;
+    let (path, headers) = {
+        let captured = captured.lock().unwrap();
+        (captured.0.clone(), captured.1.clone())
+    };
+
+    let (mut sink, mut source) = ws.split();
+    let id = make_id();
+    let (queue_tx, mut queue_rx) = mpsc::unbounded_channel::<Frame>();
+    state
+        .pending_ws
+        .lock()
+        .unwrap()
+        .insert(id.clone(), queue_tx);
+
+    if state
+        .send_to_client(&Frame::WsConnect {
+            id: id.clone(),
+            path,
+            headers,
+        })
+        .is_err()
+    {
+        state.pending_ws.lock().unwrap().remove(&id);
+        return Ok(());
+    }
+
+    match tokio::time::timeout(WS_CONNECT_TIMEOUT, queue_rx.recv()).await {
+        Ok(Some(Frame::WsConnected { .. })) => {}
+        _ => {
+            state.pending_ws.lock().unwrap().remove(&id);
+            return Ok(());
+        }
+    }
+
+    loop {
+        tokio::select! {
+            biased;
+            message = source.next() => match message {
+                Some(Ok(Message::Text(data))) => {
+                    let _ = state.send_to_client(&Frame::WsMessage {
+                        id: id.clone(),
+                        data,
+                        binary: false,
+                    });
+                }
+                Some(Ok(Message::Binary(data))) => {
+                    let _ = state.send_to_client(&Frame::WsMessage {
+                        id: id.clone(),
+                        data: b64().encode(&data),
+                        binary: true,
+                    });
+                }
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
+                    let _ = state.send_to_client(&Frame::WsClose {
+                        id: id.clone(),
+                        code: 1000,
+                        reason: String::new(),
+                    });
+                    break;
+                }
+                _ => {}
+            },
+            frame = queue_rx.recv() => match frame {
+                Some(Frame::WsMessage { data, binary, .. }) => {
+                    let message = if binary {
+                        Message::Binary(
+                            b64().decode(data.as_bytes()).unwrap_or_default(),
+                        )
+                    } else {
+                        Message::Text(data)
+                    };
+                    if sink.send(message).await.is_err() {
+                        break;
+                    }
+                }
+                Some(Frame::WsClose { .. }) | Some(Frame::Error { .. }) | None => {
+                    let _ = sink.send(Message::Close(None)).await;
+                    break;
+                }
+                _ => {}
+            },
+        }
+    }
+
+    state.pending_ws.lock().unwrap().remove(&id);
+    Ok(())
 }
 
 // ───────────────────────── E2E regression tests ─────────────────────────
@@ -907,16 +1080,49 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn ws_upgrade_is_rejected_until_supported() {
-        let (_ws_port, http_port) = spawn_test_server().await;
-        match connect_async(format!("ws://127.0.0.1:{http_port}/chat")).await {
-            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
-                assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    async fn ws_tunnel_roundtrip() {
+        let (ws_port, http_port) = spawn_test_server().await;
+        let mut client = connect_client(ws_port).await;
+        let task = tokio::spawn(async move {
+            let id = match next_frame(&mut client).await {
+                Frame::WsConnect { id, path, .. } => {
+                    assert_eq!(path, "/chat");
+                    id
+                }
+                other => panic!("expected ws_connect, got {other:?}"),
+            };
+            client
+                .send(Frame::WsConnected { id: id.clone() }.to_msg())
+                .await
+                .unwrap();
+            match next_frame(&mut client).await {
+                Frame::WsMessage { data, binary, .. } => {
+                    assert!(!binary);
+                    assert_eq!(data, "hi");
+                }
+                other => panic!("expected ws_message, got {other:?}"),
             }
-            other => {
-                panic!("expected HTTP 501 WebSocket rejection, got {other:?}");
-            }
+            client
+                .send(
+                    Frame::WsMessage {
+                        id,
+                        data: "hi-echo".into(),
+                        binary: false,
+                    }
+                    .to_msg(),
+                )
+                .await
+                .unwrap();
+        });
+        let (mut browser_ws, _) = connect_async(format!("ws://127.0.0.1:{http_port}/chat"))
+            .await
+            .unwrap();
+        browser_ws.send(Message::Text("hi".into())).await.unwrap();
+        match browser_ws.next().await {
+            Some(Ok(Message::Text(text))) => assert_eq!(text, "hi-echo"),
+            other => panic!("expected echo, got {other:?}"),
         }
+        task.await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
