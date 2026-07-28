@@ -20,6 +20,7 @@ forwards them to the local upstream service, and sends response frames back.
 import asyncio
 import base64
 import dataclasses
+import http.cookiejar
 import logging
 import os
 import random
@@ -34,10 +35,20 @@ import websockets
 
 from yr.sandbox.tunnel_protocol import (
     MAX_TUNNEL_FRAME_SIZE,
+    ErrorFrame,
+    HttpReqFrame,
+    HttpRespFrame,
+    PingFrame,
+    PongFrame,
+    WsCloseFrame,
+    WsConnectedFrame,
+    WsConnectFrame,
+    WsMessageFrame,
+    header_items_to_legacy_headers,
+    make_id,
     parse_frame,
-    HttpReqFrame, HttpRespFrame,
-    WsConnectFrame, WsConnectedFrame, WsMessageFrame, WsCloseFrame, ErrorFrame,
-    PingFrame, PongFrame, make_id,
+    rebuilt_request_header_items,
+    rebuilt_response_header_items,
 )
 
 logger = logging.getLogger(__name__)
@@ -45,17 +56,7 @@ logger = logging.getLogger(__name__)
 _WS_CHANNEL_QUEUE_MAX = 100
 _PENDING_RESPONSE_TTL = 120.0  # seconds
 _CONNECT_FAILURE_WARNING_THRESHOLD = 5
-_HOP_BY_HOP_REQUEST_HEADERS = frozenset({
-    "connection",
-    "keep-alive",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "proxy-connection",
-    "te",
-    "trailer",
-    "transfer-encoding",
-    "upgrade",
-})
+_DEFAULT_HTTP_CONCURRENCY = 10
 
 
 def _headers_for_rebuilt_request(
@@ -68,25 +69,22 @@ def _headers_for_rebuilt_request(
     metadata from that hop must therefore not be reused when httpx creates the
     upstream request.
     """
-    connection_tokens = {
-        token.strip().lower()
-        for name, value in headers.items()
-        if name.lower() == "connection"
-        for token in value.split(",")
-        if token.strip()
-    }
-    excluded = (
-        _HOP_BY_HOP_REQUEST_HEADERS
-        | connection_tokens
-        | {"content-length", "host"}
+    return header_items_to_legacy_headers(
+        rebuilt_request_header_items(
+            list(headers.items()),
+            len(body),
+        )
     )
-    outgoing_headers = {
-        name: value
-        for name, value in headers.items()
-        if name.lower() not in excluded
-    }
-    outgoing_headers["Content-Length"] = str(len(body))
-    return outgoing_headers
+
+
+class _NoCookieJar(http.cookiejar.CookieJar):
+    """Keep pooled tunnel requests free of ambient HTTP cookie state."""
+
+    def extract_cookies(self, _response, _request):
+        return
+
+    def add_cookie_header(self, _request):
+        return
 
 
 def _env_truthy(name: str) -> bool:
@@ -107,6 +105,19 @@ def _http_timeout() -> float:
         return float(os.environ.get("YR_TUNNEL_HTTP_TIMEOUT", "600"))
     except ValueError:
         return 600.0
+
+
+def _http_concurrency() -> int:
+    try:
+        value = int(
+            os.environ.get(
+                "YR_TUNNEL_HTTP_CONCURRENCY",
+                str(_DEFAULT_HTTP_CONCURRENCY),
+            )
+        )
+    except ValueError:
+        return _DEFAULT_HTTP_CONCURRENCY
+    return value if value > 0 else _DEFAULT_HTTP_CONCURRENCY
 
 
 def _patch_websockets_proxy_auth_unquote() -> None:
@@ -157,6 +168,7 @@ class TunnelClient:
         ping_timeout: float = 30.0,
         reconnect_base_delay: float = 1.0,
         reconnect_max_delay: float = 60.0,
+        max_http_concurrency: Optional[int] = None,
     ):
         """
         Args:
@@ -166,6 +178,7 @@ class TunnelClient:
             ping_timeout: seconds to wait for PongFrame before closing.
             reconnect_base_delay: base delay for exponential backoff (Task 4).
             reconnect_max_delay: max delay for exponential backoff (Task 4).
+            max_http_concurrency: maximum concurrent upstream HTTP requests.
         """
         if "://" not in upstream:
             upstream = f"http://{upstream}"
@@ -174,6 +187,11 @@ class TunnelClient:
         self._ping_timeout = ping_timeout
         self._reconnect_base_delay = reconnect_base_delay
         self._reconnect_max_delay = reconnect_max_delay
+        self._max_http_concurrency = (
+            max_http_concurrency
+            if max_http_concurrency is not None and max_http_concurrency > 0
+            else _http_concurrency()
+        )
         self._current_ping_id: Optional[str] = None
         self._pong_event: Optional[asyncio.Event] = None
         self._tunnel_url: Optional[str] = None
@@ -267,6 +285,8 @@ class TunnelClient:
                             base_url=self._upstream,
                             verify=self._ssl_verify,
                             timeout=httpx.Timeout(_http_timeout()),
+                            trust_env=False,
+                            cookies=_NoCookieJar(),
                         ) as http:
                             await self._recv_loop(ws, http)
                     finally:
@@ -373,6 +393,13 @@ class TunnelClient:
 
     async def _recv_frames(self, ws, http: httpx.AsyncClient) -> None:
         """Receive frames and dispatch them."""
+        http_tasks = set()
+        http_semaphore = asyncio.Semaphore(self._max_http_concurrency)
+
+        async def handle_http(frame):
+            async with http_semaphore:
+                await self._handle_http(ws, http, frame)
+
         try:
             async for message in ws:
                 try:
@@ -383,7 +410,9 @@ class TunnelClient:
                 if isinstance(frame, PongFrame) and frame.id == self._current_ping_id:
                     self._pong_event.set()
                 elif isinstance(frame, HttpReqFrame):
-                    asyncio.create_task(self._handle_http(ws, http, frame))
+                    task = asyncio.create_task(handle_http(frame))
+                    http_tasks.add(task)
+                    task.add_done_callback(http_tasks.discard)
                 elif isinstance(frame, WsConnectFrame):
                     asyncio.create_task(self._handle_ws_connect(ws, frame))
                 elif isinstance(frame, (WsMessageFrame, WsCloseFrame)):
@@ -394,6 +423,11 @@ class TunnelClient:
             logger.warning("Connection closed unexpectedly during recv: %s", e)
         except websockets.ConnectionClosedOK:
             logger.debug("Connection closed normally during recv")
+        finally:
+            for task in http_tasks:
+                task.cancel()
+            if http_tasks:
+                await asyncio.gather(*http_tasks, return_exceptions=True)
 
     async def _heartbeat_loop(self, ws) -> None:
         """Send PingFrame periodically. Close ws on pong timeout."""
@@ -443,18 +477,37 @@ class TunnelClient:
             # New request, send to upstream
             self._sent_request_ids.add(fid)
             try:
-                resp = await http.request(
+                request_headers = rebuilt_request_header_items(
+                    frame.header_items,
+                    len(frame.body),
+                )
+                async with http.stream(
                     method=frame.method,
                     url=frame.path,
-                    headers=_headers_for_rebuilt_request(
-                        frame.headers,
-                        frame.body,
-                    ),
+                    headers=request_headers,
                     content=frame.body,
+                ) as resp:
+                    response_body = b"".join([
+                        chunk async for chunk in resp.aiter_raw()
+                    ])
+                    response_header_items = [
+                        (
+                            name.decode("ascii"),
+                            value.decode("latin-1"),
+                        )
+                        for name, value in resp.headers.raw
+                    ]
+                response_header_items = rebuilt_response_header_items(
+                    response_header_items,
+                    frame.method,
+                    resp.status_code,
+                    len(response_body),
                 )
                 resp_frame = HttpRespFrame(
                     id=fid, status=resp.status_code,
-                    headers=dict(resp.headers), body=resp.content,
+                    headers={},
+                    header_items=response_header_items,
+                    body=response_body,
                 )
             except Exception as e:
                 resp_frame = ErrorFrame(id=fid, message=str(e))

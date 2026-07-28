@@ -18,6 +18,7 @@ import zipfile
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 PACKAGE_CORE_WHEEL = REPO_ROOT / ".buildkite" / "package_core_wheel.py"
+DATA_SYSTEM_INSTALL = REPO_ROOT / "deploy" / "data_system" / "install.sh"
 VERSION = "0.7.0+test"
 PLATFORM = "manylinux_2_31_x86_64"
 
@@ -223,6 +224,14 @@ class CoreWheelTest(unittest.TestCase):
                 self.assertIn(
                     "yr/datasystem/helm_chart/datasystem/Chart.yaml", members
                 )
+                deployment_members = {
+                    "yr/functionsystem/deploy/install.sh",
+                    "yr/functionsystem/deploy/health_check.sh",
+                    "yr/datasystem/deploy/install.sh",
+                    "yr/datasystem/deploy/health_check.sh",
+                }
+                self.assertTrue(deployment_members.issubset(members))
+                self.assertIn("yr/checkpoints/.keep", members)
 
                 self.assertNotIn(
                     "yr/functionsystem/bin/runtime-launcher", members
@@ -285,6 +294,7 @@ class CoreWheelTest(unittest.TestCase):
                     "yr/datasystem/datasystem_worker",
                     "yr/datasystem/datasystem_coordinator",
                     "yr/datasystem/docker_entryfile/daemonset/install.sh",
+                    *deployment_members,
                 ):
                     executable_info = archive.getinfo(executable)
                     self.assertEqual(
@@ -325,6 +335,55 @@ class CoreWheelTest(unittest.TestCase):
                     ).rstrip(b"=").decode("ascii")
                     self.assertEqual(digest, f"sha256={expected}")
                     self.assertEqual(size, str(len(payload)))
+
+    def test_datasystem_install_selects_flat_and_full_binary_layouts(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = pathlib.Path(temp_dir)
+            process_dir = temp_path / "yr" / "deploy" / "process"
+            datasystem_dir = temp_path / "yr" / "datasystem"
+            bin_dir = temp_path / "bin"
+            process_dir.mkdir(parents=True)
+            (datasystem_dir / "deploy").mkdir(parents=True)
+            bin_dir.mkdir()
+            readlink = bin_dir / "readlink"
+            readlink.write_text(
+                "#!/bin/sh\n"
+                "shift\n"
+                f'exec "{sys.executable}" -c '
+                '\'import os, sys; print(os.path.realpath(sys.argv[1]))\' "$1"\n',
+                encoding="utf-8",
+            )
+            readlink.chmod(0o755)
+
+            def resolve_bin_dir():
+                return subprocess.run(
+                    [
+                        "bash",
+                        "-c",
+                        '. "$1"; printf "%s" "$DATA_SYSTEM_BIN_DIR"',
+                        "bash",
+                        str(DATA_SYSTEM_INSTALL),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    env={
+                        "BASE_DIR": str(process_dir),
+                        "PATH": f"{bin_dir}:/usr/bin:/bin",
+                    },
+                ).stdout
+
+            flat_worker = datasystem_dir / "datasystem_worker"
+            flat_worker.touch()
+            flat_worker.chmod(0o755)
+            self.assertEqual(resolve_bin_dir(), str(datasystem_dir.resolve()))
+
+            service_dir = datasystem_dir / "service"
+            service_dir.mkdir()
+            service_worker = service_dir / "datasystem_worker"
+            service_worker.touch()
+            service_worker.chmod(0o755)
+            self.assertEqual(resolve_bin_dir(), str(service_dir.resolve()))
 
     def test_rejects_component_version_mismatch(self):
         with tempfile.TemporaryDirectory() as temp_dir:

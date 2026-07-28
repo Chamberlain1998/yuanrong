@@ -25,15 +25,26 @@ import os
 from typing import Optional
 
 import aiohttp
-from aiohttp import web
 import websockets
+from aiohttp import web
+from multidict import CIMultiDict
 
 from yr.sandbox.tunnel_protocol import (
-    MAX_TUNNEL_BODY_SIZE, MAX_TUNNEL_FRAME_SIZE,
-    parse_frame, make_id,
-    HttpReqFrame, HttpRespFrame,
-    WsConnectFrame, WsConnectedFrame, WsMessageFrame, WsCloseFrame, ErrorFrame,
-    PingFrame, PongFrame,
+    MAX_TUNNEL_BODY_SIZE,
+    MAX_TUNNEL_FRAME_SIZE,
+    ErrorFrame,
+    HttpReqFrame,
+    HttpRespFrame,
+    PingFrame,
+    PongFrame,
+    WsCloseFrame,
+    WsConnectedFrame,
+    WsConnectFrame,
+    WsMessageFrame,
+    make_id,
+    parse_frame,
+    rebuilt_request_header_items,
+    rebuilt_response_header_items,
 )
 
 logger = logging.getLogger(__name__)
@@ -71,7 +82,7 @@ class TunnelServer:
         )
         app = web.Application(client_max_size=MAX_TUNNEL_BODY_SIZE)
         app.router.add_route("*", "/{path_info:.*}", self._handle_request)
-        self._http_runner = web.AppRunner(app)
+        self._http_runner = web.AppRunner(app, auto_decompress=False)
         await self._http_runner.setup()
         site = web.TCPSite(self._http_runner, "127.0.0.1", self._http_port)
         await site.start()
@@ -208,12 +219,24 @@ class TunnelServer:
     async def _handle_http(self, request: web.Request) -> web.StreamResponse:
         import time
         body = await request.read()
-        headers = {k: v for k, v in request.headers.items() if k.lower() != "host"}
+        header_items = [
+            (
+                name.decode("ascii"),
+                value.decode("latin-1"),
+            )
+            for name, value in request.raw_headers
+        ]
+        header_items = rebuilt_request_header_items(
+            header_items,
+            len(body),
+        )
         fid = make_id()
         frame = HttpReqFrame(
             id=fid, method=request.method,
             path=str(request.rel_url),
-            headers=headers, body=body,
+            headers={},
+            header_items=header_items,
+            body=body,
         )
         fut = self._loop.create_future()
         self._pending[fid] = fut
@@ -235,21 +258,23 @@ class TunnelServer:
             # of connecting directly to an unreachable service.
             request.transport.close()
             return web.Response()  # not sent; transport already closed
-        # Strip hop-by-hop headers before forwarding. Without this,
-        # uvicorn's "Transfer-Encoding: chunked" gets forwarded here AND
-        # aiohttp web.Response(body=...) auto-adds Content-Length, producing
-        # a response with both headers simultaneously — which triggers
-        # HPE_UNEXPECTED_CONTENT_LENGTH in Node.js llhttp.
-        # Using StreamResponse avoids auto Content-Length entirely.
-        skip = {"content-length", "transfer-encoding", "connection"}
-        filtered_headers = {
-            k: v
-            for k, v in resp_frame.headers.items()
-            if k.lower() not in skip
-        }
-        resp = web.StreamResponse(status=resp_frame.status, headers=filtered_headers)
+        header_items = rebuilt_response_header_items(
+            resp_frame.header_items,
+            request.method,
+            resp_frame.status,
+            len(resp_frame.body),
+        )
+        headers = CIMultiDict()
+        for name, value in header_items:
+            headers.add(name, value)
+        resp = web.StreamResponse(status=resp_frame.status, headers=headers)
         await resp.prepare(request)
-        if resp_frame.body:
+        body_allowed = (
+            request.method != "HEAD"
+            and not 100 <= resp_frame.status < 200
+            and resp_frame.status not in (204, 304)
+        )
+        if body_allowed and resp_frame.body:
             await resp.write(resp_frame.body)
         await resp.write_eof()
         return resp

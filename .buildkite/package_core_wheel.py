@@ -42,10 +42,28 @@ REQUIRED_DISTRIBUTIONS = (
 )
 CORE_DISTRIBUTION = "openyuanrong-core"
 CORE_FILENAME_DISTRIBUTION = "openyuanrong_core"
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 GO_RUNTIME_PREFIX = "yr/runtime/service/go/bin/"
 GO_RUNTIME_MEMBERS = {
     GO_RUNTIME_PREFIX + "goruntime",
     GO_RUNTIME_PREFIX + "libcpplibruntime.so",
+}
+CORE_OVERLAY_SOURCES = {
+    "yr/functionsystem/deploy/install.sh": (
+        REPO_ROOT / "functionsystem/scripts/deploy/function_system/install.sh"
+    ),
+    "yr/functionsystem/deploy/health_check.sh": (
+        REPO_ROOT / "functionsystem/scripts/deploy/function_system/health_check.sh"
+    ),
+    "yr/datasystem/deploy/install.sh": (
+        REPO_ROOT / "deploy/data_system/install.sh"
+    ),
+    "yr/datasystem/deploy/health_check.sh": (
+        REPO_ROOT / "deploy/data_system/health_check.sh"
+    ),
+}
+CORE_GENERATED_MEMBERS = {
+    "yr/checkpoints/.keep": b"",
 }
 
 
@@ -337,6 +355,28 @@ def copy_base_dist_info_files(base_source, output, state, dist_info):
             )
 
 
+def add_core_overlay_members(output, state):
+    """Add legacy deployment helpers that are not part of split wheels."""
+    for member, source_path in CORE_OVERLAY_SOURCES.items():
+        if not source_path.is_file():
+            raise ValueError(f"core overlay source is missing: {source_path}")
+        add_member(
+            output,
+            state,
+            member,
+            source_path.read_bytes(),
+            generated_zip_info(member, stat.S_IFREG | 0o755),
+        )
+    for member, data in CORE_GENERATED_MEMBERS.items():
+        add_member(
+            output,
+            state,
+            member,
+            data,
+            generated_zip_info(member),
+        )
+
+
 def is_forbidden_core_member(member):
     """Return whether a member falls outside the fixed core profile."""
     return (
@@ -362,6 +402,8 @@ def validate_core_members(members):
         "yr/datasystem/datasystem_coordinator",
         "yr/faas/faasfrontend/faasfrontend.so",
         "yr/faas/faasscheduler/faasscheduler.so",
+        *CORE_OVERLAY_SOURCES,
+        *CORE_GENERATED_MEMBERS,
         *GO_RUNTIME_MEMBERS,
     }
     missing = sorted(required - members)
@@ -412,6 +454,8 @@ def assemble_core_wheel(input_dir, output_dir):
                             data,
                             clone_zip_info(source_info, member),
                         )
+
+            add_core_overlay_members(output, state)
 
             base_source = sources["openyuanrong"]
             copy_base_dist_info_files(

@@ -20,14 +20,18 @@ if [ -n "${BASE_DIR}" ]; then
   DATA_SYSTEM_DEPLOY_DIR=${BASE_DIR}/../../datasystem/deploy
 fi
 DATA_SYSTEM_DIR=$(readlink -m "${DATA_SYSTEM_DEPLOY_DIR}/..")
+DATA_SYSTEM_BIN_DIR="${DATA_SYSTEM_DIR}/service"
+if [ ! -x "${DATA_SYSTEM_BIN_DIR}/datasystem_worker" ] && [ -x "${DATA_SYSTEM_DIR}/datasystem_worker" ]; then
+  DATA_SYSTEM_BIN_DIR="${DATA_SYSTEM_DIR}"
+fi
 MAX_PROCESS_EXIT_TIMES=20
 
 # before use functions in this script, ${BASE_DIR}/utils.sh should be imported first
 
 function ds_worker_supports_node_role() {
   local help_output
-  help_output=$(OPENSSL_CONF="" LD_LIBRARY_PATH="${DATA_SYSTEM_DIR}/service/lib:${LD_LIBRARY_PATH}" \
-    "${DATA_SYSTEM_DIR}"/service/datasystem_worker --help 2>&1 || true)
+  help_output=$(OPENSSL_CONF="" LD_LIBRARY_PATH="${DATA_SYSTEM_BIN_DIR}/lib:${LD_LIBRARY_PATH}" \
+    "${DATA_SYSTEM_BIN_DIR}"/datasystem_worker --help 2>&1 || true)
   echo "${help_output}" | grep -q -- "-node_role"
 }
 
@@ -52,7 +56,7 @@ function install_ds_master() {
   if check_port "${DS_MASTER_IP}" "${DS_MASTER_PORT}"; then
     local ds_node_role_arg
     ds_node_role_arg=$(get_ds_node_role_arg "${DS_NODE_ROLE:-master}")
-    OPENSSL_CONF="" LD_LIBRARY_PATH="${DATA_SYSTEM_DIR}/service/lib:${LD_LIBRARY_PATH}" "${DATA_SYSTEM_DIR}"/service/datasystem_worker -master_address="${DS_MASTER_IP}:${DS_MASTER_PORT}" \
+    OPENSSL_CONF="" LD_LIBRARY_PATH="${DATA_SYSTEM_BIN_DIR}/lib:${LD_LIBRARY_PATH}" "${DATA_SYSTEM_BIN_DIR}"/datasystem_worker -master_address="${DS_MASTER_IP}:${DS_MASTER_PORT}" \
       -log_dir="${DS_LOG_PATH}/master" -worker_address="${DS_MASTER_IP}:${DS_MASTER_PORT}" \
       -unix_domain_socket_dir="${data_system_install_dir}/socket" -v="${DS_DEBUG_LOG_LEVEL}" \
       -minloglevel="${DS_LOG_LEVEL}" \
@@ -139,7 +143,7 @@ function install_ds_worker() {
   fi
   local ds_node_role_arg
   ds_node_role_arg=$(get_ds_node_role_arg "${DS_NODE_ROLE:-${_default_node_role}}")
-  OPENSSL_CONF="" LD_LIBRARY_PATH="${DATA_SYSTEM_DIR}/service/lib:${LD_LIBRARY_PATH}" "${DATA_SYSTEM_DIR}"/service/datasystem_worker \
+  OPENSSL_CONF="" LD_LIBRARY_PATH="${DATA_SYSTEM_BIN_DIR}/lib:${LD_LIBRARY_PATH}" "${DATA_SYSTEM_BIN_DIR}"/datasystem_worker \
     -master_address=${DS_MASTER_ADDRESS} \
     -log_dir="${DS_LOG_PATH}" -shared_memory_size_mb=${MEM4DATA} -worker_address="${IP_ADDRESS}:${DS_WORKER_PORT}" \
     -unix_domain_socket_dir="${data_system_install_path}/socket" -v="${DS_DEBUG_LOG_LEVEL}" \

@@ -499,7 +499,7 @@ create_idle_timeout_sandbox() {
 	status="$(curl_status "${resp_file}" --connect-timeout 10 --max-time 60 \
 		-X POST "http://${frontend_addr}/api/sandbox/v1/sandboxes" \
 		-H 'Content-Type: application/json' \
-		-d "{\"name\":\"${name}\",\"runtime\":\"rust\",\"cpu\":200,\"memory\":256,\"idleTimeoutSeconds\":${idle_timeout}}")"
+		-d "{\"name\":\"${name}\",\"cpu\":200,\"memory\":256,\"idleTimeoutSeconds\":${idle_timeout}}")"
 	if [[ ! "${status}" =~ ^2 ]]; then
 		printf 'idle-timeout: create failed status=%s body=%s\n' "${status}" "$(cat "${resp_file}")" >&2
 		rm -f "${resp_file}"
@@ -718,12 +718,11 @@ main() {
 		router_address="${router_address:-${TRAEFIK_ROUTER_ADDRESS}}"
 	fi
 
-	# Smoke-probe: actually create a sandbox to verify the cluster has capacity.
+	# Smoke-probe: actually create a sandbox using the frontend's default
+	# isolation runtime to verify the full create path before running tests.
 	# deploy.sh only waits for the control-plane workloads (frontend/etcd/master)
-	# to roll out — it cannot detect that the node daemon has no Docker slots
-	# left for new sandbox containers. An early probe saves ~15 minutes of CI
-	# churn when the cluster is simply full. If the probe fails, surface the
-	# exact error and exit immediately (no test = skip, not failure — infra issue).
+	# to roll out. It cannot detect API contract regressions or runtime capacity
+	# failures. A failed probe must fail the job because no smoke coverage ran.
 	probe_sandbox_ready() {
 		local frontend="$1"
 		local resp
@@ -731,16 +730,16 @@ main() {
 		resp="$(curl -sS --connect-timeout 10 --max-time 60 \
 			-X POST "http://${frontend}/api/sandbox/v1/sandboxes" \
 			-H 'Content-Type: application/json' \
-			-d '{"runtime":"rust","cpu":200,"memory":256,"idleTimeoutSeconds":30}')" || {
+			-d '{"cpu":200,"memory":256,"idleTimeoutSeconds":30}')" || {
 			printf 'Cluster sandbox probe: CREATE request failed (frontend=%s).\n' "${frontend}" >&2
-			printf 'Infrastructure issue — skipping smoke + examples.\n' >&2
+			printf 'Smoke precondition failed; no tests were run.\n' >&2
 			return 1
 		}
 		sid="$(printf '%s' "${resp}" | extract_sandbox_id 2>/dev/null)" || true
 		if [ -z "${sid}" ]; then
 			printf 'Cluster sandbox probe: CREATE returned no sandbox ID.\n' >&2
 			printf 'Response body: %s\n' "${resp}" >&2
-			printf 'Infrastructure issue — skipping smoke + examples.\n' >&2
+			printf 'Smoke precondition failed; no tests were run.\n' >&2
 			return 1
 		fi
 		printf 'Cluster sandbox probe: created %s, cleaning up.\n' "${sid}" >&2
@@ -750,11 +749,10 @@ main() {
 	}
 	if ! probe_sandbox_ready "${smoke_server_address}"; then
 		if command -v buildkite-agent >/dev/null 2>&1; then
-			buildkite-agent annotate --style "warning" --context "sandbox-k8s-no-capacity" \
-				"Cluster sandbox probe failed — the node likely has no available Docker slots. No tests were run. This is an infrastructure capacity issue, not a code regression."
+			buildkite-agent annotate --style "error" --context "sandbox-k8s-probe-failed" \
+				"Cluster sandbox probe failed. No smoke or example tests were run; inspect the CREATE response above."
 		fi
-		# Exit 0: infra issue is not a code failure — don't turn the build red.
-		exit 0
+		exit 1
 	fi
 
 	if [[ "${YR_K8S_RUN_IDLE_TIMEOUT:-true}" =~ ^(1|true|TRUE|yes|YES|on|ON)$ ]]; then
