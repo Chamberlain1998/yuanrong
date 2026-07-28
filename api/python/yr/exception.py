@@ -56,9 +56,16 @@ class YRError(Exception):
     @classmethod
     def from_error_info(cls, error_info: ErrorInfo, message_prefix: str = None, cause: Exception = None):
         """Build a structured exception from ErrorInfo."""
-        message = getattr(error_info, "msg", "")
+        code = getattr(error_info, "error_code", ErrorCode.ERR_INNER_SYSTEM_ERROR)
+        module_code = getattr(error_info, "module_code", ModuleCode.RUNTIME)
+        code_value = getattr(code, "value", code)
+        module_code_value = getattr(module_code, "value", module_code)
+        message = (
+            f"code: {code_value}, module code {module_code_value}, "
+            f"msg: {getattr(error_info, 'msg', '')}"
+        )
         if message_prefix:
-            message = f"{message_prefix}, msg: {message}" if message else message_prefix
+            message = f"{message_prefix}, {message}"
         return cls(message=message, error_info=error_info, cause=cause)
 
 
