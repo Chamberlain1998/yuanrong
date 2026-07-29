@@ -305,9 +305,11 @@ async fn execute_invoke(
     };
     let command = super::dispatch::access_command_summary(&normalized, &kw);
     let method = normalized.clone();
-    let result =
-        tokio::task::spawn_blocking(move || super::dispatch::dispatch_runtime_action(&method, &kw))
-            .await;
+    let command_trace_id = trace_id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        super::dispatch::dispatch_runtime_action_with_trace(&method, &kw, &command_trace_id)
+    })
+    .await;
     super::dispatch::log_access(trace_id.as_str(), &command, started);
 
     match result {

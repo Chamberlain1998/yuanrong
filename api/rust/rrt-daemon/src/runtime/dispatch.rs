@@ -6,7 +6,7 @@ use crate::posix::resources::MetaData;
 use crate::posix::runtime_rpc::StreamingMessage;
 use crate::posix::runtime_service::CallRequest;
 use prost::Message;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 fn sanitize_log_field(value: &str) -> String {
     let mut out = value.replace('\r', "\\r").replace('\n', "\\n");
@@ -57,11 +57,120 @@ pub(crate) fn log_access(trace_id: &str, command: &str, started: Instant) {
     );
 }
 
+fn command_result(stdout: String, stderr: String, exit_code: i64) -> rmpv::Value {
+    codec::map_value(vec![
+        ("stdout", rmpv::Value::from(stdout)),
+        ("stderr", rmpv::Value::from(stderr)),
+        ("exit_code", rmpv::Value::from(exit_code)),
+    ])
+}
+
+fn command_timeout(kw: &std::collections::BTreeMap<String, rmpv::Value>) -> Option<f64> {
+    let timeout = kw.get("timeout").and_then(|value| {
+        value
+            .as_f64()
+            .or_else(|| value.as_i64().map(|v| v as f64))
+            .or_else(|| value.as_u64().map(|v| v as f64))
+    })?;
+    (timeout.is_finite() && timeout >= 0.0).then_some(timeout)
+}
+
+fn read_command_output(file: &mut std::fs::File) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+
+    if file.seek(SeekFrom::Start(0)).is_err() {
+        return String::new();
+    }
+    let mut output = Vec::new();
+    if file.read_to_end(&mut output).is_err() {
+        return String::new();
+    }
+    String::from_utf8_lossy(&output).into_owned()
+}
+
+fn reap_timed_out_child(
+    mut child: std::process::Child,
+    trace_id: &str,
+    pid: libc::pid_t,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    const REAP_GRACE: Duration = Duration::from_secs(1);
+    let deadline = Instant::now() + REAP_GRACE;
+    loop {
+        match child.try_wait()? {
+            Some(status) => return Ok(Some(status)),
+            None if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            None => {
+                let trace_id = trace_id.to_string();
+                rrt_warn!(
+                    "[rrt-command] phase=reap_deferred traceid={} pid={} grace_ms={}",
+                    sanitize_log_field(&trace_id),
+                    pid,
+                    REAP_GRACE.as_millis()
+                );
+                std::thread::spawn(move || {
+                    match child.wait() {
+                    Ok(status) => rrt_info!(
+                        "[rrt-command] phase=wait_done traceid={} pid={} exit_code={} timed_out=true deferred=true",
+                        sanitize_log_field(&trace_id),
+                        pid,
+                        status.code().unwrap_or(-1)
+                    ),
+                    Err(e) => rrt_error!(
+                        "[rrt-command] phase=wait_failed traceid={} pid={} deferred=true error={}",
+                        sanitize_log_field(&trace_id),
+                        pid,
+                        sanitize_log_field(&e.to_string())
+                    ),
+                }
+                });
+                return Ok(None);
+            }
+        }
+    }
+}
+
 /// Run one shell command and return `{stdout, stderr, exit_code}`, matching akernel cmd_run.
-fn run_command(cmd: &str, cwd: Option<&str>, envs: Option<&rmpv::Value>) -> rmpv::Value {
+///
+/// Timed commands run in their own process group so expiry can terminate the
+/// shell and every descendant. Output is redirected to anonymous temporary
+/// files instead of pipes: a descendant that escapes the process group cannot
+/// keep a pipe open and block this function after the shell has been reaped.
+fn run_command(
+    cmd: &str,
+    cwd: Option<&str>,
+    envs: Option<&rmpv::Value>,
+    timeout_seconds: Option<f64>,
+    trace_id: &str,
+) -> rmpv::Value {
+    use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
+
+    let mut stdout = match tempfile::tempfile() {
+        Ok(file) => file,
+        Err(e) => return command_result(String::new(), e.to_string(), -1),
+    };
+    let mut stderr = match tempfile::tempfile() {
+        Ok(file) => file,
+        Err(e) => return command_result(String::new(), e.to_string(), -1),
+    };
+    let stdout_child = match stdout.try_clone() {
+        Ok(file) => file,
+        Err(e) => return command_result(String::new(), e.to_string(), -1),
+    };
+    let stderr_child = match stderr.try_clone() {
+        Ok(file) => file,
+        Err(e) => return command_result(String::new(), e.to_string(), -1),
+    };
+
     let mut c = Command::new("/bin/sh");
-    c.arg("-c").arg(cmd).stdin(Stdio::null());
+    c.arg("-c")
+        .arg(cmd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout_child))
+        .stderr(Stdio::from(stderr_child))
+        .process_group(0);
     if let Some(d) = cwd {
         if !d.is_empty() {
             c.current_dir(d);
@@ -74,26 +183,114 @@ fn run_command(cmd: &str, cwd: Option<&str>, envs: Option<&rmpv::Value>) -> rmpv
             }
         }
     }
-    match c.output() {
-        Ok(o) => codec::map_value(vec![
-            (
-                "stdout",
-                rmpv::Value::from(String::from_utf8_lossy(&o.stdout).into_owned()),
-            ),
-            (
-                "stderr",
-                rmpv::Value::from(String::from_utf8_lossy(&o.stderr).into_owned()),
-            ),
-            (
-                "exit_code",
-                rmpv::Value::from(o.status.code().unwrap_or(-1) as i64),
-            ),
-        ]),
-        Err(e) => codec::map_value(vec![
-            ("stdout", rmpv::Value::from("")),
-            ("stderr", rmpv::Value::from(e.to_string())),
-            ("exit_code", rmpv::Value::from(-1i64)),
-        ]),
+
+    let started = Instant::now();
+    let timeout_label = timeout_seconds
+        .map(|timeout| timeout.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    rrt_info!(
+        "[rrt-command] phase=spawn_start traceid={} timeout_seconds={}",
+        sanitize_log_field(trace_id),
+        timeout_label
+    );
+    let mut child = match c.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            rrt_error!(
+                "[rrt-command] phase=spawn_failed traceid={} error={}",
+                sanitize_log_field(trace_id),
+                sanitize_log_field(&e.to_string())
+            );
+            return command_result(String::new(), e.to_string(), -1);
+        }
+    };
+    let pid = child.id() as libc::pid_t;
+    rrt_info!(
+        "[rrt-command] phase=spawned_pid traceid={} pid={}",
+        sanitize_log_field(trace_id),
+        pid
+    );
+
+    let deadline = timeout_seconds.map(|timeout| started + Duration::from_secs_f64(timeout));
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(Some(status)),
+            Ok(None) => {}
+            Err(e) => break Err(e),
+        }
+
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            timed_out = true;
+            rrt_warn!(
+                "[rrt-command] phase=timeout_kill traceid={} pid={} timeout_seconds={}",
+                sanitize_log_field(trace_id),
+                pid,
+                timeout_label
+            );
+            let kill_result = unsafe { libc::kill(-pid, libc::SIGKILL) };
+            if kill_result != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    rrt_error!(
+                        "[rrt-command] phase=timeout_kill_failed traceid={} pid={} error={}",
+                        sanitize_log_field(trace_id),
+                        pid,
+                        sanitize_log_field(&error.to_string())
+                    );
+                    let _ = child.kill();
+                }
+            }
+            break reap_timed_out_child(child, trace_id, pid);
+        }
+
+        let sleep_for = deadline
+            .map(|deadline| {
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(10))
+            })
+            .unwrap_or(Duration::from_millis(10));
+        std::thread::sleep(sleep_for);
+    };
+
+    let stdout = read_command_output(&mut stdout);
+    let captured_stderr = read_command_output(&mut stderr);
+    match status {
+        Ok(Some(status)) => {
+            let exit_code = status.code().unwrap_or(-1) as i64;
+            rrt_info!(
+                "[rrt-command] phase=wait_done traceid={} pid={} exit_code={} timed_out={} duration_ms={}",
+                sanitize_log_field(trace_id),
+                pid,
+                exit_code,
+                timed_out,
+                started.elapsed().as_millis()
+            );
+            if timed_out {
+                command_result(
+                    stdout,
+                    format!("Command timed out after {timeout_label} seconds"),
+                    -1,
+                )
+            } else {
+                command_result(stdout, captured_stderr, exit_code)
+            }
+        }
+        Ok(None) => command_result(
+            stdout,
+            format!("Command timed out after {timeout_label} seconds"),
+            -1,
+        ),
+        Err(e) => {
+            rrt_error!(
+                "[rrt-command] phase=wait_failed traceid={} pid={} error={}",
+                sanitize_log_field(trace_id),
+                pid,
+                sanitize_log_field(&e.to_string())
+            );
+            command_result(stdout, e.to_string(), -1)
+        }
     }
 }
 
@@ -171,6 +368,14 @@ pub(crate) fn dispatch_runtime_action(
     method: &str,
     kw: &std::collections::BTreeMap<String, rmpv::Value>,
 ) -> Option<rmpv::Value> {
+    dispatch_runtime_action_with_trace(method, kw, "")
+}
+
+pub(crate) fn dispatch_runtime_action_with_trace(
+    method: &str,
+    kw: &std::collections::BTreeMap<String, rmpv::Value>,
+    trace_id: &str,
+) -> Option<rmpv::Value> {
     match method {
         "cmd_run" => {
             let cmd = codec::kw_str(kw, "cmd")
@@ -178,7 +383,13 @@ pub(crate) fn dispatch_runtime_action(
                 .unwrap_or_default();
             let cwd = codec::kw_str(kw, "cwd").or_else(|| codec::kw_str(kw, "working_dir"));
             let envs = kw.get("envs").or_else(|| kw.get("env"));
-            Some(run_command(&cmd, cwd.as_deref(), envs))
+            Some(run_command(
+                &cmd,
+                cwd.as_deref(),
+                envs,
+                command_timeout(kw),
+                trace_id,
+            ))
         }
         "fs_read" | "fs_write" | "fs_write_chunk" | "fs_read_chunk" | "fs_list" | "fs_exists"
         | "fs_remove" | "fs_rename" | "fs_make_dir" | "fs_get_info" => Some(match method {
@@ -273,7 +484,9 @@ impl Ctx {
                 let command = normalized
                     .map(|method| access_command_summary(method, &args))
                     .unwrap_or_else(|| format!("sandbox_invoke action={action}"));
-                let result = normalized.and_then(|method| dispatch_runtime_action(method, &args));
+                let result = normalized.and_then(|method| {
+                    dispatch_runtime_action_with_trace(method, &args, &trace_id)
+                });
                 log_access(&trace_id, &command, started);
                 match result {
                     Some(r) => call_result_msg(
@@ -299,13 +512,14 @@ impl Ctx {
                 let trace_id = access_trace_id(&call.trace_id, &call.request_id);
                 let started = Instant::now();
                 let command = access_command_summary("cmd_run", &kw);
-                let result = dispatch_runtime_action("cmd_run", &kw).unwrap_or_else(|| {
-                    codec::map_value(vec![
-                        ("stdout", rmpv::Value::from("")),
-                        ("stderr", rmpv::Value::from("failed to dispatch cmd_run")),
-                        ("exit_code", rmpv::Value::from(-1i64)),
-                    ])
-                });
+                let result = dispatch_runtime_action_with_trace("cmd_run", &kw, &trace_id)
+                    .unwrap_or_else(|| {
+                        codec::map_value(vec![
+                            ("stdout", rmpv::Value::from("")),
+                            ("stderr", rmpv::Value::from("failed to dispatch cmd_run")),
+                            ("exit_code", rmpv::Value::from(-1i64)),
+                        ])
+                    });
                 log_access(&trace_id, &command, started);
                 call_result_msg(
                     call.request_id,
@@ -411,6 +625,7 @@ impl Ctx {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn normalizes_public_sandbox_actions_to_rrt_methods() {
@@ -463,5 +678,64 @@ mod tests {
         } else {
             panic!("cmd_run should return a map");
         }
+    }
+
+    fn result_field<'a>(result: &'a rmpv::Value, name: &str) -> &'a rmpv::Value {
+        let rmpv::Value::Map(fields) = result else {
+            panic!("command result should be a map");
+        };
+        fields
+            .iter()
+            .find_map(|(key, value)| (key.as_str() == Some(name)).then_some(value))
+            .unwrap_or_else(|| panic!("command result should contain {name}"))
+    }
+
+    #[test]
+    fn cmd_run_honors_timeout_and_reaps_the_shell_process() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let shell_pid = temp.path().join("shell.pid");
+        let descendant_marker = temp.path().join("descendant-finished");
+        let command = format!(
+            "echo $$ > {}; (sleep 0.5; touch {}) & wait",
+            shell_pid.display(),
+            descendant_marker.display()
+        );
+        let mut kw = BTreeMap::new();
+        kw.insert("cmd".to_string(), rmpv::Value::from(command));
+        kw.insert("timeout".to_string(), rmpv::Value::F64(0.1));
+
+        let started = Instant::now();
+        let result = dispatch_runtime_action("cmd_run", &kw).expect("cmd_run should dispatch");
+
+        assert!(
+            started.elapsed() < Duration::from_millis(400),
+            "timed command should return near its deadline"
+        );
+        assert_eq!(result_field(&result, "exit_code").as_i64(), Some(-1));
+        assert!(result_field(&result, "stderr")
+            .as_str()
+            .unwrap_or_default()
+            .contains("Command timed out after 0.1 seconds"));
+
+        let pid = std::fs::read_to_string(&shell_pid)
+            .expect("shell should write its pid before timeout")
+            .trim()
+            .parse::<libc::pid_t>()
+            .expect("shell pid should be numeric");
+        let alive = unsafe { libc::kill(pid, 0) };
+        assert_eq!(
+            alive, -1,
+            "the direct child should already be reaped when cmd_run returns"
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+
+        std::thread::sleep(Duration::from_millis(550));
+        assert!(
+            !descendant_marker.exists(),
+            "timeout should kill the whole process group, not only /bin/sh"
+        );
     }
 }
