@@ -23,7 +23,7 @@ address = ""
 mode = "local"
 
 [values.fs]
-schedule_plugins = '''["Label", "ResourceSelector", "Default", "Heterogeneous"]'''
+schedule_plugins = '''["Label", "ResourceSelector", "Default", "Heterogeneous", "NUMA"]'''
 
 [values.fs.log]
 also_log_to_stderr = false
