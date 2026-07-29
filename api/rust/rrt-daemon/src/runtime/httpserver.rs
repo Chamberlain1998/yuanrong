@@ -145,8 +145,20 @@ impl CopyStats {
 
 /// Serve RRT atomic operations on 0.0.0.0:port. token=None disables auth for isolated/internal use only.
 pub async fn serve(port: u16, token: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
-    let listener = TcpListener::bind(("0.0.0.0", port)).await?;
-    rrt_info!("[rrt-http] atomic-ops server listening on 0.0.0.0:{port}");
+    let listener = bind(port).await?;
+    serve_listener(listener, token).await
+}
+
+pub(crate) async fn bind(port: u16) -> std::io::Result<TcpListener> {
+    TcpListener::bind(("0.0.0.0", port)).await
+}
+
+pub(crate) async fn serve_listener(
+    listener: TcpListener,
+    token: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let address = listener.local_addr()?;
+    rrt_info!("[rrt-http] atomic-ops server listening on {address}");
     loop {
         let (mut sock, _peer) = match listener.accept().await {
             Ok(x) => x,

@@ -8,7 +8,7 @@ use crate::posix::runtime_rpc::runtime_rpc_client::RuntimeRpcClient;
 use crate::posix::runtime_rpc::{streaming_message, StreamingMessage};
 use crate::posix::runtime_service::CallResponse;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 
 macro_rules! rrt_info {
@@ -68,6 +68,67 @@ pub struct Args {
     pub job_id: String,
     pub deploy_dir: String,
     pub log_level: String,
+}
+
+const RUNTIME_READY_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RuntimeReadyState {
+    Starting,
+    Ready,
+    Failed(String),
+}
+
+fn ready_runtime_receiver() -> watch::Receiver<RuntimeReadyState> {
+    let (_tx, rx) = watch::channel(RuntimeReadyState::Ready);
+    rx
+}
+
+fn failed_runtime_receiver(message: String) -> watch::Receiver<RuntimeReadyState> {
+    let (_tx, rx) = watch::channel(RuntimeReadyState::Failed(message));
+    rx
+}
+
+fn start_http_server(port: u16, token: Option<String>) -> watch::Receiver<RuntimeReadyState> {
+    let (ready_tx, ready_rx) = watch::channel(RuntimeReadyState::Starting);
+    tokio::spawn(async move {
+        let listener = match httpserver::bind(port).await {
+            Ok(listener) => listener,
+            Err(err) => {
+                let message = format!("failed to bind RRT HTTP port {port}: {err}");
+                rrt_error!("[rrt-http] readiness failed: {message}");
+                let _ = ready_tx.send(RuntimeReadyState::Failed(message));
+                return;
+            }
+        };
+        let address = listener
+            .local_addr()
+            .map(|address| address.to_string())
+            .unwrap_or_else(|_| format!("0.0.0.0:{port}"));
+        let _ = ready_tx.send(RuntimeReadyState::Ready);
+        rrt_info!("[rrt-http] readiness ready address={address}");
+        if let Err(err) = httpserver::serve_listener(listener, token).await {
+            let message = format!("RRT HTTP server stopped on port {port}: {err}");
+            rrt_error!("[rrt-http] {message}");
+            let _ = ready_tx.send(RuntimeReadyState::Failed(message));
+        }
+    });
+    ready_rx
+}
+
+async fn wait_for_runtime_ready(
+    mut ready: watch::Receiver<RuntimeReadyState>,
+) -> Result<(), String> {
+    loop {
+        match ready.borrow_and_update().clone() {
+            RuntimeReadyState::Ready => return Ok(()),
+            RuntimeReadyState::Failed(message) => return Err(message),
+            RuntimeReadyState::Starting => {}
+        }
+        if ready.changed().await.is_err() {
+            return Err("RRT HTTP readiness channel closed before startup completed".to_string());
+        }
+    }
 }
 
 fn first_env<F>(keys: &[&str], get: &mut F) -> String
@@ -196,9 +257,10 @@ mod tests {
             meta_data: Default::default(),
             body: Some(streaming_message::Body::CallReq(call)),
         };
+        let (_ready_tx, ready_rx) = watch::channel(RuntimeReadyState::Ready);
 
         assert!(
-            handle_inbound_message(inbound, "sandbox-instance", ctx, tx).await,
+            handle_inbound_message(inbound, "sandbox-instance", ctx, tx, ready_rx).await,
             "the inbound stream should remain usable"
         );
 
@@ -236,6 +298,152 @@ mod tests {
                 "second outbound message must be CallResult, got {:?}",
                 body.map(|body| body_kind(&body))
             ),
+        }
+    }
+
+    #[tokio::test]
+    async fn init_call_waits_for_http_readiness_without_delaying_transport_ack() {
+        let args = Args {
+            instance_id: "sandbox-instance".to_string(),
+            ..Default::default()
+        };
+        let ctx = std::sync::Arc::new(dispatch::Ctx::new(args));
+        let (tx, mut rx) = mpsc::channel(2);
+        let (ready_tx, ready_rx) = watch::channel(RuntimeReadyState::Starting);
+        let request_id = "create-waits-for-http@initcall";
+        let message_id = "transport-ready-message-id";
+        let call = crate::posix::runtime_service::CallRequest {
+            is_create: true,
+            sender_id: "caller-instance".to_string(),
+            request_id: request_id.to_string(),
+            ..Default::default()
+        };
+        let inbound = StreamingMessage {
+            message_id: message_id.to_string(),
+            meta_data: Default::default(),
+            body: Some(streaming_message::Body::CallReq(call)),
+        };
+
+        assert!(
+            handle_inbound_message(inbound, "sandbox-instance", ctx, tx, ready_rx).await,
+            "the inbound stream should remain usable"
+        );
+
+        let first = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timed out waiting for CallResponse")
+            .expect("outbound channel closed before CallResponse");
+        assert!(matches!(
+            first.body,
+            Some(streaming_message::Body::CallRsp(_))
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), rx.recv())
+                .await
+                .is_err(),
+            "init CallResult must not be sent before HTTP readiness"
+        );
+
+        ready_tx
+            .send(RuntimeReadyState::Ready)
+            .expect("readiness receiver should still be alive");
+        let second = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timed out waiting for readiness-gated CallResult")
+            .expect("outbound channel closed before CallResult");
+        match second.body {
+            Some(streaming_message::Body::CallResultReq(result)) => {
+                assert_eq!(result.request_id, request_id);
+                assert_eq!(result.code, 0);
+            }
+            body => panic!(
+                "second outbound message must be CallResult, got {:?}",
+                body.map(|body| body_kind(&body))
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn init_call_reports_http_readiness_failure_after_transport_ack() {
+        let args = Args {
+            instance_id: "sandbox-instance".to_string(),
+            ..Default::default()
+        };
+        let ctx = std::sync::Arc::new(dispatch::Ctx::new(args));
+        let (tx, mut rx) = mpsc::channel(2);
+        let (_ready_tx, ready_rx) = watch::channel(RuntimeReadyState::Failed(
+            "failed to bind RRT HTTP port 50090: address already in use".to_string(),
+        ));
+        let request_id = "create-http-bind-failed@initcall";
+        let message_id = "transport-bind-failed-message-id";
+        let call = crate::posix::runtime_service::CallRequest {
+            is_create: true,
+            sender_id: "caller-instance".to_string(),
+            request_id: request_id.to_string(),
+            ..Default::default()
+        };
+        let inbound = StreamingMessage {
+            message_id: message_id.to_string(),
+            meta_data: Default::default(),
+            body: Some(streaming_message::Body::CallReq(call)),
+        };
+
+        assert!(
+            handle_inbound_message(inbound, "sandbox-instance", ctx, tx, ready_rx).await,
+            "the inbound stream should remain usable"
+        );
+
+        let first = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timed out waiting for CallResponse")
+            .expect("outbound channel closed before CallResponse");
+        assert!(matches!(
+            first.body,
+            Some(streaming_message::Body::CallRsp(_))
+        ));
+
+        let second = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timed out waiting for readiness failure CallResult")
+            .expect("outbound channel closed before CallResult");
+        match second.body {
+            Some(streaming_message::Body::CallResultReq(result)) => {
+                assert_eq!(result.request_id, request_id);
+                assert_eq!(
+                    result.code,
+                    crate::posix::common::ErrorCode::ErrInnerSystemError as i32
+                );
+                assert!(result.message.contains("runtime initialization failed"));
+                assert!(result.message.contains("address already in use"));
+            }
+            body => panic!(
+                "second outbound message must be CallResult, got {:?}",
+                body.map(|body| body_kind(&body))
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn http_server_readiness_reports_bind_failure() {
+        let occupied = httpserver::bind(0)
+            .await
+            .expect("an ephemeral HTTP port should be available");
+        let port = occupied
+            .local_addr()
+            .expect("occupied listener should have a local address")
+            .port();
+        let mut ready = start_http_server(port, None);
+
+        tokio::time::timeout(Duration::from_secs(1), ready.changed())
+            .await
+            .expect("timed out waiting for HTTP bind failure")
+            .expect("readiness channel closed before reporting bind failure");
+        let state = ready.borrow().clone();
+        match state {
+            RuntimeReadyState::Failed(message) => {
+                assert!(message.contains(&format!("RRT HTTP port {port}")));
+            }
+            state => panic!("expected HTTP readiness failure, got {state:?}"),
         }
     }
 }
@@ -404,17 +612,19 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     rrt_info!("[rrt-runtime] instance_id={}", instance_id);
 
     // Optional: start the RRT atomic-operation HTTP server for sandboxRouter direct access when RRT_HTTP_PORT is set.
-    if let Some(port) = std::env::var("RRT_HTTP_PORT")
-        .ok()
-        .and_then(|p| p.parse::<u16>().ok())
-    {
-        let token = std::env::var("RRT_HTTP_TOKEN").ok();
-        tokio::spawn(async move {
-            if let Err(e) = httpserver::serve(port, token).await {
-                rrt_error!("[rrt-http] serve error: {e}");
+    let runtime_ready = match std::env::var("RRT_HTTP_PORT") {
+        Ok(raw_port) => match raw_port.parse::<u16>() {
+            Ok(port) if port > 0 => {
+                let token = std::env::var("RRT_HTTP_TOKEN").ok();
+                start_http_server(port, token)
             }
-        });
-    }
+            _ => failed_runtime_receiver(format!(
+                "invalid RRT_HTTP_PORT '{raw_port}': expected an integer between 1 and 65535"
+            )),
+        },
+        Err(std::env::VarError::NotPresent) => ready_runtime_receiver(),
+        Err(err) => failed_runtime_receiver(format!("failed to read RRT_HTTP_PORT: {err}")),
+    };
 
     // Optional: start the reverse-tunnel server (reverse_tunnel, Port A ws / Port B http) when RRT_TUNNEL_WS_PORT is set.
     // Run it concurrently with the HTTP server so normal mode can provide both atomic-operation HTTP direct access and reverse tunnel.
@@ -436,7 +646,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // busy/idle reports are emitted by activity::enter()/ActiveGuard drop on 0<->1 transitions.
     // function-proxy IdleMgr owns the actual idle timeout, avoiding inconsistent duplicate timers in RRT and proxy.
-    run_message_stream_loop(args, instance_id, ctx, tx, rx).await
+    run_message_stream_loop(args, instance_id, ctx, tx, rx, runtime_ready).await
 }
 
 fn build_stream_request(
@@ -460,6 +670,7 @@ async fn run_message_stream_loop(
     ctx: std::sync::Arc<dispatch::Ctx>,
     tx: mpsc::Sender<StreamingMessage>,
     mut rx: mpsc::Receiver<StreamingMessage>,
+    runtime_ready: watch::Receiver<RuntimeReadyState>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     const STREAM_CHANNEL_SIZE: usize = 256;
     const RECONNECT_MIN: Duration = Duration::from_millis(200);
@@ -555,7 +766,13 @@ async fn run_message_stream_loop(
                 inbound_msg = inbound.message() => {
                     match inbound_msg {
                         Ok(Some(msg)) => {
-                            if !handle_inbound_message(msg, &instance_id, ctx.clone(), tx.clone()).await {
+                            if !handle_inbound_message(
+                                msg,
+                                &instance_id,
+                                ctx.clone(),
+                                tx.clone(),
+                                runtime_ready.clone(),
+                            ).await {
                                 return Ok(());
                             }
                         }
@@ -653,6 +870,7 @@ async fn handle_inbound_message(
     instance_id: &str,
     ctx: std::sync::Arc<dispatch::Ctx>,
     tx: mpsc::Sender<StreamingMessage>,
+    runtime_ready: watch::Receiver<RuntimeReadyState>,
 ) -> bool {
     let mid = msg.message_id.clone();
     match msg.body {
@@ -680,17 +898,44 @@ async fn handle_inbound_message(
             let tx2 = tx.clone();
             tokio::spawn(async move {
                 let _active = activity::enter(); // Count RuntimeRPC calls as busy.
-                let reply = match tokio::task::spawn_blocking(move || ctx2.handle_call(call)).await
-                {
-                    Ok(msg) => msg,
-                    Err(e) => call_result_msg(
+                let readiness = if call.is_create {
+                    match tokio::time::timeout(
+                        RUNTIME_READY_TIMEOUT,
+                        wait_for_runtime_ready(runtime_ready),
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => Err(format!(
+                            "RRT HTTP readiness timed out after {} seconds",
+                            RUNTIME_READY_TIMEOUT.as_secs()
+                        )),
+                    }
+                } else {
+                    Ok(())
+                };
+                let reply = match readiness {
+                    Err(message) => call_result_msg(
                         request_id,
                         iid,
                         String::new(),
-                        1,
-                        &format!("dispatch panicked: {e}"),
+                        crate::posix::common::ErrorCode::ErrInnerSystemError as i32,
+                        &format!("runtime initialization failed: {message}"),
                         Vec::new(),
                     ),
+                    Ok(()) => {
+                        match tokio::task::spawn_blocking(move || ctx2.handle_call(call)).await {
+                            Ok(msg) => msg,
+                            Err(e) => call_result_msg(
+                                request_id,
+                                iid,
+                                String::new(),
+                                crate::posix::common::ErrorCode::ErrInnerSystemError as i32,
+                                &format!("dispatch panicked: {e}"),
+                                Vec::new(),
+                            ),
+                        }
+                    }
                 };
                 let _ = tx2.send(reply).await;
             });
