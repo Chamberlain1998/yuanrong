@@ -208,7 +208,7 @@ func (ls *LiteScheduler) Process(req *LiteRequest, traceID, traceParent string,
 		if !owned {
 			logger.Warnf("lite Process not owner of session (owner=%s), should reroute", ownerID)
 			data, _ := json.Marshal(liteErrResp(statuscode.AcquireNonOwnerSchedulerErrorCode,
-				fmt.Sprintf("not the owner scheduler; should be routed to %s", ownerID), startTime))
+				ownerID, startTime))
 			return data, nil
 		}
 	}

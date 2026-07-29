@@ -18,11 +18,16 @@
 package litescheduler
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 
 	"github.com/smartystreets/goconvey/convey"
+	"yuanrong.org/kernel/pkg/common/faas_common/loadbalance"
+	"yuanrong.org/kernel/pkg/common/faas_common/statuscode"
+	commonTypes "yuanrong.org/kernel/pkg/common/faas_common/types"
 	"yuanrong.org/kernel/pkg/functionscaler/config"
+	"yuanrong.org/kernel/pkg/functionscaler/selfregister"
 	"yuanrong.org/kernel/pkg/functionscaler/types"
 )
 
@@ -75,5 +80,35 @@ func TestProcessReverseLookupFillsSessionID(t *testing.T) {
 		relReq := &LiteRequest{Op: "release", AllocationIDs: []string{allocID}, NeedReverseLookup: true, TraceID: "tr"}
 		err := ls.processRequest(relReq, "", nil)
 		convey.So(err, convey.ShouldBeNil)
+	})
+}
+
+func TestProcessAcquireNonOwnerReturnsOwnerID(t *testing.T) {
+	convey.Convey("acquire non-owner response returns the owner ID only", t, func() {
+		proxy := selfregister.NewSchedulerProxy(loadbalance.NewSimpleCHGeneric())
+		proxy.Add(&commonTypes.InstanceInfo{
+			InstanceID:   "owner-scheduler-id",
+			InstanceName: "owner-scheduler-name",
+		}, "", "", true)
+
+		oldSelfID := selfregister.SelfInstanceID
+		oldSelfName := selfregister.SelfInstanceName
+		selfregister.SelfInstanceID = "local-scheduler"
+		selfregister.SelfInstanceName = "local-scheduler"
+		defer func() {
+			selfregister.SelfInstanceID = oldSelfID
+			selfregister.SelfInstanceName = oldSelfName
+		}()
+
+		ls := &LiteScheduler{ownerProxy: proxy}
+		data, err := ls.Process(&LiteRequest{
+			Op: "acquire", TenantID: "tenant1", SessionID: "session1", TraceID: "trace1",
+		}, "trace1", "", nil)
+		convey.So(err, convey.ShouldBeNil)
+
+		resp := &commonTypes.InstanceResponse{}
+		convey.So(json.Unmarshal(data, resp), convey.ShouldBeNil)
+		convey.So(resp.ErrorCode, convey.ShouldEqual, statuscode.AcquireNonOwnerSchedulerErrorCode)
+		convey.So(resp.ErrorMessage, convey.ShouldEqual, "owner-scheduler-id")
 	})
 }
