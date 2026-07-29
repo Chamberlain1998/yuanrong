@@ -6,6 +6,7 @@
 use crate::posix::core_service::CallResult;
 use crate::posix::runtime_rpc::runtime_rpc_client::RuntimeRpcClient;
 use crate::posix::runtime_rpc::{streaming_message, StreamingMessage};
+use crate::posix::runtime_service::CallResponse;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -172,6 +173,70 @@ mod tests {
 
         assert_eq!(args.instance_id, "demo-sandbox");
         assert_eq!(args.log_level, "INFO");
+    }
+
+    #[tokio::test]
+    async fn call_request_sends_transport_response_before_call_result() {
+        let args = Args {
+            instance_id: "sandbox-instance".to_string(),
+            ..Default::default()
+        };
+        let ctx = std::sync::Arc::new(dispatch::Ctx::new(args));
+        let (tx, mut rx) = mpsc::channel(2);
+        let request_id = "create-request@initcall";
+        let message_id = "transport-message-id";
+        let call = crate::posix::runtime_service::CallRequest {
+            is_create: true,
+            sender_id: "caller-instance".to_string(),
+            request_id: request_id.to_string(),
+            ..Default::default()
+        };
+        let inbound = StreamingMessage {
+            message_id: message_id.to_string(),
+            meta_data: Default::default(),
+            body: Some(streaming_message::Body::CallReq(call)),
+        };
+
+        assert!(
+            handle_inbound_message(inbound, "sandbox-instance", ctx, tx).await,
+            "the inbound stream should remain usable"
+        );
+
+        let first = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timed out waiting for CallResponse")
+            .expect("outbound channel closed before CallResponse");
+        assert_eq!(first.message_id, message_id);
+        match first.body {
+            Some(streaming_message::Body::CallRsp(response)) => {
+                assert_eq!(
+                    response.code,
+                    crate::posix::common::ErrorCode::ErrNone as i32
+                );
+                assert!(response.message.is_empty());
+            }
+            body => panic!(
+                "first outbound message must be CallResponse, got {:?}",
+                body.map(|body| body_kind(&body))
+            ),
+        }
+
+        let second = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timed out waiting for CallResult")
+            .expect("outbound channel closed before CallResult");
+        assert_eq!(second.message_id, request_id);
+        match second.body {
+            Some(streaming_message::Body::CallResultReq(result)) => {
+                assert_eq!(result.request_id, request_id);
+                assert_eq!(result.instance_id, "caller-instance");
+                assert_eq!(result.code, 0);
+            }
+            body => panic!(
+                "second outbound message must be CallResult, got {:?}",
+                body.map(|body| body_kind(&body))
+            ),
+        }
     }
 }
 
@@ -568,6 +633,21 @@ fn body_kind(body: &streaming_message::Body) -> &'static str {
     }
 }
 
+/// Acknowledge receipt of a CallReq on the transport-level message ID.
+///
+/// CallResultReq is a separate business result keyed by CallRequest.requestID.
+/// Function Proxy keeps the send future pending until this response arrives.
+fn call_response_msg(message_id: String) -> StreamingMessage {
+    StreamingMessage {
+        message_id,
+        meta_data: Default::default(),
+        body: Some(streaming_message::Body::CallRsp(CallResponse {
+            code: crate::posix::common::ErrorCode::ErrNone as i32,
+            message: String::new(),
+        })),
+    }
+}
+
 async fn handle_inbound_message(
     msg: StreamingMessage,
     instance_id: &str,
@@ -585,6 +665,9 @@ async fn handle_inbound_message(
                     call.request_id,
                     call.args.len()
                 );
+            }
+            if tx.send(call_response_msg(mid)).await.is_err() {
+                return false;
             }
             // Each call uses its own spawn_blocking task: long commands must not block the receive loop because heartbeats must keep responding.
             let request_id = call.request_id.clone();
