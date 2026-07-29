@@ -61,7 +61,7 @@ class YRError(Exception):
         code_value = getattr(code, "value", code)
         module_code_value = getattr(module_code, "value", module_code)
         message = (
-            f"code: {code_value}, module code {module_code_value}, "
+            f"code: {code_value}, module code: {module_code_value}, "
             f"msg: {getattr(error_info, 'msg', '')}"
         )
         if message_prefix:

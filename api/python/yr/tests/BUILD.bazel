@@ -54,6 +54,15 @@ py_test(
   env = SAN_ENV,
 )
 py_test(
+  name = "test_exception_structured",
+  size = "small",
+  srcs = ["test_exception_structured.py"],
+  tags = ["smoke"],
+  imports = ["../../"],
+  deps = ["//api/python:yr_lib"],
+  env = SAN_ENV,
+)
+py_test(
   name = "test_cluster_mode_runtime",
   size = "small",
   srcs = ["test_cluster_mode_runtime.py"],

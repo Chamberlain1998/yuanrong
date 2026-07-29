@@ -54,8 +54,8 @@ def test_error_info_is_preserved():
     assert error.error_info is info
     assert error.code == ErrorCode.ERR_GET_OPERATION_FAILED
     assert error.module_code == ModuleCode.RUNTIME
-    assert error.message == "code: 4005, module code 20, msg: get failed"
-    assert str(error) == "code: 4005, module code 20, msg: get failed"
+    assert error.message == "code: 4005, module code: 20, msg: get failed"
+    assert str(error) == "code: 4005, module code: 20, msg: get failed"
 
 
 def test_error_info_message_prefix_is_preserved():
@@ -64,8 +64,8 @@ def test_error_info_message_prefix_is_preserved():
     error = YRRuntimeError.from_error_info(info, message_prefix="failed to get object")
 
     assert error.error_info is info
-    assert error.message == "failed to get object, code: 4005, module code 20, msg: boom"
-    assert str(error) == "failed to get object, code: 4005, module code 20, msg: boom"
+    assert error.message == "failed to get object, code: 4005, module code: 20, msg: boom"
+    assert str(error) == "failed to get object, code: 4005, module code: 20, msg: boom"
 
 
 def test_integer_error_info_codes_remain_in_legacy_messages():
@@ -75,8 +75,8 @@ def test_integer_error_info_codes_remain_in_legacy_messages():
     error = YRRuntimeError.from_error_info(info)
     prefixed_error = YRRuntimeError.from_error_info(info, message_prefix="failed to get object")
 
-    assert error.message == "code: 4005, module code 20, msg: get failed"
-    assert prefixed_error.message == "failed to get object, code: 4005, module code 20, msg: get failed"
+    assert error.message == "code: 4005, module code: 20, msg: get failed"
+    assert prefixed_error.message == "failed to get object, code: 4005, module code: 20, msg: get failed"
 
 
 def test_timeout_value_and_type_errors_keep_builtin_catch_compatibility():
