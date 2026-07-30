@@ -389,6 +389,16 @@ type RootfsSpecMeta struct {
 	ReadOnly    bool              `json:"readonly" valid:",optional"`
 	StorageInfo RootfsStorageInfo `json:"storageInfo" valid:",optional"`
 	MountPoint  string            `json:"mountpoint" valid:",optional"`
+	Mounts      []RootfsMount     `json:"mounts" valid:",optional"`
+}
+
+// RootfsMount describes a host directory bind-mounted into the sandbox container.
+// Field JSON tags align with the docker_executor's ParseRootfsMounts
+// (functionsystem/src/runtime_manager/utils/utils.cpp): source/target/readonly.
+type RootfsMount struct {
+	Source   string `json:"source" valid:",optional"`
+	Target   string `json:"target" valid:",optional"`
+	ReadOnly bool   `json:"readonly" valid:",optional"`
 }
 
 // StateConfig ConsistentWithInstance- The lifecycle is consistent with that of the instance.

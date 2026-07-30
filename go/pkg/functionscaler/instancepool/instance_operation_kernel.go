@@ -339,7 +339,7 @@ func createInvokeOptions(funcSpec *types.FunctionSpecification, schedulingOption
 
 func isEmptyRootfsSpec(rootfs commonTypes.RootfsSpecMeta) bool {
 	if rootfs.Runtime != "" || rootfs.Type != "" || rootfs.ImageURL != "" || rootfs.Path != "" ||
-		rootfs.MountPoint != "" || rootfs.ReadOnly {
+		rootfs.MountPoint != "" || rootfs.ReadOnly || len(rootfs.Mounts) != 0 {
 		return false
 	}
 	if rootfs.StorageInfo.Endpoint != "" || rootfs.StorageInfo.Bucket != "" || rootfs.StorageInfo.Object != "" ||
