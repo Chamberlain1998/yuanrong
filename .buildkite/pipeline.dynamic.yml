@@ -746,6 +746,11 @@ cat << YAML
           echo "=== [2.5/6] Replace functionsystem source with Rust branch ==="
           rm -rf functionsystem
           git clone --depth 1 --branch "${FUNCTIONSYSTEM_BRANCH}" "${FUNCTIONSYSTEM_REPO}" functionsystem
+          # The Rust packager reads binaries from functionsystem/target/release,
+          # while CI keeps Cargo outputs in the shared target directory.
+          if [ -n "\$\${CARGO_TARGET_DIR:-}" ] && [ ! -e functionsystem/target ]; then
+            ln -s "\$\$CARGO_TARGET_DIR" functionsystem/target
+          fi
           ;;
       esac
       

@@ -1163,7 +1163,7 @@ std::pair<std::vector<std::string>, ErrorInfo> MemoryStore::GetInstanceIds(const
         auto it = storeMap.find(objId);
         if (it == storeMap.end()) {
             std::string msg = "objId " + objId + " does not exist in storeMap.";
-            YRLOG_INFO("{} Return objId as instanceId.", msg);
+            YRLOG_DEBUG("{} Return objId as instanceId.", msg);
             retInstances.push_back(objId);
             return std::make_pair(retInstances, ErrorInfo(ErrorCode::ERR_INNER_SYSTEM_ERROR, ModuleCode::RUNTIME, msg));
         }

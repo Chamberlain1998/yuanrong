@@ -2,11 +2,55 @@
 
 use super::codec;
 use super::{call_result_msg, Args};
-use crate::posix::resources::MetaData;
 use crate::posix::runtime_rpc::StreamingMessage;
 use crate::posix::runtime_service::CallRequest;
-use prost::Message;
+use std::collections::HashMap;
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+const REQUEST_DEDUP_TTL: Duration = Duration::from_secs(30 * 60);
+
+struct DedupSlot {
+    created: Instant,
+    response: Mutex<Option<Result<rmpv::Value, String>>>,
+    ready: Condvar,
+}
+
+fn dedup_cache() -> &'static Mutex<HashMap<String, Arc<DedupSlot>>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Arc<DedupSlot>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn reserve_request_id(request_id: &str) -> (Arc<DedupSlot>, bool) {
+    let now = Instant::now();
+    let mut cache = dedup_cache().lock().unwrap();
+    cache.retain(|_, slot| now.duration_since(slot.created) <= REQUEST_DEDUP_TTL);
+    if let Some(slot) = cache.get(request_id) {
+        return (slot.clone(), false);
+    }
+    let slot = Arc::new(DedupSlot {
+        created: now,
+        response: Mutex::new(None),
+        ready: Condvar::new(),
+    });
+    cache.insert(request_id.to_string(), slot.clone());
+    (slot, true)
+}
+
+fn wait_dedup_response(slot: Arc<DedupSlot>) -> Result<rmpv::Value, String> {
+    let mut guard = slot.response.lock().unwrap();
+    loop {
+        if let Some(response) = guard.clone() {
+            return response;
+        }
+        guard = slot.ready.wait(guard).unwrap();
+    }
+}
+
+fn complete_dedup_response(slot: &Arc<DedupSlot>, response: Result<rmpv::Value, String>) {
+    *slot.response.lock().unwrap() = Some(response);
+    slot.ready.notify_all();
+}
 
 fn sanitize_log_field(value: &str) -> String {
     let mut out = value.replace('\r', "\\r").replace('\n', "\\n");
@@ -303,16 +347,6 @@ fn yr_serialize<T: serde::Serialize>(value: &T) -> Vec<u8> {
     buf
 }
 
-/// Extract method name from CallRequest: args[0] is MetaData and the method is functionMeta.functionName.
-fn method_name(call: &CallRequest) -> String {
-    call.args
-        .first()
-        .and_then(|a| MetaData::decode(a.value.as_slice()).ok())
-        .and_then(|m| m.function_meta)
-        .map(|fm| fm.function_name)
-        .unwrap_or_default()
-}
-
 fn value_map_to_kwargs(
     value: Option<&rmpv::Value>,
 ) -> std::collections::BTreeMap<String, rmpv::Value> {
@@ -424,6 +458,44 @@ pub(crate) fn dispatch_runtime_action_with_trace(
     }
 }
 
+/// Execute one public sandbox action through the same normalized RRT primitive
+/// used by both RuntimeRPC and the direct HTTP endpoint.
+pub(crate) fn execute_sandbox_action(
+    action: &str,
+    kw: &std::collections::BTreeMap<String, rmpv::Value>,
+    trace_id: &str,
+) -> Result<rmpv::Value, String> {
+    let started = Instant::now();
+    let method = normalize_sandbox_action(action)
+        .ok_or_else(|| format!("unsupported sandbox action: {action}"))?;
+    let command = access_command_summary(method, kw);
+    let result = dispatch_runtime_action_with_trace(method, kw, trace_id)
+        .ok_or_else(|| format!("unsupported sandbox action: {action}"));
+    log_access(trace_id, &command, started);
+    result
+}
+
+/// Execute a sandbox action at most once for a non-empty request ID. Both
+/// RuntimeRPC and direct HTTP use this cache, so retries crossing transports
+/// observe the same result.
+pub(crate) fn execute_sandbox_action_once(
+    request_id: Option<&str>,
+    action: &str,
+    kw: &std::collections::BTreeMap<String, rmpv::Value>,
+    trace_id: &str,
+) -> Result<rmpv::Value, String> {
+    let Some(request_id) = request_id.filter(|id| !id.is_empty()) else {
+        return execute_sandbox_action(action, kw, trace_id);
+    };
+    let (slot, owner) = reserve_request_id(request_id);
+    if !owner {
+        return wait_dedup_response(slot);
+    }
+    let response = execute_sandbox_action(action, kw, trace_id);
+    complete_dedup_response(&slot, response.clone());
+    response
+}
+
 pub struct Ctx {
     #[allow(dead_code)]
     args: Args,
@@ -461,7 +533,8 @@ impl Ctx {
         if call.is_create {
             return call_result_msg(call.request_id, iid, oid, 0, "created", Vec::new());
         }
-        let method = method_name(&call);
+        let kw = codec::parse_kwargs(&call.args);
+        let method = codec::kw_str(&kw, "sandbox_method").unwrap_or_default();
         if super::debug_on() {
             rrt_debug!("[rrt-runtime] method={method} args={}", call.args.len());
         }
@@ -475,21 +548,12 @@ impl Ctx {
                 call_result_msg(call.request_id, iid, oid, 0, "ok", yr_serialize(&r))
             }
             "sandbox_invoke" => {
-                let kw = codec::parse_kwargs(&call.args);
                 let action = codec::kw_str(&kw, "action").unwrap_or_default();
                 let args = value_map_to_kwargs(kw.get("args"));
                 let trace_id = access_trace_id(&call.trace_id, &call.request_id);
-                let started = Instant::now();
-                let normalized = normalize_sandbox_action(&action);
-                let command = normalized
-                    .map(|method| access_command_summary(method, &args))
-                    .unwrap_or_else(|| format!("sandbox_invoke action={action}"));
-                let result = normalized.and_then(|method| {
-                    dispatch_runtime_action_with_trace(method, &args, &trace_id)
-                });
-                log_access(&trace_id, &command, started);
-                match result {
-                    Some(r) => call_result_msg(
+                match execute_sandbox_action_once(Some(&call.request_id), &action, &args, &trace_id)
+                {
+                    Ok(r) => call_result_msg(
                         call.request_id,
                         iid,
                         oid,
@@ -497,18 +561,12 @@ impl Ctx {
                         "ok",
                         codec::yr_serialize_value(&r),
                     ),
-                    None => call_result_msg(
-                        call.request_id,
-                        iid,
-                        oid,
-                        1,
-                        &format!("unsupported sandbox action: {action}"),
-                        Vec::new(),
-                    ),
+                    Err(message) => {
+                        call_result_msg(call.request_id, iid, oid, 1, &message, Vec::new())
+                    }
                 }
             }
             "cmd_run" => {
-                let kw = codec::parse_kwargs(&call.args);
                 let trace_id = access_trace_id(&call.trace_id, &call.request_id);
                 let started = Instant::now();
                 let command = access_command_summary("cmd_run", &kw);
@@ -532,7 +590,6 @@ impl Ctx {
             }
             "fs_read" | "fs_write" | "fs_write_chunk" | "fs_read_chunk" | "fs_list"
             | "fs_exists" | "fs_remove" | "fs_rename" | "fs_make_dir" | "fs_get_info" => {
-                let kw = codec::parse_kwargs(&call.args);
                 let r = dispatch_runtime_action(method.as_str(), &kw).unwrap_or_else(|| {
                     codec::map_value(vec![(
                         "error",
@@ -565,7 +622,6 @@ impl Ctx {
                 }
             }
             "cmd_start" | "cmd_poll" | "cmd_wait" | "cmd_kill" | "cmd_list" | "cmd_send_stdin" => {
-                let kw = codec::parse_kwargs(&call.args);
                 let trace_id = access_trace_id(&call.trace_id, &call.request_id);
                 let started = Instant::now();
                 let command = access_command_summary(method.as_str(), &kw);
@@ -586,7 +642,6 @@ impl Ctx {
                 )
             }
             "bash_init" | "bash_submit" | "bash_poll" | "bash_destroy" => {
-                let kw = codec::parse_kwargs(&call.args);
                 let trace_id = access_trace_id(&call.trace_id, &call.request_id);
                 let started = Instant::now();
                 let command = access_command_summary(method.as_str(), &kw);
@@ -661,7 +716,8 @@ mod tests {
             "cmd".to_string(),
             rmpv::Value::from("printf sandbox-invoke"),
         );
-        let result = dispatch_runtime_action("cmd_run", &kw).expect("cmd_run should dispatch");
+        let result = execute_sandbox_action("process.exec", &kw, "trace-test")
+            .expect("sandbox action should dispatch through the shared path");
         if let rmpv::Value::Map(fields) = result {
             let stdout = fields
                 .iter()
@@ -737,5 +793,28 @@ mod tests {
             !descendant_marker.exists(),
             "timeout should kill the whole process group, not only /bin/sh"
         );
+    }
+
+    #[test]
+    fn deduplicates_sandbox_actions_by_request_id() {
+        let first_args = BTreeMap::from([("cmd".to_string(), rmpv::Value::from("printf first"))]);
+        let second_args = BTreeMap::from([("cmd".to_string(), rmpv::Value::from("printf second"))]);
+
+        let first = execute_sandbox_action_once(
+            Some("rrt-dedup-test-request"),
+            "process.exec",
+            &first_args,
+            "trace-first",
+        )
+        .expect("first action should run");
+        let duplicate = execute_sandbox_action_once(
+            Some("rrt-dedup-test-request"),
+            "process.exec",
+            &second_args,
+            "trace-second",
+        )
+        .expect("duplicate action should reuse the first result");
+
+        assert_eq!(duplicate, first);
     }
 }

@@ -89,31 +89,30 @@ fn failed_runtime_receiver(message: String) -> watch::Receiver<RuntimeReadyState
     rx
 }
 
-fn start_http_server(port: u16, token: Option<String>) -> watch::Receiver<RuntimeReadyState> {
+async fn start_http_server(
+    port: u16,
+    token: Option<String>,
+) -> Result<watch::Receiver<RuntimeReadyState>, std::io::Error> {
+    let listener = httpserver::bind(port).await.map_err(|err| {
+        let message = format!("failed to bind RRT HTTP port {port}: {err}");
+        rrt_error!("[rrt-http] readiness failed: {message}");
+        std::io::Error::new(err.kind(), message)
+    })?;
+    let address = listener
+        .local_addr()
+        .map(|address| address.to_string())
+        .unwrap_or_else(|_| format!("0.0.0.0:{port}"));
     let (ready_tx, ready_rx) = watch::channel(RuntimeReadyState::Starting);
+    let _ = ready_tx.send(RuntimeReadyState::Ready);
+    rrt_info!("[rrt-http] readiness ready address={address}");
     tokio::spawn(async move {
-        let listener = match httpserver::bind(port).await {
-            Ok(listener) => listener,
-            Err(err) => {
-                let message = format!("failed to bind RRT HTTP port {port}: {err}");
-                rrt_error!("[rrt-http] readiness failed: {message}");
-                let _ = ready_tx.send(RuntimeReadyState::Failed(message));
-                return;
-            }
-        };
-        let address = listener
-            .local_addr()
-            .map(|address| address.to_string())
-            .unwrap_or_else(|_| format!("0.0.0.0:{port}"));
-        let _ = ready_tx.send(RuntimeReadyState::Ready);
-        rrt_info!("[rrt-http] readiness ready address={address}");
         if let Err(err) = httpserver::serve_listener(listener, token).await {
             let message = format!("RRT HTTP server stopped on port {port}: {err}");
             rrt_error!("[rrt-http] {message}");
             let _ = ready_tx.send(RuntimeReadyState::Failed(message));
         }
     });
-    ready_rx
+    Ok(ready_rx)
 }
 
 async fn wait_for_runtime_ready(
@@ -234,6 +233,61 @@ mod tests {
 
         assert_eq!(args.instance_id, "demo-sandbox");
         assert_eq!(args.log_level, "INFO");
+    }
+
+    #[test]
+    fn call_result_keeps_inline_value_without_object_id() {
+        let message = call_result_msg(
+            "request-inline".to_string(),
+            "sandbox-instance".to_string(),
+            String::new(),
+            0,
+            "ok",
+            vec![1, 2, 3],
+        );
+
+        let Some(streaming_message::Body::CallResultReq(result)) = message.body else {
+            panic!("expected CallResultReq");
+        };
+        assert_eq!(result.small_objects.len(), 1);
+        assert!(result.small_objects[0].id.is_empty());
+        assert_eq!(result.small_objects[0].value, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn call_result_preserves_supplied_object_id() {
+        let message = call_result_msg(
+            "request-object".to_string(),
+            "sandbox-instance".to_string(),
+            "object-result".to_string(),
+            0,
+            "ok",
+            vec![4, 5, 6],
+        );
+
+        let Some(streaming_message::Body::CallResultReq(result)) = message.body else {
+            panic!("expected CallResultReq");
+        };
+        assert_eq!(result.small_objects.len(), 1);
+        assert_eq!(result.small_objects[0].id, "object-result");
+        assert_eq!(result.small_objects[0].value, vec![4, 5, 6]);
+    }
+
+    #[test]
+    fn call_result_omits_small_object_without_inline_value() {
+        let message = call_result_msg(
+            "request-empty".to_string(),
+            "sandbox-instance".to_string(),
+            "unused-object".to_string(),
+            0,
+            "created",
+            Vec::new(),
+        );
+
+        let Some(streaming_message::Body::CallResultReq(result)) = message.body else {
+            panic!("expected CallResultReq");
+        };
+        assert!(result.small_objects.is_empty());
     }
 
     #[tokio::test]
@@ -424,7 +478,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_server_readiness_reports_bind_failure() {
+    async fn http_server_bind_failure_is_reported_before_runtime_stream_start() {
         let occupied = httpserver::bind(0)
             .await
             .expect("an ephemeral HTTP port should be available");
@@ -432,19 +486,33 @@ mod tests {
             .local_addr()
             .expect("occupied listener should have a local address")
             .port();
-        let mut ready = start_http_server(port, None);
-
-        tokio::time::timeout(Duration::from_secs(1), ready.changed())
+        let error = start_http_server(port, None)
             .await
-            .expect("timed out waiting for HTTP bind failure")
-            .expect("readiness channel closed before reporting bind failure");
-        let state = ready.borrow().clone();
-        match state {
-            RuntimeReadyState::Failed(message) => {
-                assert!(message.contains(&format!("RRT HTTP port {port}")));
-            }
-            state => panic!("expected HTTP readiness failure, got {state:?}"),
-        }
+            .expect_err("occupied HTTP port must fail before RuntimeRPC starts");
+
+        assert!(error.to_string().contains(&format!("RRT HTTP port {port}")));
+    }
+
+    #[tokio::test]
+    async fn http_server_port_is_reserved_before_start_returns() {
+        let probe = httpserver::bind(0)
+            .await
+            .expect("an ephemeral HTTP port should be available");
+        let port = probe
+            .local_addr()
+            .expect("probe listener should have a local address")
+            .port();
+        drop(probe);
+
+        let ready = start_http_server(port, None)
+            .await
+            .expect("HTTP listener should bind before start returns");
+
+        assert_eq!(*ready.borrow(), RuntimeReadyState::Ready);
+        let error = httpserver::bind(port)
+            .await
+            .expect_err("the returned server must already reserve its port");
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
     }
 }
 
@@ -539,8 +607,10 @@ pub(crate) fn call_result_msg(
         message: message.to_string(),
         ..Default::default()
     };
-    // smallObject.id must equal returnObjectID so driver get(returnObjectID) can read the inline result.
-    if !object_id.is_empty() {
+    // Raw RRT invokes return their value inline even when the caller does not
+    // allocate a DataSystem return object. Preserve a supplied object ID, but
+    // do not use its absence to discard a valid inline result.
+    if !value.is_empty() {
         result
             .small_objects
             .push(crate::posix::common::SmallObject {
@@ -616,7 +686,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Ok(raw_port) => match raw_port.parse::<u16>() {
             Ok(port) if port > 0 => {
                 let token = std::env::var("RRT_HTTP_TOKEN").ok();
-                start_http_server(port, token)
+                // Reserve the fixed HTTP port before RuntimeRPC opens an outbound socket.
+                // The sandbox ephemeral range may include this port.
+                start_http_server(port, token).await?
             }
             _ => failed_runtime_receiver(format!(
                 "invalid RRT_HTTP_PORT '{raw_port}': expected an integer between 1 and 65535"
