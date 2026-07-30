@@ -68,21 +68,39 @@ OUTPUT_DIR=${BASE_DIR}/../output
 # 2. Bypass Porter Stemmer for CJK: stemmer destroys Chinese characters.
 # 3. Relax length filter for CJK: allow single/double-char CJK terms in
 #    partial matching and filteredTermCount.
+# 4. Append CJK segmentation logic to ensure it loads after searchtools.js.
 # Each patch includes an idempotency guard: if already patched, skip.
 function patch_searchtools() {
   local JS_FILE="$1"
+  local STATIC_DIR="$(dirname "$JS_FILE")"
   # Remove digit filter (multiline: || spans two lines)
-  grep -q 'queryTerm\\.match.*\\\\d' "$JS_FILE" \
+  grep -q 'queryTerm\.match.*\\d' "$JS_FILE" \
     && sed -i '/||$/{N;s/||\n\s*queryTerm\.match(\/\^\\d+\$\/)//;}' "$JS_FILE"
   # Bypass stemmer for CJK terms
-  grep -q '\\[\\\\u4e00-\\\\u9fff\\]' "$JS_FILE" \
+  grep -q 'queryTermLower) ? queryTermLower' "$JS_FILE" \
     || sed -i 's/let word = stemmer\.stemWord(queryTermLower);/let word = \/[\\u4e00-\\u9fff]\/.test(queryTermLower) ? queryTermLower : stemmer.stemWord(queryTermLower);/' "$JS_FILE"
-  # Relax length filter for CJK terms — parentheses ensure correct
-  # precedence if Sphinx later wraps these in && compound expressions.
-  # Idempotency: grep first, only patch if unpatched occurrences exist.
-  if grep -qE '(word|term)\.length > 2' "$JS_FILE" && ! grep -qE '\(word\.length > 2 ||' "$JS_FILE"; then
-    sed -i -E 's/(word|term)\.length > 2/(\1.length > 2 || \/[\\u4e00-\\u9fff]\/.test(\1))/g' "$JS_FILE"
+  # Relax length filter for CJK terms.
+  # Use CJK_LEN_PATCH sentinel for idempotency.
+  # Use /* ... */ block comment to avoid line-end // swallowing closing
+  # parens/semicolons on arrow-function expressions (e.g. .filter(...);).
+  # Use # as sed delimiter to avoid escaping / and conflict with || in replacement.
+  if ! grep -q 'CJK_LEN_PATCH' "$JS_FILE"; then
+    sed -i 's#if (word\.length > 2) {#if (word.length > 2 || /[\u4e00-\u9fff]/.test(word)) { /* CJK_LEN_PATCH */#' "$JS_FILE"
+    sed -i 's#(term) => term\.length > 2#(term) => term.length > 2 || /[\u4e00-\u9fff]/.test(term) /* CJK_LEN_PATCH */#' "$JS_FILE"
   fi
+  # Append CJK segmentation logic to searchtools.js.
+  # This avoids script loading order issues: html_js_files scripts load in <head>
+  # before searchtools.js (which loads at </body>). Appending directly ensures
+  # the splitQuery override runs after searchtools.js defines it.
+  # Idempotency: build.sh writes the CJK_SPLIT_APPENDED sentinel itself,
+  # so the check does not depend on the source file's content.
+  local SPLIT_SRC="$STATIC_DIR/search_cjk_split.js"
+  if [[ ! -f "$SPLIT_SRC" ]]; then
+    echo "ERROR: $SPLIT_SRC not found, CJK segmentation cannot be injected" >&2
+    return 1
+  fi
+  grep -q 'CJK_SPLIT_APPENDED' "$JS_FILE" \
+    || { echo "/* CJK_SPLIT_APPENDED */" >> "$JS_FILE"; cat "$SPLIT_SRC" >> "$JS_FILE"; }
 }
 
 # Add noindex meta tag to all HTML files in a directory (for non-latest versions).

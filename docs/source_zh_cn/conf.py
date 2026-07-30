@@ -82,6 +82,8 @@ extensions = [
     "breathe",
     "sphinxcontrib.openapi",  # 添加 sphinxcontrib-openapi 扩展
 ]
+# Enable Chinese search: Sphinx uses jieba for word-level tokenization in the index.
+html_search_language = "zh"
 sitemap_url_scheme = "{link}"
 sitemap_show_lastmod = True
 sitemap_excludes = [
@@ -122,8 +124,13 @@ html_js_files = [
     "language-switcher.js",
     "js/dismissable-banner.js",
     "search_cjk_dict.js",
-    "search_cjk_split.js",
 ]
+# IMPORTANT: CJK search segmentation requires build.sh, NOT bare sphinx-build.
+# search_cjk_split.js is appended to searchtools.js by build.sh at build
+# time, avoiding script loading order issues (html_js_files load before
+# searchtools.js in the HTML template). Running sphinx-build directly
+# without build.sh will cause CJK segmentation to be missing. Always use:
+#   ./build.sh -v <version>
 #   确保末尾加上斜杠
 html_baseurl = "https://docs.openyuanrong.org/zh-cn/latest/"
 html_theme_options = {
@@ -239,16 +246,19 @@ def setup(app):
             raw = f.read()
 
         # 从 Search.setIndex({...}) 中提取 terms 字典
-        # Sphinx 格式: "Search.setIndex({...});" — 剥离前缀和分号后解析 JSON
+        # Sphinx format: "Search.setIndex({...});" or "Search.setIndex({...})"
+        # Strip prefix and suffix before JSON parsing.
         prefix = "Search.setIndex("
-        suffix = ");"
         start = raw.find(prefix)
         if start == -1:
             logging.warning("Search: searchindex.js format unrecognized, CJK dict not generated")
             return
         json_str = raw[start + len(prefix):].rstrip()
-        if json_str.endswith(suffix):
-            json_str = json_str[:-len(suffix)]
+        # Strip trailing ); or ), take outermost {} as JSON
+        if json_str.endswith(");"):
+            json_str = json_str[:-2]
+        elif json_str.endswith(")"):
+            json_str = json_str[:-1]
         try:
             data = json.loads(json_str)
         except json.JSONDecodeError:
@@ -274,5 +284,9 @@ def setup(app):
             f.write(";\n")
 
         logging.info(f"Search: generated CJK dict ({len(words)} words)")
+
+    # search_cjk_split.js is appended to searchtools.js by build.sh at build
+    # time, avoiding script loading order issues (html_js_files load before
+    # searchtools.js in the HTML template).
 
     app.connect("build-finished", _build_cjk_dict)
