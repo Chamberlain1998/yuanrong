@@ -18,6 +18,8 @@
 package litescheduler
 
 import (
+	"time"
+
 	"go.uber.org/zap"
 	"yuanrong.org/kernel/pkg/common/faas_common/logger/log"
 	commonTypes "yuanrong.org/kernel/pkg/common/faas_common/types"
@@ -43,6 +45,7 @@ func (ls *LiteScheduler) SubscribeAndLoop() {
 	go ls.processInstanceEvents()
 	go ls.processSchedulerEvents()
 	go ls.processExpiryEvents()
+	go ls.processSessionContextIdle()
 }
 
 func (ls *LiteScheduler) processFuncSpecEvents() {
@@ -138,6 +141,23 @@ func (ls *LiteScheduler) processSchedulerEvents() {
 				return
 			}
 			logger.Debugf("lite scheduler observed ring change: type %v", event.EventType)
+			for _, pool := range ls.Pools() {
+				pool.Lock()
+				for _, instance := range pool.instances {
+					if instance.SessionCtxID == "" {
+						continue
+					}
+					routingKey := sessionContextRoutingKey(pool.funcKey, instance.SessionCtxID)
+					if ls.ownerProxy != nil {
+						if _, owned := ls.ownerProxy.CheckHashOwner(routingKey); owned {
+							continue
+						}
+					}
+					instance.IdleSince = time.Time{}
+					instance.Reclaiming = false
+				}
+				pool.Unlock()
+			}
 		}
 	}
 }
@@ -192,7 +212,13 @@ func (ls *LiteScheduler) handleInstanceUpdate(pool *LiteFunctionPool, ins *types
 	defer pool.Unlock()
 	switch mapStatus(ins.InstanceStatus.Code) {
 	case InstanceStatusRunning, InstanceStatusSubHealth:
-		pool.instances[ins.InstanceID] = buildLiteInstanceFromInstance(ins)
+		next := buildLiteInstanceFromInstance(ins)
+		if current := pool.instances[ins.InstanceID]; current != nil {
+			next.InUse = current.InUse
+			next.IdleSince = current.IdleSince
+			next.Reclaiming = current.Reclaiming
+		}
+		pool.instances[ins.InstanceID] = next
 		logger.Debugf("lite instance upserted: status %d, capacity %d", ins.InstanceStatus.Code, ins.ConcurrentNum)
 	case InstanceStatusUnavailable:
 		ls.removeInstanceLocked(pool, ins.InstanceID)

@@ -130,12 +130,18 @@ func (ls *LiteScheduler) reapExpiredAllocation(allocID string) {
 		if slot := pool.instances[alloc.InstanceID]; slot != nil && slot.InUse > 0 {
 			slot.InUse--
 		}
-		// Decrement session's activeAllocs; if zero, start the idle-unbind timer.
-		needTimer, _ := pool.unbindSessionOnRelease(alloc.SessionID)
+		// Decrement InstanceSession's activeAllocs; pure SessionContext requests
+		// have no sticky binding.
+		bindingKey := ""
+		needTimer := false
+		if alloc.SessionID != "" {
+			bindingKey = sessionBindingKey(alloc.SessionID, alloc.SessionCtxID)
+			needTimer, _ = pool.unbindSessionOnRelease(bindingKey)
+		}
 		sessionTTL := alloc.SessionTTL
 		pool.Unlock()
 		if needTimer {
-			ls.startSessionUnbindTimer(pool, alloc.SessionID, sessionTTL)
+			ls.startSessionUnbindTimer(pool, bindingKey, sessionTTL)
 		}
 		logger.Infof("lite expiry reaped: instance %s, funcKey %s, InUse decremented",
 			alloc.InstanceID, alloc.FuncKey)

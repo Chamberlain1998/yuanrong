@@ -102,7 +102,7 @@ func (oi *OnDemandInstanceQueue) CreateInstance(insCrtReq *types.InstanceCreateR
 	oi.RUnlock()
 	instance, createErr = oi.createInstanceFunc(
 		insCrtReq.TraceID, insCrtReq.InstanceName, oi.instanceType, oi.resKey, insCrtReq.CreateEvent,
-		insCrtReq.TraceParent, nil)
+		insCrtReq.TraceParent, insCrtReq.SessionCtxID)
 	if createErr != nil {
 		log.GetLogger().Errorf("failed to create instance for function %s error %s", oi.funcKeyWithRes,
 			createErr.Error())

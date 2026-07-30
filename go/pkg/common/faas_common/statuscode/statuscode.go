@@ -29,6 +29,8 @@ import (
 
 // system error code
 const (
+	// SessionCtxDeletingErrCode indicates that the target SessionContext is being deleted.
+	SessionCtxDeletingErrCode = 150480
 	// InnerResponseSuccessCode -
 	InnerResponseSuccessCode = 0
 	// InternalErrorCode if the value is 331404, try again.

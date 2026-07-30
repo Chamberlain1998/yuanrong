@@ -35,7 +35,8 @@ const liteAllocPrefix = "lite"
 type Allocation struct {
 	AllocationID string
 	SessionID    string // full sessionID (allocationID only stores hash)
-	SessionTTL   int    // seconds; 0 means default; used for idle-unbind timer
+	SessionCtxID string
+	SessionTTL   int // seconds; 0 means default; used for idle-unbind timer
 	TenantID     string
 	InstanceID   string
 	FuncKey      string
@@ -49,6 +50,13 @@ type Allocation struct {
 func sessionHash(sessionID string) string {
 	h := sha256.Sum256([]byte(sessionID))
 	return hex.EncodeToString(h[:])[:16]
+}
+
+func allocationSessionID(sessionID, sessionCtxID string) string {
+	if sessionID != "" {
+		return sessionID
+	}
+	return sessionCtxID
 }
 
 // genAllocationID produces: lite:{sessionHash}:{instanceID}:thread:{seq}

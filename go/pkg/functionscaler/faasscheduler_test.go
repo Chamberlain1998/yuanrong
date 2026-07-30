@@ -49,11 +49,26 @@ import (
 	"yuanrong.org/kernel/pkg/functionscaler/litescheduler"
 	"yuanrong.org/kernel/pkg/functionscaler/registry"
 	"yuanrong.org/kernel/pkg/functionscaler/selfregister"
+	"yuanrong.org/kernel/pkg/functionscaler/sessioncontextregistry"
 	"yuanrong.org/kernel/pkg/functionscaler/state"
 	"yuanrong.org/kernel/pkg/functionscaler/types"
 )
 
 type fakeLease struct{}
+
+type fakeSessionContextRegistrar struct {
+	err     error
+	request sessioncontextregistry.Request
+	traceID string
+}
+
+func (f *fakeSessionContextRegistrar) Register(
+	request sessioncontextregistry.Request, traceID string,
+) error {
+	f.request = request
+	f.traceID = traceID
+	return f.err
+}
 
 func (l *fakeLease) Extend() error {
 	return nil
@@ -1540,6 +1555,35 @@ func TestFaaSScheduler_handleQuerySession(t *testing.T) {
 		convey.So(resp, convey.ShouldNotBeNil)
 		convey.So(resp.ErrorCode, convey.ShouldEqual, statuscode.SessionNotFoundErrCode)
 	})
+}
+
+func TestRegisterSessionContextPropagatesFailureAndTraceID(t *testing.T) {
+	registrar := &fakeSessionContextRegistrar{err: errors.New("registry unavailable")}
+	funcSpec := &types.FunctionSpecification{
+		FuncKey: "tenant/0@service@agent/latest",
+		ExtendedMetaData: commonTypes.ExtendedMetaData{
+			EnableSessionCtx: true,
+		},
+	}
+
+	err := registerSessionContext(registrar, funcSpec, "session-1", "acquire-trace")
+
+	assert.Error(t, err)
+	assert.Equal(t, statuscode.StatusInternalServerError, err.Code())
+	assert.Equal(t, "tenant", registrar.request.TenantID)
+	assert.Equal(t, "0@service@agent", registrar.request.RegisteredName)
+	assert.Equal(t, "latest", registrar.request.FunctionVersion)
+	assert.Equal(t, "session-1", registrar.request.SessionContextID)
+	assert.Equal(t, "acquire-trace", registrar.traceID)
+}
+
+func TestRegisterSessionContextSkipsFunctionsWithoutSessionContext(t *testing.T) {
+	registrar := &fakeSessionContextRegistrar{err: errors.New("must not be called")}
+
+	err := registerSessionContext(registrar, &types.FunctionSpecification{}, "", "trace")
+
+	assert.NoError(t, err)
+	assert.Empty(t, registrar.traceID)
 }
 
 func TestGetResourceSpecification(t *testing.T) {

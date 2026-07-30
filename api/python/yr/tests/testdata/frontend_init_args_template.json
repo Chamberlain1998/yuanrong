@@ -1,0 +1,47 @@
+{
+  "iamConfig": {
+    "addr": "{iam_server_address}",
+    "enableFuncTokenAuth": {enable_func_token_auth}
+  },
+  "externalAuthConfig": {
+    "url": "{auth_public_url}",
+    "internalUrl": "{auth_internal_url}",
+    "realm": "{auth_realm}",
+    "clientId": "{auth_client_id}",
+    "clientSecret": "{auth_client_secret}",
+    "enabled": {auth_enabled}
+  },
+  "metaServiceAddress": "{meta_service_address}",
+  "functionInvokeBackend": {function_invoke_backend},
+  "componentMTLSEnable": {sslEnable},
+  "sandboxRouter": {
+    "enabled": {sandboxRouterEnable},
+    "listenPort": {sandboxRouterListenPort},
+    "enableJWTAuth": {sandboxRouterEnableJwt},
+    "validateIAM": {sandboxRouterValidateIam},
+    "rrtPort": {sandboxRouterRrtPort}
+  },
+  "http": {
+    "serverListenIP": "{faas_frontend_http_ip}",
+    "serverListenPort": {faas_frontend_http_port}
+  },
+  "leaseBypass": {frontend_lease_bypass},
+  "httpsConfig": {
+    "httpsEnable": {frontendSslEnable},
+    "sslBasePath": "{sslBasePath}",
+    "clientAuthType": "RequireAndVerifyClientCert"
+  },
+  "routerEtcd": {
+    "servers": ["{etcdAddr}"],
+    "sslEnable": {sslEnable},
+    "authType": "{etcdAuthType}",
+    "cafile": "{etcdCAFile}",
+    "certfile": "{etcdCertFile}",
+    "keyfile": "{etcdKeyFile}",
+    "azPrefix": "{azPrefix}"
+  },
+  "sccConfig": {
+    "enable": {sccEnable},
+    "configPath": "{sccBasePath}"
+  }
+}

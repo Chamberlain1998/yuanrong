@@ -43,6 +43,8 @@ import (
 	"yuanrong.org/kernel/pkg/functionscaler/config"
 	"yuanrong.org/kernel/pkg/functionscaler/litescheduler"
 	"yuanrong.org/kernel/pkg/functionscaler/selfregister"
+	"yuanrong.org/kernel/pkg/functionscaler/sessioncontextmanager"
+	"yuanrong.org/kernel/pkg/functionscaler/types"
 )
 
 var isShutDown atomic.Bool = atomic.Bool{}
@@ -53,6 +55,9 @@ const (
 	defaultServerTimeout      = 900 * time.Second
 	invokePath                = "/invoke"
 	scaleHintPath             = "/scalehint"
+	sessionContextIdlePath    = "/sessioncontext/idle"
+	sessionContextForkPath    = "/sessioncontext/fork"
+	sessionContextDeletePath  = "/sessioncontext/delete"
 )
 
 // SetShutDownStatus -
@@ -148,11 +153,116 @@ func route(ctx *fasthttp.RequestCtx) {
 		invokeHandler(ctx)
 	case scaleHintPath:
 		scaleHintHandler(ctx)
+	case sessionContextIdlePath:
+		sessionContextIdleHandler(ctx)
+	case sessionContextForkPath:
+		sessionContextForkHandler(ctx)
+	case sessionContextDeletePath:
+		sessionContextDeleteHandler(ctx)
 	default:
 		ctx.SetStatusCode(http.StatusInternalServerError)
 		log.GetLogger().Errorf("unsupported http request path %s", path)
 	}
 	return
+}
+
+func sessionContextIdleHandler(ctx *fasthttp.RequestCtx) {
+	var report types.IdleReport
+	if err := json.Unmarshal(ctx.Request.Body(), &report); err != nil {
+		writeSessionContextManagerError(ctx, http.StatusBadRequest, "INVALID_REQUEST", err.Error())
+		return
+	}
+	fs := functionscaler.GetGlobalScheduler()
+	if fs == nil || fs.SessionContextManager == nil {
+		writeSessionContextManagerError(ctx, http.StatusServiceUnavailable, "MANAGER_UNAVAILABLE",
+			"SessionContext manager is unavailable")
+		return
+	}
+	for _, item := range report.Instances {
+		ownerID, owned := selfregister.GlobalSchedulerProxy.CheckFuncOwner(item.FuncKey)
+		if !owned {
+			writeSessionContextManagerError(ctx, http.StatusConflict, "NOT_FUNCTION_OWNER", ownerID)
+			return
+		}
+	}
+	if err := fs.SessionContextManager.HandleIdle(report); err != nil {
+		writeSessionContextManagerError(ctx, http.StatusInternalServerError, "IDLE_REPORT_FAILED", err.Error())
+		return
+	}
+	ctx.SetStatusCode(http.StatusNoContent)
+}
+
+func sessionContextForkHandler(ctx *fasthttp.RequestCtx) {
+	var request sessioncontextmanager.ForkRequest
+	if err := json.Unmarshal(ctx.Request.Body(), &request); err != nil {
+		writeSessionContextManagerError(ctx, http.StatusBadRequest, "INVALID_REQUEST", err.Error())
+		return
+	}
+	if ownerID, owned := selfregister.GlobalSchedulerProxy.CheckFuncOwner(request.FuncKey); !owned {
+		writeSessionContextManagerError(ctx, http.StatusConflict, "NOT_FUNCTION_OWNER", ownerID)
+		return
+	}
+	fs := functionscaler.GetGlobalScheduler()
+	if fs == nil || fs.SessionContextManager == nil {
+		writeSessionContextManagerError(ctx, http.StatusServiceUnavailable, "MANAGER_UNAVAILABLE",
+			"SessionContext manager is unavailable")
+		return
+	}
+	response, err := fs.SessionContextManager.Fork(request)
+	if err != nil {
+		writeManagerOperationError(ctx, err)
+		return
+	}
+	body, _ := json.Marshal(response)
+	ctx.SetStatusCode(http.StatusCreated)
+	ctx.Response.SetBody(body)
+}
+
+func sessionContextDeleteHandler(ctx *fasthttp.RequestCtx) {
+	var request sessioncontextmanager.DeleteRequest
+	if err := json.Unmarshal(ctx.Request.Body(), &request); err != nil {
+		writeSessionContextManagerError(ctx, http.StatusBadRequest, "INVALID_REQUEST", err.Error())
+		return
+	}
+	if ownerID, owned := selfregister.GlobalSchedulerProxy.CheckFuncOwner(request.FuncKey); !owned {
+		writeSessionContextManagerError(ctx, http.StatusConflict, "NOT_FUNCTION_OWNER", ownerID)
+		return
+	}
+	fs := functionscaler.GetGlobalScheduler()
+	if fs == nil || fs.SessionContextManager == nil {
+		writeSessionContextManagerError(ctx, http.StatusServiceUnavailable, "MANAGER_UNAVAILABLE",
+			"SessionContext manager is unavailable")
+		return
+	}
+	if err := fs.SessionContextManager.Delete(request); err != nil {
+		writeManagerOperationError(ctx, err)
+		return
+	}
+	ctx.SetStatusCode(http.StatusNoContent)
+}
+
+func writeManagerOperationError(ctx *fasthttp.RequestCtx, err error) {
+	var managerErr *sessioncontextmanager.Error
+	if errors.As(err, &managerErr) {
+		status := http.StatusConflict
+		switch managerErr.Code {
+		case "FUNCTION_NOT_FOUND", "TURN_NOT_FOUND":
+			status = http.StatusNotFound
+		case "TURN_NOT_COMPLETED", "INVALID_SESSION_CONTEXT":
+			status = http.StatusBadRequest
+		case "INSTANCE_STOP_TIMEOUT":
+			status = http.StatusServiceUnavailable
+		}
+		writeSessionContextManagerError(ctx, status, managerErr.Code, managerErr.Message)
+		return
+	}
+	writeSessionContextManagerError(ctx, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error())
+}
+
+func writeSessionContextManagerError(ctx *fasthttp.RequestCtx, status int, code, message string) {
+	body, _ := json.Marshal(sessioncontextmanager.Error{Code: code, Message: message})
+	ctx.SetStatusCode(status)
+	ctx.Response.SetBody(body)
 }
 
 func auth(ctx *fasthttp.RequestCtx) error {

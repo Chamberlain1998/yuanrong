@@ -323,11 +323,11 @@ func parseDsKey(key string) (string, string, error) {
 }
 
 // get timestamp and status form dataSystem value
-// dataSystem value format: 1748573798753243935;ready
+// dataSystem value format: 1748573798753243935;ready[;hostId[;compatibilityVersion]]
 func parseDsValue(value string) (string, string, error) {
 	splits := strings.Split(value, ";")
-	if len(splits) != 2 { // magic number
-		return "", "", errors.New("invalid format of dataSystem key")
+	if len(splits) < 2 { // magic number
+		return "", "", errors.New("invalid format of dataSystem value")
 	}
 	timeStamp, status := splits[0], splits[1] // magic number
 	return timeStamp, status, nil

@@ -344,7 +344,7 @@ func TestHandleFuncSpecUpdate(t *testing.T) {
 		},
 		ExtendedMetaData: commontypes.ExtendedMetaData{EnableSessionCtx: true},
 	})
-	assert.Equal(t, false, instanceScaler.enable)
+	assert.Equal(t, true, instanceScaler.enable)
 	close(stop)
 }
 

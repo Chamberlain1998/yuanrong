@@ -19,6 +19,7 @@ package functionscaler
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	_ "net/http/pprof"
@@ -52,6 +53,8 @@ import (
 	"yuanrong.org/kernel/pkg/functionscaler/metrics"
 	"yuanrong.org/kernel/pkg/functionscaler/registry"
 	"yuanrong.org/kernel/pkg/functionscaler/selfregister"
+	"yuanrong.org/kernel/pkg/functionscaler/sessioncontextmanager"
+	"yuanrong.org/kernel/pkg/functionscaler/sessioncontextregistry"
 	"yuanrong.org/kernel/pkg/functionscaler/types"
 	"yuanrong.org/kernel/pkg/functionscaler/utils"
 )
@@ -98,7 +101,12 @@ var (
 	getAndDeleteStateFunc     = (*instancepool.PoolManager).GetAndDeleteState
 	releaseStateThreadFunc    = (*instancepool.PoolManager).ReleaseStateThread
 	retainStateThreadFunc     = (*instancepool.PoolManager).RetainStateThread
+	sessionContextRegistry    = sessioncontextregistry.NewManager()
 )
+
+type sessionContextRegistrar interface {
+	Register(req sessioncontextregistry.Request, traceID string) error
+}
 
 // InstanceOperation defines instance operations
 type InstanceOperation string
@@ -108,14 +116,15 @@ type StateOperation string
 
 // FaaSScheduler manages instances for faas functions
 type FaaSScheduler struct {
-	PoolManager     *instancepool.PoolManager
-	liteScheduler   *litescheduler.LiteScheduler
-	funcSpecCh      chan registry.SubEvent
-	insSpecCh       chan registry.SubEvent
-	insConfigCh     chan registry.SubEvent
-	aliasSpecCh     chan registry.SubEvent
-	schedulerCh     chan registry.SubEvent
-	rolloutConfigCh chan registry.SubEvent
+	PoolManager           *instancepool.PoolManager
+	SessionContextManager *sessioncontextmanager.Manager
+	liteScheduler         *litescheduler.LiteScheduler
+	funcSpecCh            chan registry.SubEvent
+	insSpecCh             chan registry.SubEvent
+	insConfigCh           chan registry.SubEvent
+	aliasSpecCh           chan registry.SubEvent
+	schedulerCh           chan registry.SubEvent
+	rolloutConfigCh       chan registry.SubEvent
 
 	leaseInterval time.Duration
 
@@ -150,6 +159,8 @@ func NewFaaSScheduler(stopCh <-chan struct{}) *FaaSScheduler {
 		rolloutConfigCh: make(chan registry.SubEvent, defaultChanSize),
 		leaseInterval:   leaseInterval,
 	}
+	faasScheduler.SessionContextManager = sessioncontextmanager.New(
+		faasScheduler.PoolManager, nil, sessionContextRegistry, registry.GlobalRegistry.GetFuncSpec)
 	// LiteScheduler branch (session-based). Only active when config enables it.
 	if config.GlobalConfig.LiteScheduler.Enable {
 		faasScheduler.liteScheduler = litescheduler.New(
@@ -508,6 +519,13 @@ func (fs *FaaSScheduler) handleInstanceAcquireWithTraceParent(targetName string,
 		logger.Errorf("failed get resSpec error %v", err)
 		return generateInstanceResponse(nil, err, startTime)
 	}
+	if registerErr := registerSessionContext(
+		sessionContextRegistry, funcSpec, dataInfo.sessionCtxID, traceID,
+	); registerErr != nil {
+		logger.Errorf("failed to register session context for function %s: %v",
+			funcSpec.FuncKey, registerErr)
+		return generateInstanceResponse(nil, registerErr, startTime)
+	}
 	logger.Infof("handling instance acquire for resSpec %v instanceID %s instanceSession %v sessionCtxID %s traceID %s", resSpec,
 		dataInfo.designateInstanceID, dataInfo.instanceSession, dataInfo.sessionCtxID, traceID)
 	poolLabel := getPoolLabel(dataInfo.poolLabel, funcSpec.InstanceMetaData.PoolLabel)
@@ -536,6 +554,35 @@ func (fs *FaaSScheduler) handleInstanceAcquireWithTraceParent(targetName string,
 	logger.Infof("succeed to acquire instance %s of function %s traceID %s", insAlloc.AllocationID, funcSpec.FuncKey,
 		traceID)
 	return generateInstanceResponse(insAlloc, nil, startTime)
+}
+
+func splitFunctionKey(funcKey string) (string, string, string, bool) {
+	parts := strings.Split(funcKey, utils.FuncKeyDelimiter)
+	if len(parts) != utils.ValidFuncKeyLen || parts[0] == "" || parts[1] == "" || parts[2] == "" {
+		return "", "", "", false
+	}
+	return parts[0], parts[1], parts[2], true
+}
+
+func registerSessionContext(registrar sessionContextRegistrar, funcSpec *types.FunctionSpecification,
+	sessionContextID, traceID string,
+) snerror.SNError {
+	if sessionContextID == "" || !funcSpec.ExtendedMetaData.EnableSessionCtx {
+		return nil
+	}
+	tenantID, registeredName, version, ok := splitFunctionKey(funcSpec.FuncKey)
+	if !ok {
+		return snerror.New(statuscode.StatusInternalServerError,
+			"failed to register session context: invalid function key")
+	}
+	err := registrar.Register(sessioncontextregistry.Request{
+		TenantID: tenantID, RegisteredName: registeredName, FunctionVersion: version,
+		SessionContextID: sessionContextID,
+	}, traceID)
+	if err != nil {
+		return snerror.NewWithError(statuscode.StatusInternalServerError, err)
+	}
+	return nil
 }
 
 func (fs *FaaSScheduler) handleQuerySession(targetName string, extraData []byte,
@@ -615,6 +662,29 @@ func (fs *FaaSScheduler) HandleScaleHint(hint *litescheduler.ScaleHint, traceID 
 	if getFuncSpecFunc(registry.GlobalRegistry, hint.FuncKey) == nil {
 		logger.Errorf("scaleHint function %s doesn't exist", hint.FuncKey)
 		return false, statuscode.FuncMetaNotFoundErrCode, ""
+	}
+	if hint.SessionCtxID != "" {
+		if fs.SessionContextManager == nil {
+			return false, statuscode.StatusInternalServerError, "SessionContext manager is unavailable"
+		}
+		if err := fs.SessionContextManager.HandleScaleHint(hint, traceID); err != nil {
+			var managerErr *sessioncontextmanager.Error
+			if errors.As(err, &managerErr) {
+				switch managerErr.Code {
+				case "SESSION_CTX_DELETING":
+					return false, statuscode.SessionCtxDeletingErrCode, managerErr.Code
+				case "FUNCTION_NOT_FOUND":
+					return false, statuscode.FuncMetaNotFoundErrCode, managerErr.Code
+				case "INVALID_SESSION_CONTEXT":
+					return false, statuscode.InstanceSessionInvalidErrCode, managerErr.Code
+				}
+			}
+			if snErr, ok := err.(snerror.SNError); ok {
+				return false, snErr.Code(), snErr.Error()
+			}
+			return false, statuscode.StatusInternalServerError, err.Error()
+		}
+		return true, 0, ""
 	}
 	if err := fs.PoolManager.TriggerScale(hint.FuncKey, hint.RequestedConcurrency); err != nil {
 		logger.Errorf("failed to trigger scale for function %s, error %s", hint.FuncKey, err.Error())

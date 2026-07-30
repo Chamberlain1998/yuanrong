@@ -521,6 +521,7 @@ type InstanceCreateRequest struct {
 	TraceID      string
 	TraceParent  string
 	CreateEvent  []byte
+	SessionCtxID *string
 }
 
 // InstanceDeleteRequest contains specifications for deleting an instance

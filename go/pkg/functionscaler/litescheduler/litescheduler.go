@@ -49,7 +49,7 @@ const liteExpiryScanSlots = 100
 // (stream hints over gRPC) to a remote scaler service. Swapping implementations
 // requires no changes to operation.go or callers of handleColdStart.
 type ScaleHintSender interface {
-	Send(hint *ScaleHint)
+	Send(hint *ScaleHint) (*ScaleHintResponse, error)
 }
 
 // LiteScheduler is the session-based lightweight scheduling branch.
@@ -66,6 +66,8 @@ type LiteScheduler struct {
 	funcSpecCh      chan registry.SubEvent
 	insSpecCh       chan registry.SubEvent
 	schedulerCh     chan registry.SubEvent
+	idleOnce        sync.Once
+	idleHTTP        *idleReporter
 	// expiryWheel is the time wheel that drives automatic lease expiry. Each
 	// allocation is registered as a task; when the wheel fires, the expiry
 	// callback reaps the allocation and decrements InUse. retain calls
@@ -204,7 +206,11 @@ func (ls *LiteScheduler) Process(req *LiteRequest, traceID, traceParent string,
 	}
 	// owner check (acquire only; release/retain skip per spec)
 	if req.Op == "acquire" && ls.ownerProxy != nil {
-		ownerID, owned := ls.ownerProxy.CheckHashOwner(req.TenantID + "/" + req.SessionID)
+		routingID := req.SessionID
+		if req.SessionCtxID != "" {
+			routingID = req.FuncKey + "/" + req.SessionCtxID
+		}
+		ownerID, owned := ls.ownerProxy.CheckHashOwner(req.TenantID + "/" + routingID)
 		if !owned {
 			logger.Warnf("lite Process not owner of session (owner=%s), should reroute", ownerID)
 			data, _ := json.Marshal(liteErrResp(statuscode.AcquireNonOwnerSchedulerErrorCode,
@@ -254,6 +260,7 @@ func (ls *LiteScheduler) reverseLookup(req *LiteRequest) *lookupErr {
 			return &lookupErr{code: statuscode.LeaseIDNotFoundCode, msg: statuscode.LeaseIDNotFoundMsg}
 		}
 		req.SessionID = alloc.SessionID
+		req.SessionCtxID = alloc.SessionCtxID
 		req.SessionTTL = alloc.SessionTTL
 		req.TenantID = alloc.TenantID
 		req.FuncKey = alloc.FuncKey

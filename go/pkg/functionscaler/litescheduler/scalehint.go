@@ -20,6 +20,7 @@ package litescheduler
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"sync"
@@ -31,10 +32,10 @@ import (
 	"yuanrong.org/kernel/pkg/common/faas_common/localauth"
 	"yuanrong.org/kernel/pkg/common/faas_common/logger/log"
 	"yuanrong.org/kernel/pkg/common/faas_common/statuscode"
-	commonTls "yuanrong.org/kernel/pkg/common/faas_common/tls"
 	commonTypes "yuanrong.org/kernel/pkg/common/faas_common/types"
 	"yuanrong.org/kernel/pkg/functionscaler/config"
 	"yuanrong.org/kernel/pkg/functionscaler/selfregister"
+	scalerTypes "yuanrong.org/kernel/pkg/functionscaler/types"
 	"yuanrong.org/kernel/pkg/functionscaler/utils"
 	"yuanrong.org/kernel/runtime/libruntime/api"
 )
@@ -42,16 +43,17 @@ import (
 // ScaleHint is an idempotent capacity demand hint from LiteScheduler to Scaler.
 // Scaler dedups by FuncKey and does not create N instances for N hints.
 type ScaleHint struct {
-	FuncKey                 string
-	TenantID                string
-	SessionID               string
-	Reason                  string // cold_start, no_capacity, high_concurrency
-	RequestedConcurrency    int
-	CurrentLocalConcurrency int
-	CurrentLocalCapacity    int
-	SchedulerID             string
-	TraceID                 string
-	RequestID               string
+	FuncKey                 string `json:"funcKey"`
+	TenantID                string `json:"tenantId"`
+	SessionID               string `json:"sessionId,omitempty"`
+	SessionCtxID            string `json:"sessionCtxId,omitempty"`
+	Reason                  string `json:"reason"` // cold_start, no_capacity, high_concurrency
+	RequestedConcurrency    int    `json:"requestedConcurrency"`
+	CurrentLocalConcurrency int    `json:"currentLocalConcurrency"`
+	CurrentLocalCapacity    int    `json:"currentLocalCapacity"`
+	SchedulerID             string `json:"schedulerId"`
+	TraceID                 string `json:"traceId"`
+	RequestID               string `json:"requestId"`
 }
 
 // noopSender is a placeholder ScaleHintSender that logs hints but does not dispatch
@@ -74,13 +76,14 @@ func NewNoopSender() ScaleHintSender {
 	return &noopSender{}
 }
 
-func (n *noopSender) Send(hint *ScaleHint) {
+func (n *noopSender) Send(hint *ScaleHint) (*ScaleHintResponse, error) {
 	if hint == nil {
-		return
+		return nil, nil
 	}
 	log.GetLogger().With(zap.String("funcKey", hint.FuncKey),
 		zap.String("sessionID", hint.SessionID), zap.String("traceID", hint.TraceID)).
 		Debug("lite scaleHint noop (no scaler backend configured)")
+	return nil, nil
 }
 
 const (
@@ -128,12 +131,7 @@ type dedupToken struct {
 // cold-start wait window a function emits at most one hint, no matter how many
 // concurrent acquires cold-start on it.
 func NewHTTPSender(proxy *selfregister.SchedulerProxy) ScaleHintSender {
-	scheme := "http"
-	transport := &http.Transport{}
-	if config.GlobalConfig.HTTPSConfig != nil && config.GlobalConfig.HTTPSConfig.HTTPSEnable {
-		scheme = "https"
-		transport.TLSClientConfig = commonTls.GetClientTLSConfig()
-	}
+	scheme, client := newHTTPClient(scaleHintHTTPTimeout)
 	dedupTTL := time.Duration(config.GlobalConfig.LiteScheduler.AcquireWaitTimeoutMs) * time.Millisecond
 	if dedupTTL <= 0 {
 		dedupTTL = time.Second
@@ -142,7 +140,7 @@ func NewHTTPSender(proxy *selfregister.SchedulerProxy) ScaleHintSender {
 		scheme, dedupTTL.Milliseconds(), scaleHintMaxRetries)
 	return &httpSender{
 		proxy:      proxy,
-		client:     &http.Client{Timeout: scaleHintHTTPTimeout, Transport: transport},
+		client:     client,
 		dedup:      utils.NewTimeoutMap(time.Minute),
 		dedupTTL:   dedupTTL,
 		maxRetries: scaleHintMaxRetries,
@@ -154,38 +152,44 @@ func NewHTTPSender(proxy *selfregister.SchedulerProxy) ScaleHintSender {
 // synchronous but time-bounded (client timeout 1s): it runs in handleColdStart
 // before waitForInstance and must not block the acquire for long. Failed
 // dispatches release their dedup claim so a later cold-start can retry.
-func (s *httpSender) Send(hint *ScaleHint) {
+func (s *httpSender) Send(hint *ScaleHint) (*ScaleHintResponse, error) {
 	if hint == nil {
 		log.GetLogger().Warnf("receive nil scaleHint, skip send")
-		return
+		return nil, nil
 	}
 	logger := log.GetLogger().With(zap.String("funcKey", hint.FuncKey),
 		zap.String("sessionID", hint.SessionID), zap.String("traceID", hint.TraceID))
-	token, reserved := s.reserveDedup(hint.FuncKey)
+	dedupKey := hint.FuncKey
+	if hint.SessionCtxID != "" {
+		dedupKey = scalerTypes.JoinKey(hint.FuncKey, hint.SessionCtxID)
+	}
+	token, reserved := s.reserveDedup(dedupKey)
 	if !reserved {
 		logger.Debug("scaleHint deduped within window, skip")
-		return
+		return nil, nil
 	}
 	accepted := false
 	defer func() {
-		s.finishDedup(hint.FuncKey, token, accepted)
+		s.finishDedup(dedupKey, token, accepted)
 	}()
 	hint.SchedulerID = selfregister.GetSchedulerProxyName()
 	body, err := json.Marshal(hint)
 	if err != nil {
 		logger.Warnf("marshal scaleHint failed: %s", err.Error())
-		return
+		return nil, err
 	}
 	owner, _ := s.proxy.FindHashOwner(hint.FuncKey)
 	if owner == nil {
 		logger.Warn("hash ring not ready, drop scaleHint (best-effort)")
-		return
+		return nil, fmt.Errorf("scaleHint owner not found")
 	}
 	if owner.Address == "" {
 		logger.Warnf("owner %s has no registered address, drop scaleHint", owner.InstanceName)
-		return
+		return nil, fmt.Errorf("scaleHint owner address is empty")
 	}
-	accepted = s.sendWithRetry(owner, hint.TraceID, body, logger)
+	response, err := s.sendWithRetry(owner, hint.TraceID, body, logger)
+	accepted = err == nil && (response == nil || response.ErrorCode == 0)
+	return response, err
 }
 
 // reserveDedup atomically claims a funcKey. The temporary TTL covers both the
@@ -232,27 +236,34 @@ func (s *httpSender) finishDedup(funcKey string, token *dedupToken, accepted boo
 // maxRetries. Any other failure drops the hint.
 func (s *httpSender) sendWithRetry(owner *commonTypes.InstanceInfo, traceID string, body []byte,
 	logger api.FormatLogger,
-) bool {
+) (*ScaleHintResponse, error) {
 	for attempt := 0; ; attempt++ {
 		statusCode, respBody, err := s.post(owner.Address, traceID, body)
 		if err == nil && statusCode == http.StatusAccepted {
 			logger.Infof("scaleHint accepted by owner %s (%s)", owner.InstanceName, owner.Address)
-			return true
+			return &ScaleHintResponse{}, nil
 		}
 		newOwnerID := parseNonOwnerRedirect(statusCode, respBody)
 		if newOwnerID == "" {
 			logger.Warnf("scaleHint to %s failed (status %d, err %v), resp %s, drop",
 				owner.Address, statusCode, err, string(respBody))
-			return false
+			var response ScaleHintResponse
+			if len(respBody) != 0 && json.Unmarshal(respBody, &response) == nil {
+				return &response, nil
+			}
+			if err != nil {
+				return nil, err
+			}
+			return nil, fmt.Errorf("scaleHint failed with HTTP status %d", statusCode)
 		}
 		if attempt >= s.maxRetries {
 			logger.Warnf("scaleHint reroute retries exhausted (%d), drop", s.maxRetries)
-			return false
+			return nil, fmt.Errorf("scaleHint reroute retries exhausted")
 		}
 		next := s.proxy.FindByInstanceID(newOwnerID)
 		if next == nil || next.Address == "" {
 			logger.Warnf("redirected owner %s not found in ring, drop scaleHint", newOwnerID)
-			return false
+			return nil, fmt.Errorf("redirected scaleHint owner unavailable")
 		}
 		logger.Infof("scaleHint rerouted to new owner %s (%s)", next.InstanceName, next.Address)
 		owner = next
