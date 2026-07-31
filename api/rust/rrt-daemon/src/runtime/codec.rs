@@ -73,15 +73,11 @@ pub fn yr_serialize_value(v: &Value) -> Vec<u8> {
 
 /// Extract kwargs from a CallRequest arg list.
 ///
-/// Runtime calls normally prepend protobuf MetaData at args[0], so akernel
-/// method kwargs are encoded as alternating key/value entries in args[1:].
-/// Some frontend/libruntime paths can pass only the user args, or a single map
-/// value. Accept all three shapes so the HTTP sandbox v1 envelope can dispatch
-/// to the same RRT primitives without depending on one exact transport wrapper.
+/// The sandbox/RRT wire contract carries either one map value or alternating
+/// key/value entries starting at args[0]. Transport metadata is not part of the
+/// application argument list.
 pub fn parse_kwargs(args: &[Arg]) -> BTreeMap<String, Value> {
-    parse_kwargs_from(args, 1)
-        .or_else(|| parse_kwargs_from(args, 0))
-        .unwrap_or_default()
+    parse_kwargs_from(args, 0).unwrap_or_default()
 }
 
 fn parse_kwargs_from(args: &[Arg], start: usize) -> Option<BTreeMap<String, Value>> {
@@ -130,4 +126,33 @@ pub fn map_value(pairs: Vec<(&str, Value)>) -> Value {
             .map(|(k, v)| (Value::from(k), v))
             .collect(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_single_sandbox_envelope_from_arg_zero() {
+        let envelope = map_value(vec![
+            ("sandbox_method", Value::from("sandbox_invoke")),
+            ("action", Value::from("process.exec")),
+            (
+                "args",
+                map_value(vec![("cmd", Value::from("printf envelope"))]),
+            ),
+        ]);
+        let args = vec![Arg {
+            value: yr_serialize_value(&envelope),
+            ..Default::default()
+        }];
+
+        let parsed = parse_kwargs(&args);
+
+        assert_eq!(
+            kw_str(&parsed, "sandbox_method").as_deref(),
+            Some("sandbox_invoke")
+        );
+        assert_eq!(kw_str(&parsed, "action").as_deref(), Some("process.exec"));
+    }
 }

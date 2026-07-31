@@ -15,70 +15,19 @@
 //!
 //! No new dependencies: use raw tokio TcpListener plus handwritten HTTP/1.1 with connection-level close.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::process::Command;
 
 const IO_BUFFER_SIZE: usize = 256 * 1024;
-const REQUEST_DEDUP_TTL: Duration = Duration::from_secs(30 * 60);
-
-#[derive(Clone)]
 struct CachedResponse {
     status: u16,
     body: String,
-}
-
-struct DedupSlot {
-    created: Instant,
-    response: Mutex<Option<CachedResponse>>,
-    ready: Condvar,
-}
-
-fn dedup_cache() -> &'static Mutex<HashMap<String, Arc<DedupSlot>>> {
-    static C: OnceLock<Mutex<HashMap<String, Arc<DedupSlot>>>> = OnceLock::new();
-    C.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn cleanup_dedup_cache() {
-    let now = Instant::now();
-    let mut cache = dedup_cache().lock().unwrap();
-    cache.retain(|_, slot| now.duration_since(slot.created) <= REQUEST_DEDUP_TTL);
-}
-
-fn reserve_request_id(request_id: &str) -> (Arc<DedupSlot>, bool) {
-    cleanup_dedup_cache();
-    let mut cache = dedup_cache().lock().unwrap();
-    if let Some(slot) = cache.get(request_id) {
-        return (slot.clone(), false);
-    }
-    let slot = Arc::new(DedupSlot {
-        created: Instant::now(),
-        response: Mutex::new(None),
-        ready: Condvar::new(),
-    });
-    cache.insert(request_id.to_string(), slot.clone());
-    (slot, true)
-}
-
-fn wait_dedup_response(slot: Arc<DedupSlot>) -> CachedResponse {
-    let mut guard = slot.response.lock().unwrap();
-    loop {
-        if let Some(resp) = guard.clone() {
-            return resp;
-        }
-        guard = slot.ready.wait(guard).unwrap();
-    }
-}
-
-fn complete_dedup_response(slot: &Arc<DedupSlot>, resp: CachedResponse) {
-    *slot.response.lock().unwrap() = Some(resp);
-    slot.ready.notify_all();
 }
 
 #[derive(Clone, Copy)]
@@ -279,62 +228,32 @@ async fn handle_conn(
     let kw = json_args_to_kwargs(parsed.get("args"));
     let request_id = request_id_from(&head, &parsed);
 
-    let resp = if let Some(request_id) = request_id {
-        let (slot, owner) = reserve_request_id(&request_id);
-        if owner {
-            let resp = execute_invoke(action, kw, trace_id.clone()).await;
-            complete_dedup_response(&slot, resp.clone());
-            resp
-        } else {
-            match tokio::task::spawn_blocking(move || wait_dedup_response(slot)).await {
-                Ok(resp) => resp,
-                Err(e) => CachedResponse {
-                    status: 500,
-                    body: err_json(&format!("requestId wait failed: {e}")),
-                },
-            }
-        }
-    } else {
-        execute_invoke(action, kw, trace_id.clone()).await
-    };
+    let resp = execute_invoke(request_id, action, kw, trace_id).await;
     write_resp(sock, resp.status, &resp.body).await
 }
 
 async fn execute_invoke(
+    request_id: Option<String>,
     action: String,
     kw: BTreeMap<String, rmpv::Value>,
     trace_id: String,
 ) -> CachedResponse {
-    let started = Instant::now();
-    let normalized = match super::dispatch::normalize_sandbox_action(&action) {
-        Some(method) => method.to_string(),
-        None => {
-            return CachedResponse {
-                status: 400,
-                body: err_json(&format!("unsupported action: {action}")),
-            }
-        }
-    };
-    let command = super::dispatch::access_command_summary(&normalized, &kw);
-    let method = normalized.clone();
-    let command_trace_id = trace_id.clone();
     let result = tokio::task::spawn_blocking(move || {
-        super::dispatch::dispatch_runtime_action_with_trace(&method, &kw, &command_trace_id)
+        super::dispatch::execute_sandbox_action_once(request_id.as_deref(), &action, &kw, &trace_id)
     })
     .await;
-    super::dispatch::log_access(trace_id.as_str(), &command, started);
 
     match result {
-        Ok(Some(result)) => {
+        Ok(Ok(result)) => {
             let json = rmpv_to_json(&result);
             CachedResponse {
                 status: 200,
                 body: serde_json::to_string(&json).unwrap_or_else(|_| "{}".into()),
             }
         }
-        Ok(None) => CachedResponse {
+        Ok(Err(message)) => CachedResponse {
             status: 400,
-            body: err_json(&format!("unsupported action: {action}")),
+            body: err_json(&message),
         },
         Err(e) => CachedResponse {
             status: 500,
