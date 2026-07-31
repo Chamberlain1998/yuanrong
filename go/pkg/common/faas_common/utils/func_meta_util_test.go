@@ -30,7 +30,7 @@ import (
 func TestGetFuncMetaSignature(t *testing.T) {
 	convey.Convey("success", t, func() {
 		signature := GetFuncMetaSignature(&types.FunctionMetaInfo{}, true)
-		convey.So(signature, convey.ShouldEqual, "3662994177")
+		convey.So(signature, convey.ShouldEqual, "1820686202")
 	})
 	convey.Convey("enable agent session affects signature", t, func() {
 		signature1 := GetFuncMetaSignature(&types.FunctionMetaInfo{

@@ -48,7 +48,7 @@ enable_faas_frontend:,faas_frontend_http_port:,faas_frontend_grpc_port:,enable_f
 lite_scheduler_enable:,lite_scheduler_enable_all_tenants:,lite_scheduler_enabled_tenants:,lite_scheduler_enabled_functions:,lite_scheduler_acquire_wait_timeout_ms:,\
 enable_meta_service:,meta_service_port:,\
 enable_iam_server:,iam_server_port:,iam_token_expired_time_span:,iam_credential_type:,\
-function_agent_port:,function_proxy_port:,ssh_enable:,ssh_backend_public_key_dir:,frontend_ssh_auth_enable:,frontend_ssh_address:,\
+function_agent_port:,function_proxy_port:,ssh_enable:,enable_tcp_tunnel:,ssh_backend_public_key_dir:,frontend_ssh_auth_enable:,frontend_ssh_address:,\
 frontend_ssh_host_key:,frontend_ssh_authorized_keys:,frontend_ssh_backend_key:,frontend_ssh_max_connections:,\
 tcp_tunnel_port:,tcp_tunnel_max_connections:,\
 function_proxy_grpc_port:,global_scheduler_port:,runtime_init_port:,\
@@ -252,6 +252,7 @@ METRICS_COLLECTOR_TYPE="proc"
 MERGE_PROCESS_ENABLE="true"
 FUNCTION_PROXY_MERGE_PROCESS_ENABLE="false"
 SSH_ENABLE="false"
+ENABLE_TCP_TUNNEL="false"
 YR_SSH_BACKEND_PUBLIC_KEY_DIR=""
 FRONTEND_SSH_AUTH_ENABLE="true"
 FRONTEND_SSH_ADDRESS=":2222"
@@ -533,7 +534,8 @@ function usage() {
   echo -e "     --function_agent_port                               function agent port (default 58866)"
   echo -e "     --function_proxy_port                               function proxy port (default 22772)"
   echo -e "     --function_proxy_grpc_port                          function proxy port for driver (default 22773)"
-  echo -e "     --ssh_enable                                        enable frontend SSH and function proxy tunnel (default false)"
+  echo -e "     --ssh_enable                                        enable frontend SSH (default false). When true the TCP tunnel is also enabled (the SSH path needs it)."
+  echo -e "     --enable_tcp_tunnel                                 enable function proxy TCP tunnel listener independently of ssh_enable (default false). Use this for wsproxy WS passthrough without SSH keys."
   echo -e "     --ssh_backend_public_key_dir                        host directory containing authorized_keys for sandbox mounts"
   echo -e "     --frontend_ssh_auth_enable                          authenticate external SSH clients with authorized_keys (default true)"
   echo -e "     --frontend_ssh_address                              frontend SSH listen address (default :2222)"
@@ -825,6 +827,7 @@ function parse_opt() {
     --function_proxy_port) FUNCTION_PROXY_PORT=$2 && port_policy_table["function_proxy_port"]="FIX" && shift 2 ;;
     --function_proxy_grpc_port) FUNCTION_PROXY_GRPC_PORT=$2 && port_policy_table["function_proxy_grpc_port"]="FIX" && shift 2 ;;
     --ssh_enable) SSH_ENABLE=$2 && shift 2 ;;
+    --enable_tcp_tunnel) ENABLE_TCP_TUNNEL=$2 && shift 2 ;;
     --ssh_backend_public_key_dir) YR_SSH_BACKEND_PUBLIC_KEY_DIR=$(readlink -m "$2") && shift 2 ;;
     --frontend_ssh_auth_enable) FRONTEND_SSH_AUTH_ENABLE=$2 && shift 2 ;;
     --frontend_ssh_address) FRONTEND_SSH_ADDRESS=$2 && shift 2 ;;
@@ -1409,6 +1412,10 @@ function check_input() {
      log_error "ssh_enable can only be 'true' or 'false'"
      return 1
   fi
+  if [ "X${ENABLE_TCP_TUNNEL}" != "Xtrue" ] && [ "X${ENABLE_TCP_TUNNEL}" != "Xfalse" ]; then
+     log_error "enable_tcp_tunnel can only be 'true' or 'false'"
+     return 1
+  fi
   if [ "X${FRONTEND_SSH_AUTH_ENABLE}" != "Xtrue" ] && [ "X${FRONTEND_SSH_AUTH_ENABLE}" != "Xfalse" ]; then
     log_error "frontend_ssh_auth_enable can only be 'true' or 'false'"
     return 1
@@ -1801,7 +1808,7 @@ function export_config() {
   export RUNTIME_INIT_PORT DS_WORKER_PORT RUNTIME_CONN_TIMEOUT_S
   export ENABLE_RUNTIME_LAUNCHER RUNTIME_LAUNCHER_SOCK
   export RUNTIME_INIT_CALL_TIMEOUT_SECONDS IS_SCHEDULE_TOLERATE_ABNORMAL STATE_STORAGE_TYPE
-  export MERGE_PROCESS_ENABLE FUNCTION_PROXY_MERGE_PROCESS_ENABLE DRIVER_GATEWAY_ENABLE SSH_ENABLE
+  export MERGE_PROCESS_ENABLE FUNCTION_PROXY_MERGE_PROCESS_ENABLE DRIVER_GATEWAY_ENABLE SSH_ENABLE ENABLE_TCP_TUNNEL
   export FRONTEND_SSH_AUTH_ENABLE FRONTEND_SSH_ADDRESS FRONTEND_SSH_HOST_KEY FRONTEND_SSH_AUTHORIZED_KEYS
   export FRONTEND_SSH_BACKEND_KEY FRONTEND_SSH_MAX_CONNECTIONS TCP_TUNNEL_PORT TCP_TUNNEL_MAX_CONNECTIONS
   export YR_SSH_BACKEND_PUBLIC_KEY_DIR
