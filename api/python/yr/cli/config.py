@@ -21,8 +21,9 @@ import os
 import socket
 import sys
 import time
+from functools import partial
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 try:
     import tomllib
@@ -33,10 +34,88 @@ import tomli_w
 from jinja2 import Environment, StrictUndefined
 
 from yr.cli.const import DEFAULT_CONFIG_TEMPLATE_PATH, DEFAULT_VALUES_TOML, SESSIONS_DIR, StartMode
-from yr.cli.utils import get_ip, get_total_memory_mb, port_or_free, trim_hostname
+from yr.cli.utils import check_port, get_ip, get_total_memory_mb, trim_hostname
 
 logger = logging.getLogger(__name__)
 print_logger = logging.getLogger("print")
+
+
+def create_jinja_environment(port_policy: str = "RANDOM") -> Environment:
+    env = Environment(
+        undefined=StrictUndefined,
+        trim_blocks=True,
+        lstrip_blocks=True,
+        keep_trailing_newline=True,
+        newline_sequence="\n",
+    )
+    env.filters["check_port"] = partial(check_port, port_policy=port_policy)
+    return env
+
+
+def build_runtime_context(yr_package_path: Path) -> dict[str, Any]:
+    hostname = socket.gethostname()
+    pid = os.getpid()
+    node_id = f"{trim_hostname()}-{pid}"
+    timestamp = time.time()
+    time_str = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+    return {
+        "yr_package_path": yr_package_path,
+        "hostname": hostname,
+        "pid": pid,
+        "node_id": node_id,
+        "cpu_millicores": os.cpu_count() * 1000,
+        "memory_num_mb": get_total_memory_mb(),
+        "ip": get_ip(),
+        "timestamp": timestamp,
+        "time": time_str,
+        "deploy_path": Path(f"{SESSIONS_DIR}/{time_str}"),
+        "cwd": Path.cwd(),
+        "ld_library_path": os.environ.get("LD_LIBRARY_PATH", ""),
+        "python_path": os.environ.get("PYTHONPATH", ""),
+    }
+
+
+def _get_template_error_lineno(exc: Exception) -> Optional[int]:
+    lineno = getattr(exc, "lineno", None)
+    if lineno is not None:
+        return lineno
+
+    traceback = exc.__traceback__
+    while traceback is not None:
+        if traceback.tb_frame.f_code.co_filename == "<template>":
+            lineno = traceback.tb_lineno
+        traceback = traceback.tb_next
+    return lineno
+
+
+def render_user_config_template(template_path: Path, cli_dir: Path) -> str:
+    template_path = Path(template_path)
+    try:
+        template_text = template_path.read_text()
+    except OSError as exc:
+        raise ValueError(f"Failed to read template '{template_path}': {exc}") from exc
+
+    runtime_context = build_runtime_context(Path(cli_dir).parent)
+    jinja_env = create_jinja_environment()
+    jinja_env.globals.update(runtime_context)
+    jinja_env.globals["env"] = dict(os.environ)
+
+    try:
+        rendered_text = jinja_env.from_string(template_text).render()
+    except Exception as exc:
+        lineno = _get_template_error_lineno(exc)
+        location = f" at line {lineno}" if lineno is not None else ""
+        raise ValueError(
+            f"Failed to render template '{template_path}'{location}: {exc}"
+        ) from exc
+
+    try:
+        tomllib.loads(rendered_text)
+    except tomllib.TOMLDecodeError as exc:
+        raise ValueError(
+            f"Invalid TOML rendered from template '{template_path}': {exc}"
+        ) from exc
+    return rendered_text
 
 
 def normalize_deploy_path(deploy_path: str | Path, cwd: Path) -> Path:
@@ -55,6 +134,7 @@ class ConfigResolver:
         overrides: Optional[tuple[str, ...]] = None,
         render: Optional[bool] = True,
         env_subst_keys: Optional[tuple[str, ...]] = None,
+        port_policy: str = "RANDOM",
     ) -> None:
         self.mode = mode
         self.yr_package_path = cli_dir.parent
@@ -78,13 +158,7 @@ class ConfigResolver:
         )
         if render:
             self.runtime_context = self._build_runtime_context()
-            self.jinja_env = Environment(
-                undefined=StrictUndefined,
-                trim_blocks=True,
-                lstrip_blocks=True,
-                keep_trailing_newline=True,
-                newline_sequence="\n",
-            )
+            self.jinja_env = create_jinja_environment(port_policy)
             self.jinja_env.globals.update(
                 {
                     "yr_package_path": self.binary_root,
@@ -103,7 +177,6 @@ class ConfigResolver:
                     "python_path": self.runtime_context["python_path"],
                 },
             )
-            self.jinja_env.filters["check_port"] = port_or_free
             self.rendered_config = self._load_config(config_path, overrides)
             self.runtime_context["deploy_path"] = Path(
                 self.rendered_config["values"]["deploy_path"]
@@ -188,31 +261,7 @@ class ConfigResolver:
 
     def _build_runtime_context(self) -> dict[str, any]:
         """build runtime context, collect environment information"""
-        hostname = socket.gethostname()
-        pid = os.getpid()
-        node_id = f"{trim_hostname()}-{pid}"
-        cpu_millicores = os.cpu_count() * 1000
-        memory_num_mb = get_total_memory_mb()
-        ip = get_ip()
-        timestamp = time.time()
-        time_str = time.strftime("%Y%m%d_%H%M%S", time.localtime())
-        ld_library_path = os.environ.get("LD_LIBRARY_PATH", "")
-        python_path = os.environ.get("PYTHONPATH", "")
-        return {
-            "yr_package_path": self.yr_package_path,
-            "hostname": hostname,
-            "pid": pid,
-            "node_id": node_id,
-            "cpu_millicores": cpu_millicores,
-            "memory_num_mb": memory_num_mb,
-            "ip": ip,
-            "timestamp": timestamp,
-            "time": time_str,
-            "deploy_path": Path(f"{SESSIONS_DIR}/{time_str}"),
-            "cwd": Path.cwd(),
-            "ld_library_path": ld_library_path,
-            "python_path": python_path,
-        }
+        return build_runtime_context(self.yr_package_path)
 
     def _apply_env_subst(self, text: str) -> str:
         if not self.env_subst_keys:

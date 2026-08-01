@@ -27,7 +27,7 @@ import time
 import urllib.request
 from contextlib import closing
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +85,19 @@ def port_or_free(port: str) -> int:
         new_port = s.getsockname()[1]
         logger.info(f"port {port} is occupied, use {new_port} instead")
         return new_port
+
+
+def check_port(port: Union[str, int], port_policy: str = "RANDOM") -> int:
+    if port_policy != "FIX":
+        return port_or_free(port)
+
+    try:
+        fixed_port = int(port)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"invalid port {port!r}: expected an integer in 1..65535") from exc
+    if not is_valid_port(fixed_port):
+        raise ValueError(f"invalid port {port!r}: expected an integer in 1..65535")
+    return fixed_port
 
 
 def is_valid_file_path(path: str, allow_empty: bool = True) -> bool:

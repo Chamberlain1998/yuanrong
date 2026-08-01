@@ -190,16 +190,18 @@ json_field() {
 runtime_image_tag() {
 	python3 -c '
 import json
+import os
 import sys
 
 metadata = json.load(open(sys.argv[1]))
 image_tag = metadata["image_tag"]
+sdk_suffix = os.environ.get("YR_K8S_DEFAULT_RUNTIME_SDK_SUFFIX", "cp310")
 for image in metadata.get("images", []):
     if "/yr-runtime:" in image:
         print(image.rsplit(":", 1)[1])
         break
 else:
-    print(f"{image_tag}-cp310")
+    print(f"{image_tag}-{sdk_suffix}")
 ' "${SANDBOX_METADATA}"
 }
 

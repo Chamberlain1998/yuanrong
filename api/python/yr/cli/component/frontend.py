@@ -48,7 +48,8 @@ class FrontendLauncher(ComponentLauncher):
         etcd_auth_type = values["etcd"].get("auth_type", "Noauth")
         etcd_table_prefix = values["etcd"].get("table_prefix", "")
 
-        ssl_enable = str(values["fs"]["tls"].get("enable", "false")).lower()
+        fs_tls_enable = values["fs"]["tls"].get("enable", False)
+        ssl_enable = str(fs_tls_enable).lower()
         scc_enable = str(faas_values.get("scc_enable", "false")).lower()
         ssl_base_path = values["fs"]["tls"].get("base_path", "")
         scc_base_path = faas_args.get("scc_base_path", "")
@@ -89,7 +90,15 @@ class FrontendLauncher(ComponentLauncher):
         # init_frontend_args.json is invalid and frontend fails to start.
         # functionInvokeBackend is a raw {token} (no quotes) -> bare integer, default 0.
         function_invoke_backend = str(faas_values.get("function_invoke_backend", 0))
-        frontend_https_enable = ssl_enable
+        frontend_https_enable = str(
+            faas_values.get("ssl_enable", fs_tls_enable)
+        ).lower()
+        frontend_client_auth_type = str(
+            faas_values.get(
+                "client_auth_type",
+                "RequireAndVerifyClientCert",
+            )
+        )
         enable_func_token_auth = str(
             faas_values.get("enable_func_token_auth", False)
         ).lower()
@@ -139,8 +148,10 @@ class FrontendLauncher(ComponentLauncher):
             "{frontend_lease_bypass}": frontend_lease_bypass,
             "{function_invoke_backend}": function_invoke_backend,
             "{frontendSslEnable}": frontend_https_enable,
+            "{frontendClientAuthType}": frontend_client_auth_type,
         }
 
+        text = text.replace("RequireAndVerifyClientCert", frontend_client_auth_type)
         for placeholder, value in replacements.items():
             text = text.replace(placeholder, value)
 

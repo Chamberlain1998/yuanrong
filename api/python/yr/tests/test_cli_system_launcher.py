@@ -16,10 +16,13 @@
 
 from types import SimpleNamespace
 import unittest
+from pathlib import Path
+from unittest import mock
 
 from yr.cli.component.base import ComponentConfig
 from yr.cli.component.registry import get_depends_on_overrides
 from yr.cli.const import StartMode
+import yr.cli.system_launcher as system_launcher_module
 from yr.cli.system_launcher import SystemLauncher
 
 
@@ -100,6 +103,29 @@ class TestCliSystemLauncher(unittest.TestCase):
             "runtime_launcher",
             get_depends_on_overrides(StartMode.AGENT)["function_proxy"],
         )
+
+    def test_constructor_passes_port_policy_to_config_resolver(self):
+        resolver = SimpleNamespace(
+            runtime_context={
+                "time": "20260801_000000",
+                "deploy_path": Path("/tmp/yr-test-session"),
+            }
+        )
+        with (
+            mock.patch.object(
+                system_launcher_module, "ConfigResolver", return_value=resolver
+            ) as config_resolver,
+            mock.patch.object(system_launcher_module, "SessionManager"),
+            mock.patch.object(SystemLauncher, "_register_component_launchers"),
+        ):
+            SystemLauncher(
+                Path("/tmp/config.toml"),
+                Path("/tmp/yr/cli"),
+                StartMode.MASTER,
+                port_policy="FIX",
+            )
+
+        self.assertEqual(config_resolver.call_args.kwargs["port_policy"], "FIX")
 
 
 if __name__ == "__main__":

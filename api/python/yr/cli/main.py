@@ -23,7 +23,7 @@ from typing import Optional
 import click
 
 import yr.cli.discovery as discovery
-from yr.cli.config import ConfigResolver
+from yr.cli.config import ConfigResolver, render_user_config_template
 from yr.cli.const import (
     DEFAULT_CONFIG_PATH,
     DEFAULT_CONFIG_TEMPLATE_PATH,
@@ -179,6 +179,15 @@ Common patterns:\n
     help="Start runtime-launcher for sandbox container backend.",
 )
 @click.option(
+    "--port-policy",
+    "--port_policy",
+    "port_policy",
+    type=click.Choice(["FIX", "RANDOM"], case_sensitive=False),
+    default="RANDOM",
+    show_default=True,
+    help="Port allocation policy for default ports.",
+)
+@click.option(
     "--block",
     "block",
     type=bool,
@@ -193,6 +202,7 @@ def start(ctx: click.Context, **kwargs) -> None:
     function_master_addr = kwargs["function_master_addr"]
     function_proxy_merge_process_enable = kwargs["function_proxy_merge_process_enable"]
     enable_runtime_launcher = kwargs["enable_runtime_launcher"]
+    port_policy = kwargs["port_policy"]
     block = kwargs["block"]
     config_path: Path = ctx.obj["config_path"]
     cli_dir: Path = ctx.obj["cli_dir"]
@@ -231,7 +241,13 @@ def start(ctx: click.Context, **kwargs) -> None:
             ]
         )
 
-    launcher = SystemLauncher(config_path, cli_dir, mode, overrides=tuple(effective_overrides))
+    launcher = SystemLauncher(
+        config_path,
+        cli_dir,
+        mode,
+        overrides=tuple(effective_overrides),
+        port_policy=port_policy,
+    )
     launcher.load_components()
     success = launcher.start_all()
     if success and block:
@@ -413,6 +429,46 @@ def config_template(ctx: click.Context) -> None:
     values_path = cli_dir.parent / DEFAULT_VALUES_TOML
     template_path = cli_dir.parent / DEFAULT_CONFIG_TEMPLATE_PATH
     cfg.print_default_config(values_path, template_path)
+
+
+@config.command(name="render", help="Render a user Jinja template to TOML")
+@click.option(
+    "-t",
+    "--template",
+    "template_path",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Path to the user Jinja template.",
+)
+@click.option(
+    "-o",
+    "--output",
+    "output_path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    help="Write rendered TOML to this path instead of stdout.",
+)
+@click.pass_context
+def config_render(
+    ctx: click.Context,
+    template_path: Path,
+    output_path: Optional[Path],
+) -> None:
+    cli_dir: Path = ctx.obj["cli_dir"]
+    try:
+        rendered_text = render_user_config_template(template_path, cli_dir)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    if output_path is None:
+        click.echo(rendered_text, nl=False)
+        return
+
+    try:
+        output_path.write_text(rendered_text)
+    except OSError as exc:
+        raise click.ClickException(
+            f"Failed to write template '{template_path}' to '{output_path}': {exc}"
+        ) from exc
 
 
 @cli.group(help="Checkpoint management commands")

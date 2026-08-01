@@ -38,6 +38,9 @@ class TestCliMain(unittest.TestCase):
         fake_yr_cli = types.ModuleType("yr.cli")
         fake_config = types.ModuleType("yr.cli.config")
         fake_config.ConfigResolver = object
+        fake_config.render_user_config_template = mock.Mock(
+            return_value="[user]\nvalue = 1\n"
+        )
         fake_discovery = types.ModuleType("yr.cli.discovery")
         fake_discovery.resolve_overrides_from_function_master = mock.Mock(return_value=("x=y",))
 
@@ -97,6 +100,7 @@ class TestCliMain(unittest.TestCase):
         ):
             spec.loader.exec_module(module)
         module.fake_discovery = fake_discovery
+        module.fake_config = fake_config
         module.FakeSystemLauncher = FakeSystemLauncher
         return module
 
@@ -153,6 +157,55 @@ class TestCliMain(unittest.TestCase):
         call_kwargs = main.fake_discovery.resolve_overrides_from_function_master.call_args.kwargs
         self.assertEqual(call_kwargs["function_master_addr"], "http://127.0.0.1:8080")
         self.assertEqual(main.FakeSystemLauncher.calls[-1][1]["overrides"], ("x=y",))
+
+    def test_start_port_policy_options(self):
+        cases = [
+            ([], "RANDOM", 0),
+            (["--port-policy", "FIX"], "FIX", 0),
+            (["--port_policy", "fix"], "FIX", 0),
+            (["--port-policy", "invalid"], None, 2),
+        ]
+        for args, expected_policy, expected_exit_code in cases:
+            with self.subTest(args=args):
+                main = self.load_cli_main_with_stubbed_deps()
+                result = CliRunner().invoke(main.cli, ["start", *args], obj={})
+
+                self.assertEqual(result.exit_code, expected_exit_code, result.output)
+                if expected_policy is not None:
+                    self.assertEqual(
+                        main.FakeSystemLauncher.calls[-1][1]["port_policy"],
+                        expected_policy,
+                    )
+
+    def test_config_render_outputs_stdout_or_file(self):
+        main = self.load_cli_main_with_stubbed_deps()
+        runner = CliRunner()
+        with runner.isolated_filesystem():
+            template_path = Path("user.toml.jinja")
+            output_path = Path("rendered.toml")
+            template_path.write_text("[user]\nvalue = 1\n")
+
+            stdout_result = runner.invoke(
+                main.cli,
+                ["config", "render", "--template", str(template_path)],
+                obj={},
+            )
+            file_result = runner.invoke(
+                main.cli,
+                [
+                    "config",
+                    "render",
+                    "--template",
+                    str(template_path),
+                    "--output",
+                    str(output_path),
+                ],
+                obj={},
+            )
+
+            self.assertEqual(stdout_result.output, "[user]\nvalue = 1\n")
+            self.assertEqual(file_result.exit_code, 0, file_result.output)
+            self.assertEqual(output_path.read_text(), "[user]\nvalue = 1\n")
 
     def test_user_visible_print_logger_writes_to_stdout(self):
         stdout = io.StringIO()

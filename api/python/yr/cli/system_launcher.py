@@ -297,9 +297,17 @@ class SystemLauncher:
         overrides: Optional[tuple[str, ...]] = None,
         session_file: Optional[str] = None,
         render: bool = True,
+        port_policy: str = "RANDOM",
     ):
         self.mode = mode
-        self.resolver = ConfigResolver(config_path, cli_dir, mode, overrides, render)
+        self.resolver = ConfigResolver(
+            config_path,
+            cli_dir,
+            mode,
+            overrides,
+            render,
+            port_policy=port_policy,
+        )
         self.session_manager = SessionManager(
             self.resolver.runtime_context["time"] if mode else "",
             mode,
