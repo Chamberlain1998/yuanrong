@@ -2,6 +2,7 @@
 
 """Regression tests for Buildkite main-build artifact reuse."""
 
+import os
 import pathlib
 import subprocess
 import unittest
@@ -15,6 +16,32 @@ COMPILE_IMAGE = REPO_ROOT / "ci" / "ubuntu" / "Dockerfile.ubuntu2004"
 
 
 class BuildkiteMainPackagingTest(unittest.TestCase):
+    def test_k8s_runtime_uses_selected_sdk_python_suffix(self):
+        env = os.environ.copy()
+        env.update(
+            {
+                "ENABLE_LINUX_ARM": "false",
+                "ENABLE_MACOS_SDK": "false",
+                "ENABLE_TEST_PYPI_PUBLISH": "false",
+                "SDK_PYTHON_VERSIONS": "python3.11",
+            }
+        )
+        result = subprocess.run(
+            ["bash", str(PIPELINE)],
+            cwd=REPO_ROOT,
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertIn('YR_K8S_DEFAULT_RUNTIME_SDK_SUFFIX: "cp311"', result.stdout)
+        self.assertIn("YR_K8S_DEFAULT_RUNTIME_SDK_SUFFIX", PIPELINE.read_text())
+        self.assertIn(
+            'os.environ.get("YR_K8S_DEFAULT_RUNTIME_SDK_SUFFIX", "cp310")',
+            (REPO_ROOT / ".buildkite" / "test_sandbox_k8s.sh").read_text(),
+        )
+
     def test_core_wheel_is_only_wired_into_buildkite(self):
         def tracked_references(needle):
             result = subprocess.run(

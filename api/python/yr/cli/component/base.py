@@ -155,7 +155,7 @@ class ComponentLauncher:
         logger.info(f"Starting {self.name}: {' '.join(cmd)}")
         logger.info(f"Environment: {full_env}")
 
-        log_file = Path(cwd) / "logs" / f"{self.name}_stdout.log"
+        log_file = self._get_stdout_log_file()
         with log_file.open("a") as log:
             log.write(f"\n=== Started at {time.ctime()} ===\n")
             log.write(f"Command: {' '.join(cmd)}\n\n")
@@ -226,7 +226,7 @@ class ComponentLauncher:
         full_env = self.component_config.env_vars
         cwd = self.component_config.working_dir
 
-        log_file = Path(self.resolver.runtime_context["deploy_path"]) / "logs" / f"{self.name}_stdout.log"
+        log_file = self._get_stdout_log_file()
         with log_file.open("a") as log:
             log.write(f"\n=== Started at {time.ctime()} ===\n")
             log.write(f"Command: {' '.join(cmd)}\n\n")
@@ -246,6 +246,12 @@ class ComponentLauncher:
         self.component_config.start_time = time.time()
         self.component_config.status = ComponentStatus.RUNNING
         return process
+
+    def _get_stdout_log_file(self) -> Path:
+        log_root = self.resolver.rendered_config["values"]["fs"]["log"]["path"]
+        log_file = Path(log_root) / f"{self.name}_stdout.log"
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        return log_file
 
     def _check_port_health(self) -> bool:
         if not self.component_config.health_check_port:
