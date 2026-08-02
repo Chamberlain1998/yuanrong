@@ -372,10 +372,13 @@ ssl_base_path = "{{ values.fs.tls.base_path }}"
 ssl_root_file = "{{ values.fs.tls.ca_file }}"
 ssl_cert_file = "{{ values.fs.tls.cert_file }}"
 ssl_key_file = "{{ values.fs.tls.key_file }}"
-# TCP tunnel for frontend SSH -> instance sshd. All three fields are gated on
-# values.frontend.ssh_enable so the listener and its port/limit appear together
-# (mirrors deploy/process/config.sh where --ssh_enable gates both sides).
-{% if values.frontend.ssh_enable %}
+# TCP tunnel: a generic L4 passthrough (wsproxy WS passthrough reuses it; the
+# legacy SSH path also rides on it). Gated on enable_tcp_tunnel OR ssh_enable,
+# so WS can run without SSH keys while existing SSH deployments keep their
+# tunnel automatically. ssh_enable forces the tunnel on (the SSH path
+# frontend->instance-sshd needs it), so tunnel=false has no effect when
+# ssh_enable=true.
+{% if values.frontend.enable_tcp_tunnel or values.frontend.ssh_enable %}
 enable_tcp_tunnel = true
 tcp_tunnel_port = "{{ values.function_proxy.tcp_tunnel_port }}"
 tcp_tunnel_max_connections = {{ values.function_proxy.tcp_tunnel_max_connections }}
