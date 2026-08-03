@@ -499,21 +499,20 @@ func (i *instanceQueueWithObserver) handleSubHealthInstanceUpdateMetrics(oldInsA
 }
 
 type basicConcurrencyScheduler struct {
-	funcSpec              *types.FunctionSpecification
-	insAcqReqQueue        *requestqueue.InsAcqReqQueue
-	leaseManager          lease.InstanceLeaseManager
-	selfInstanceQueue     queue.Queue
-	otherInstanceQueue    queue.Queue
-	selfSubHealthRecord   map[string]*instanceElement
-	otherSubHealthRecord  map[string]*instanceElement
-	sessionManager        *sessionManager
-	observers             map[scheduler.InstanceTopic][]*instanceObserver
-	funcKeyWithRes        string
-	concurrentNum         int
-	isFuncOwner           bool
-	stopped               bool
-	leaseInterval         time.Duration
-	sessionCtxIdleHandler func(*types.Instance)
+	funcSpec             *types.FunctionSpecification
+	insAcqReqQueue       *requestqueue.InsAcqReqQueue
+	leaseManager         lease.InstanceLeaseManager
+	selfInstanceQueue    queue.Queue
+	otherInstanceQueue   queue.Queue
+	selfSubHealthRecord  map[string]*instanceElement
+	otherSubHealthRecord map[string]*instanceElement
+	sessionManager       *sessionManager
+	observers            map[scheduler.InstanceTopic][]*instanceObserver
+	funcKeyWithRes       string
+	concurrentNum        int
+	isFuncOwner          bool
+	stopped              bool
+	leaseInterval        time.Duration
 	*sync.RWMutex
 	*sync.Cond
 	coldStartTraceMu    sync.Mutex
@@ -858,57 +857,24 @@ func (bcs *basicConcurrencyScheduler) acquireDefaultInstance(instanceQueue queue
 	insAcqReq *types.InstanceAcquireRequest) (*types.InstanceAllocation, error) {
 	log.GetLogger().Debugf("acquire default instance for function %s traceID %s", bcs.funcKeyWithRes,
 		insAcqReq.TraceID)
-	var insElem *instanceElement
-	if bcs.funcSpec.ExtendedMetaData.EnableSessionCtx {
-		if instanceQueue.SortedRange(func(obj interface{}) bool {
-			candidate, ok := obj.(*instanceElement)
-			if !ok || candidate.instance.InstanceStatus.Code != int32(constant.KernelInstanceStatusRunning) ||
-				!bcs.matchesSessionCtx(candidate.instance, insAcqReq.SessionCtxID) || len(candidate.threadMap) == 0 {
-				return true
-			}
-			insElem = candidate
-			return false
-		}) {
-			return nil, scheduler.ErrNoInsAvailable
-		}
-	} else {
-		obj := instanceQueue.Front()
-		if obj == nil {
-			return nil, scheduler.ErrNoInsAvailable
-		}
-		var ok bool
-		insElem, ok = obj.(*instanceElement)
-		if !ok {
-			return nil, scheduler.ErrTypeConvertFail
-		}
+	obj := instanceQueue.Front()
+	if obj == nil {
+		return nil, scheduler.ErrNoInsAvailable
+	}
+	insElem, ok := obj.(*instanceElement)
+	if !ok {
+		return nil, scheduler.ErrTypeConvertFail
 	}
 	return acquireInstanceThread(insAcqReq.DesignateThreadID, instanceQueue, insElem)
 }
 
-func (bcs *basicConcurrencyScheduler) matchesSessionCtx(instance *types.Instance, sessionCtxID string) bool {
-	if !bcs.funcSpec.ExtendedMetaData.EnableSessionCtx {
-		return true
-	}
-	return instance != nil && instance.SessionCtxID != nil && *instance.SessionCtxID == sessionCtxID
-}
-
-func hasActiveSessionCtx(instance *types.Instance) bool {
-	return instance != nil && instance.SessionCtxID != nil && *instance.SessionCtxID != ""
-}
-
-type releaseInstanceResult struct {
-	instanceForSessionCtxIdleHandler *types.Instance
-}
-
-func (r releaseInstanceResult) shouldHandleSessionCtxIdle() bool {
-	return r.instanceForSessionCtxIdleHandler != nil
-}
+type releaseInstanceResult struct{}
 
 func (bcs *basicConcurrencyScheduler) getSessionCacheKey(sessionID, sessionCtxID string) string {
 	if !bcs.funcSpec.ExtendedMetaData.EnableSessionCtx {
 		return sessionID
 	}
-	return sessionID + "\x00" + sessionCtxID
+	return types.JoinKey(sessionID, sessionCtxID)
 }
 
 func (bcs *basicConcurrencyScheduler) getRecordCacheKey(record *sessionRecord) string {
@@ -941,9 +907,6 @@ func (bcs *basicConcurrencyScheduler) acquireSessionInstance(instanceQueue queue
 				return true
 			}
 			if insElem.instance.InstanceStatus.Code != int32(constant.KernelInstanceStatusRunning) {
-				return true
-			}
-			if !bcs.matchesSessionCtx(insElem.instance, insAcqReq.SessionCtxID) {
 				return true
 			}
 			if insAcqReq.InstanceSession.Concurrency == -1 {
@@ -1012,9 +975,6 @@ func (bcs *basicConcurrencyScheduler) acquireDesignateInstance(instanceQueue que
 	insElem, ok := obj.(*instanceElement)
 	if !ok {
 		return nil, scheduler.ErrTypeConvertFail
-	}
-	if !bcs.matchesSessionCtx(insElem.instance, insAcqReq.SessionCtxID) {
-		return nil, scheduler.ErrInsNotExist
 	}
 	if insElem.instance.InstanceStatus.Code == int32(constant.KernelInstanceStatusSubHealth) {
 		return nil, scheduler.ErrInsSubHealthy
@@ -1197,20 +1157,13 @@ func (bcs *basicConcurrencyScheduler) acquireSessionThread(designateThreadID str
 func (bcs *basicConcurrencyScheduler) ReleaseInstance(insAlloc *types.InstanceAllocation) error {
 	bcs.Lock()
 	useSelfInstance := bcs.checkSelfInstance(insAlloc.Instance)
-	var (
-		releaseResult releaseInstanceResult
-		err           error
-	)
+	var err error
 	if useSelfInstance {
-		releaseResult, err = bcs.releaseInstanceInternal(bcs.selfInstanceQueue, insAlloc)
+		_, err = bcs.releaseInstanceInternal(bcs.selfInstanceQueue, insAlloc)
 	} else {
-		releaseResult, err = bcs.releaseInstanceInternal(bcs.otherInstanceQueue, insAlloc)
+		_, err = bcs.releaseInstanceInternal(bcs.otherInstanceQueue, insAlloc)
 	}
-	idleHandler := bcs.sessionCtxIdleHandler
 	bcs.Unlock()
-	if err == nil && releaseResult.shouldHandleSessionCtxIdle() && idleHandler != nil {
-		idleHandler(releaseResult.instanceForSessionCtxIdleHandler)
-	}
 	return err
 }
 
@@ -1248,10 +1201,6 @@ func (bcs *basicConcurrencyScheduler) releaseInstanceInternal(instanceQueue queu
 	}
 	if !releaseInSession {
 		metrics.OnReleaseLease(insAlloc)
-	}
-	if bcs.funcSpec.ExtendedMetaData.EnableSessionCtx && hasActiveSessionCtx(insElem.instance) &&
-		len(insElem.threadMap) == insElem.instance.ConcurrentNum {
-		return releaseInstanceResult{instanceForSessionCtxIdleHandler: insElem.instance}, nil
 	}
 	return releaseInstanceResult{}, nil
 }
@@ -1338,13 +1287,7 @@ func (bcs *basicConcurrencyScheduler) unbindInstanceSession(insQue queue.Queue, 
 			logger.Errorf("failed to update instance %s during unbinding for function %s error %s",
 				record.insElem.instance.InstanceID, bcs.funcKeyWithRes, err.Error())
 		}
-		instance := record.insElem.instance
-		idleHandler := bcs.sessionCtxIdleHandler
-		enableSessionCtx := bcs.funcSpec.ExtendedMetaData.EnableSessionCtx
 		bcs.L.Unlock()
-		if idleHandler != nil && enableSessionCtx && hasActiveSessionCtx(instance) {
-			idleHandler(instance)
-		}
 		logger.Infof("unbind session with instance %s for function %s", record.insElem.instance.InstanceID,
 			bcs.funcKeyWithRes)
 	case <-record.expireCancelCh:
@@ -1450,43 +1393,6 @@ func (bcs *basicConcurrencyScheduler) DelInstance(instance *types.Instance) erro
 		return err
 	}
 	return err
-}
-
-func (bcs *basicConcurrencyScheduler) isSessionCtxInstanceIdle(instanceID, sessionCtxID string) bool {
-	bcs.RLock()
-	defer bcs.RUnlock()
-	for _, instanceQueue := range []queue.Queue{bcs.selfInstanceQueue, bcs.otherInstanceQueue} {
-		obj := instanceQueue.GetByID(instanceID)
-		insElem, ok := obj.(*instanceElement)
-		if !ok {
-			continue
-		}
-		return bcs.matchesSessionCtx(insElem.instance, sessionCtxID) &&
-			len(insElem.threadMap) == insElem.instance.ConcurrentNum
-	}
-	return false
-}
-
-func (bcs *basicConcurrencyScheduler) popIdleSessionCtxInstance(instanceID, sessionCtxID string) (*types.Instance, error) {
-	bcs.Lock()
-	defer bcs.Unlock()
-	for _, instanceQueue := range []queue.Queue{bcs.selfInstanceQueue, bcs.otherInstanceQueue} {
-		obj := instanceQueue.GetByID(instanceID)
-		insElem, ok := obj.(*instanceElement)
-		if !ok {
-			continue
-		}
-		if !bcs.matchesSessionCtx(insElem.instance, sessionCtxID) ||
-			len(insElem.threadMap) != insElem.instance.ConcurrentNum {
-			return nil, nil
-		}
-		if err := instanceQueue.DelByID(instanceID); err != nil {
-			return nil, err
-		}
-		bcs.leaseManager.HandleInstanceDelete(insElem.instance)
-		return insElem.instance, nil
-	}
-	return nil, nil
 }
 
 // SignalAllInstances sends signal to all instances

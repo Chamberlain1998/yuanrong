@@ -71,6 +71,19 @@ func (ir *InstanceRegistry) GetInstance(instanceID string) *types.Instance {
 	return instance
 }
 
+// ListInstances returns detached snapshots of all instances for funcKey.
+func (ir *InstanceRegistry) ListInstances(funcKey string) []*types.Instance {
+	ir.RLock()
+	defer ir.RUnlock()
+	result := make([]*types.Instance, 0)
+	for _, instance := range ir.InstanceIDMap {
+		if instance != nil && instance.FuncKey == funcKey {
+			result = append(result, instance.Copy())
+		}
+	}
+	return result
+}
+
 // GetFunctionInstanceIDMap -
 func (ir *InstanceRegistry) GetFunctionInstanceIDMap() map[string]map[string]*commonTypes.InstanceSpecification {
 	ir.Lock()

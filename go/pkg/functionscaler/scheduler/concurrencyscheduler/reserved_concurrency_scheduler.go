@@ -79,9 +79,6 @@ func (rcs *ReservedConcurrencyScheduler) AcquireInstance(insAcqReq *types.Instan
 		recordErr  error
 	)
 	insAlloc, acquireErr = rcs.basicConcurrencyScheduler.AcquireInstance(insAcqReq)
-	if rcs.funcSpec.ExtendedMetaData.EnableSessionCtx {
-		return insAlloc, acquireErr
-	}
 	if acquireErr != nil && acquireErr != scheduler.ErrNoInsAvailable {
 		return nil, acquireErr
 	}
@@ -195,29 +192,10 @@ func (rcs *ReservedConcurrencyScheduler) ConnectWithInstanceScaler(instanceScale
 		if !ok {
 			return
 		}
-		if !rcs.funcSpec.ExtendedMetaData.EnableSessionCtx {
-			instanceScaler.HandleInsThdUpdate(0, totalInsThdDiff)
-		}
+		instanceScaler.HandleInsThdUpdate(0, totalInsThdDiff)
 		rcs.insAcqReqQueue.HandleInsNumUpdate(totalInsThdDiff / rcs.concurrentNum)
 	})
 	return
-}
-
-// IsSessionCtxInstanceIdle reports whether all concurrency slots of the ctx instance are available.
-func (rcs *ReservedConcurrencyScheduler) IsSessionCtxInstanceIdle(instanceID, sessionCtxID string) bool {
-	return rcs.isSessionCtxInstanceIdle(instanceID, sessionCtxID)
-}
-
-// PopIdleSessionCtxInstance removes an idle ctx instance from scheduling.
-func (rcs *ReservedConcurrencyScheduler) PopIdleSessionCtxInstance(instanceID, sessionCtxID string) (*types.Instance, error) {
-	return rcs.popIdleSessionCtxInstance(instanceID, sessionCtxID)
-}
-
-// SetSessionCtxIdleHandler sets the callback invoked after a session ctx instance becomes idle.
-func (rcs *ReservedConcurrencyScheduler) SetSessionCtxIdleHandler(handler func(*types.Instance)) {
-	rcs.Lock()
-	rcs.sessionCtxIdleHandler = handler
-	rcs.Unlock()
 }
 
 // HandleFuncSpecUpdate handles funcSpec update comes from ETCD

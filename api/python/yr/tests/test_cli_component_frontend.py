@@ -18,6 +18,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 from yr.cli.component.base import ComponentLauncher
 from yr.cli.component.faas_frontend import FaaSFrontendLauncher
@@ -55,7 +56,11 @@ class TestFrontendInitArgsPatch(unittest.TestCase):
                     "auth": {"base_path": ""},
                 },
             },
-            name: {"args": {}},
+            name: {
+                "args": {},
+                "src_init_config_path": "/package/faas/init_frontend_args.json",
+                "env": {"INIT_ARGS_FILE_PATH": "/deploy/frontend_init_args.json"},
+            },
             "function_proxy": {"args": {"etcd_address": "127.0.0.1:2379"}},
         }
         resolver = SimpleNamespace(rendered_config=rendered_config)
@@ -83,6 +88,22 @@ class TestFrontendInitArgsPatch(unittest.TestCase):
             self.assertNotIn("{frontend_lease_bypass}", text)
             config = json.loads(text)
             self.assertFalse(config["leaseBypass"])
+
+    def assert_patches_complete_frontend_template(self, launcher_cls, name):
+        # Use a Bazel-owned fixture because the optional frontend submodule is not
+        # checked out in every runtime build. Keep this path inside runfiles.
+        template = Path(__file__).parent / "testdata/frontend_init_args_template.json"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dest = Path(tmpdir) / "init_frontend_args_temp.json"
+
+            self.make_launcher(launcher_cls, name).patch_init_frontend_args(
+                template, dest
+            )
+
+            rendered = dest.read_text()
+            self.assertNotRegex(rendered, r"\{[A-Za-z_][A-Za-z0-9_]*\}")
+            config = json.loads(rendered)
+            self.assertEqual(config["functionInvokeBackend"], 0)
 
     def test_frontend_launcher_sets_default_lease_bypass(self):
         self.assert_patches_frontend_lease_bypass(FrontendLauncher, "frontend")
@@ -115,6 +136,27 @@ class TestFrontendInitArgsPatch(unittest.TestCase):
                             overrides,
                             template_value,
                         )
+
+    def test_frontend_launcher_renders_complete_template(self):
+        self.assert_patches_complete_frontend_template(
+            FrontendLauncher, "frontend"
+        )
+
+    def test_frontend_launcher_reads_component_init_config_path(self):
+        launcher = self.make_launcher(FrontendLauncher, "frontend")
+
+        with mock.patch.object(launcher, "patch_init_frontend_args") as patch:
+            launcher.prestart_hook()
+
+        patch.assert_called_once_with(
+            "/package/faas/init_frontend_args.json",
+            Path("/deploy/frontend_init_args.json"),
+        )
+
+    def test_faas_frontend_launcher_renders_complete_template(self):
+        self.assert_patches_complete_frontend_template(
+            FaaSFrontendLauncher, "faas_frontend"
+        )
 
     def assert_frontend_security_config(
         self, launcher_cls, name, fs_tls_enable, overrides, template_value
@@ -170,7 +212,6 @@ class TestFrontendInitArgsPatch(unittest.TestCase):
             'bin_path = "{{ values.yr_package_path }}/runtime/service/go/bin/goruntime"',
             'ip = "{{ values.host_ip }}"',
             'port = "{{ 8888|check_port() }}"',
-            'config_path = "{{ values.yr_package_path }}/faas/init_frontend_args.json"',
         ):
             self.assertIn(expected, section)
         self.assertNotIn("\nssl_enable =", section)

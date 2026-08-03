@@ -67,6 +67,27 @@ func TestParseRequestAcquireWithoutSession(t *testing.T) {
 	})
 }
 
+func TestParseRequestAcquireWithSessionContext(t *testing.T) {
+	orig := config.GlobalConfig.LiteScheduler
+	defer func() { config.GlobalConfig.LiteScheduler = orig }()
+	config.GlobalConfig.LiteScheduler = types.LiteSchedulerConfig{Enable: true, EnableAllTenants: true}
+	extra, err := json.Marshal(map[string][]byte{"sessionCtxID": []byte("ctx-a")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ls := &LiteScheduler{funcSpecGetter: func(string) *types.FunctionSpecification {
+		return &types.FunctionSpecification{
+			ExtendedMetaData: commonTypes.ExtendedMetaData{EnableSessionCtx: true},
+		}
+	}}
+	req, ok := ls.ParseRequest("acquire", "t1/fA/v1", extra, "tr1")
+	convey.Convey("SessionContext without InstanceSession enters lite", t, func() {
+		convey.So(ok, convey.ShouldBeTrue)
+		convey.So(req.SessionCtxID, convey.ShouldEqual, "ctx-a")
+		convey.So(req.SessionID, convey.ShouldEqual, "")
+	})
+}
+
 func TestParseRequestReleaseLitePrefix(t *testing.T) {
 	orig := config.GlobalConfig.LiteScheduler
 	defer func() { config.GlobalConfig.LiteScheduler = orig }()

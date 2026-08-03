@@ -230,6 +230,16 @@ func (pm *PoolManager) DeleteInstance(instance *types.Instance) snerror.SNError 
 	return pool.DeleteInstance(instance)
 }
 
+// ListInstances returns a read-only snapshot of all observed instances for a function.
+// The registry is the authoritative all-instance view and includes instances created
+// by either the Kernel or FG backend.
+func (pm *PoolManager) ListInstances(funcKey string) []*types.Instance {
+	if registry.GlobalRegistry == nil || registry.GlobalRegistry.InstanceRegistry == nil {
+		return nil
+	}
+	return registry.GlobalRegistry.InstanceRegistry.ListInstances(funcKey)
+}
+
 // AcquireInstanceThread will acquire a instance thread of a specific function
 func (pm *PoolManager) AcquireInstanceThread(insAcqReq *types.InstanceAcquireRequest) (*types.InstanceAllocation,
 	snerror.SNError,

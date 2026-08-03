@@ -276,6 +276,7 @@ py_test(
     size = "small",
     srcs = ["test_cli_component_frontend.py"],
     tags = ["smoke"],
+    data = ["testdata/frontend_init_args_template.json"],
     imports = ["../../"],
     deps = ["//api/python:yr_lib"],
     env = SAN_ENV,

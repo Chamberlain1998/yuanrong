@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 class FrontendLauncher(ComponentLauncher):
     def prestart_hook(self) -> None:
         logger.info(f"{self.name}: prestart hook executing")
-        src = self.resolver.rendered_config["values"][self.name]["config_path"]
+        src = self.resolver.rendered_config[self.name]["src_init_config_path"]
         dest = Path(
             self.resolver.rendered_config[self.name]["env"]["INIT_ARGS_FILE_PATH"]
         ).resolve()

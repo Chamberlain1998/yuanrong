@@ -134,7 +134,6 @@ port = "{{ 58866|check_port() }}"
 bin_path = "{{ values.yr_package_path }}/runtime/service/go/bin/goruntime"
 ip = "{{ values.host_ip }}"
 port = "{{ 8888|check_port() }}"
-config_path = "{{ values.yr_package_path }}/faas/init_frontend_args.json"
 # sandboxRouter (rrt direct L7 reverse proxy). Enabled here so the full-feature
 # package's Test K8S exercises the akernel-sdk -> rrt direct path end to end.
 # (Production default is off; flip back to false to ship off-by-default.)
@@ -175,7 +174,6 @@ ssh_backend_public_key_dir = ""
 [values.function_scheduler]
 bin_path = "{{ values.yr_package_path }}/runtime/service/go/bin/goruntime"
 ip = "{{ values.host_ip }}"
-config_path = "{{ values.yr_package_path }}/faas/init_scheduler_args.json"
 lease_port = "{{ 8889|check_port() }}"
 
 [values.meta_service]

@@ -20,7 +20,6 @@ package instancepool
 import (
 	"context"
 	"fmt"
-	"hash/fnv"
 	"reflect"
 	"sync"
 	"time"
@@ -83,8 +82,6 @@ const (
 	base                         = 10
 	defaultDirectoryLimit        = 512
 	annotationFullFuncName       = "funcName"
-	sessionCtxCreateLockShards   = 32
-	defaultSessionCtxIdleTTL     = 5 * time.Second
 )
 
 var instanceQueueAcquireInstanceFunc = func(queue instancequeue.InstanceQueue,
@@ -240,9 +237,6 @@ type GenericInstancePool struct {
 	minScaleUpdatedTime   time.Time
 	pendingInstanceNum    map[string]int
 	minScaleAlarmSign     map[string]bool
-	sessionCtxIdleTimers  map[string]*time.Timer
-	sessionCtxIdleTTL     time.Duration
-	sessionCtxCreateLocks [sessionCtxCreateLockShards]sync.Mutex
 
 	synced bool
 	sync.RWMutex
@@ -291,8 +285,6 @@ func NewGenericInstancePool(funcSpec *types.FunctionSpecification, faasManagerIn
 		waitInsConfigChan:     make(chan struct{}),
 		pendingInstanceNum:    make(map[string]int),
 		minScaleAlarmSign:     make(map[string]bool),
-		sessionCtxIdleTimers:  make(map[string]*time.Timer),
-		sessionCtxIdleTTL:     defaultSessionCtxIdleTTL,
 	}
 	pool.stateRoute = StateRoute{
 		funcSpec:           funcSpec,
@@ -346,7 +338,6 @@ func (gi *GenericInstancePool) createInstanceQueue(instanceType types.InstanceTy
 		ResKey:             resKey,
 		MetricsCollector:   metricsCollector,
 		CreateInstanceFunc: gi.createInstance,
-		SessionCtxIdleFunc: gi.scheduleSessionCtxIdleTimer,
 		DeleteInstanceFunc: gi.deleteInstance,
 		SignalInstanceFunc: gi.handleSignal,
 	}
@@ -530,9 +521,6 @@ func (gi *GenericInstancePool) AcquireInstance(insAcqReq *types.InstanceAcquireR
 		}
 		gi.RUnlock()
 		logger = logger.With(zap.Any("resource", resKey))
-		if gi.FuncSpec.ExtendedMetaData.EnableSessionCtx {
-			return gi.acquireSessionCtxInstanceThread(resKey, insAcqReq, logger)
-		}
 		if len(insAcqReq.InstanceName) != 0 {
 			onDemandInstanceQueue, err := gi.acquireOnDemandInstanceQueue(resKey)
 			if err != nil {
@@ -561,64 +549,6 @@ func (gi *GenericInstancePool) AcquireInstance(insAcqReq *types.InstanceAcquireR
 		insAlloc, err = gi.acquireInstanceFromScaleQueueWithBackup(resKey, insAcqReq, logger)
 		return insAlloc, err
 	}
-}
-
-func getSessionCtxCreateLockIndex(resKey resspeckey.ResSpecKey, sessionCtxID string) int {
-	hash := fnv.New32a()
-	_, _ = hash.Write([]byte(resKey.String()))
-	_, _ = hash.Write([]byte{0})
-	_, _ = hash.Write([]byte(sessionCtxID))
-	return int(hash.Sum32() % sessionCtxCreateLockShards)
-}
-
-func acquireExistingSessionCtxInstanceThread(instanceQueue *instancequeue.ScaledInstanceQueue,
-	insAcqReq *types.InstanceAcquireRequest) (*types.InstanceAllocation, snerror.SNError) {
-	insAlloc, acquireErr := instanceQueue.AcquireInstance(insAcqReq)
-	if insAlloc != nil {
-		return insAlloc, nil
-	}
-	if acquireErr != nil && acquireErr.Code() != statuscode.NoInstanceAvailableErrCode &&
-		acquireErr.Code() != statuscode.InstanceNotFoundErrCode {
-		return nil, acquireErr
-	}
-	return nil, nil
-}
-
-func (gi *GenericInstancePool) acquireSessionCtxInstanceThread(resKey resspeckey.ResSpecKey,
-	insAcqReq *types.InstanceAcquireRequest, logger api.FormatLogger) (*types.InstanceAllocation, snerror.SNError) {
-	reservedInstanceQueue, err := gi.acquireReservedInstanceQueue(resKey)
-	if err != nil {
-		return nil, err
-	}
-	if insAlloc, acquireErr := acquireExistingSessionCtxInstanceThread(reservedInstanceQueue, insAcqReq); insAlloc != nil {
-		gi.cancelSessionCtxIdleTimer(insAlloc.Instance.InstanceID)
-		return insAlloc, nil
-	} else if acquireErr != nil {
-		return nil, acquireErr
-	}
-
-	createLock := &gi.sessionCtxCreateLocks[getSessionCtxCreateLockIndex(resKey, insAcqReq.SessionCtxID)]
-	createLock.Lock()
-	defer createLock.Unlock()
-	if insAlloc, acquireErr := acquireExistingSessionCtxInstanceThread(reservedInstanceQueue, insAcqReq); insAlloc != nil {
-		gi.cancelSessionCtxIdleTimer(insAlloc.Instance.InstanceID)
-		return insAlloc, nil
-	} else if acquireErr != nil {
-		return nil, acquireErr
-	}
-	instance, createErr := reservedInstanceQueue.CreateSessionCtxInstance(insAcqReq.TraceID,
-		insAcqReq.SessionCtxID)
-	if createErr != nil {
-		logger.Errorf("failed to create session context instance: %s", createErr.Error())
-		return nil, snerror.New(statuscode.StatusInternalServerError, createErr.Error())
-	}
-	gi.scheduleSessionCtxIdleTimer(instance)
-	insAlloc, acquireErr := reservedInstanceQueue.AcquireInstance(insAcqReq)
-	if insAlloc == nil {
-		return nil, acquireErr
-	}
-	gi.cancelSessionCtxIdleTimer(insAlloc.Instance.InstanceID)
-	return insAlloc, nil
 }
 
 func (gi *GenericInstancePool) acquireInstanceFromScaleQueueWithBackup(resKey resspeckey.ResSpecKey,
@@ -690,76 +620,8 @@ func (gi *GenericInstancePool) ReleaseInstance(insAlloc *types.InstanceAllocatio
 		log.GetLogger().Errorf("failed to release instance insAlloc %s error %s", insAlloc.AllocationID, err.Error())
 		return
 	}
-	if hasSessionCtxID(instance) {
-		gi.scheduleSessionCtxIdleTimer(instance)
-	}
 	log.GetLogger().Infof("released instance insAlloc %s of function %s resource %+v", insAlloc.AllocationID,
 		gi.FuncSpec.FuncKey, instance.ResKey)
-}
-
-func (gi *GenericInstancePool) cancelSessionCtxIdleTimer(instanceID string) {
-	gi.Lock()
-	if timer, ok := gi.sessionCtxIdleTimers[instanceID]; ok {
-		timer.Stop()
-		delete(gi.sessionCtxIdleTimers, instanceID)
-	}
-	gi.Unlock()
-}
-
-func (gi *GenericInstancePool) scheduleSessionCtxIdleTimer(instance *types.Instance) {
-	if !hasSessionCtxID(instance) || instance.InstanceType != types.InstanceTypeReserved {
-		return
-	}
-	gi.RLock()
-	instanceQueue := gi.reservedInstanceQueue[instance.ResKey]
-	funcCtx := gi.FuncSpec.FuncCtx
-	funcKey := gi.FuncSpec.FuncKey
-	gi.RUnlock()
-	if instanceQueue == nil || !instanceQueue.IsSessionCtxInstanceIdle(instance.InstanceID, *instance.SessionCtxID) {
-		return
-	}
-	gi.cancelSessionCtxIdleTimer(instance.InstanceID)
-	instanceID := instance.InstanceID
-	sessionCtxID := *instance.SessionCtxID
-	idleTTL := gi.sessionCtxIdleTTL
-	if idleTTL <= 0 {
-		idleTTL = defaultSessionCtxIdleTTL
-	}
-	gi.Lock()
-	var timer *time.Timer
-	timer = time.AfterFunc(idleTTL, func() {
-		// Keep the pool lock until the scheduler finishes the conditional pop. This makes the timer identity check and
-		// deletion one operation relative to acquire-side timer cancellation, so an expired timer cannot delete an
-		// instance from a newer idle period.
-		gi.Lock()
-		if gi.sessionCtxIdleTimers[instanceID] != timer {
-			gi.Unlock()
-			return
-		}
-		if funcCtx != nil {
-			select {
-			case <-funcCtx.Done():
-				delete(gi.sessionCtxIdleTimers, instanceID)
-				gi.Unlock()
-				return
-			default:
-			}
-		}
-		deleted := instanceQueue.DeleteIdleSessionCtxInstance(instanceID, sessionCtxID)
-		delete(gi.sessionCtxIdleTimers, instanceID)
-		gi.Unlock()
-		if deleted {
-			log.GetLogger().Infof("deleted idle session context instance %s of function %s", instanceID, funcKey)
-		}
-	})
-	gi.sessionCtxIdleTimers[instanceID] = timer
-	gi.Unlock()
-	log.GetLogger().Infof("scheduled idle session context instance %s cleanup for function %s after %s",
-		instanceID, funcKey, idleTTL)
-}
-
-func hasSessionCtxID(instance *types.Instance) bool {
-	return instance != nil && instance.SessionCtxID != nil && *instance.SessionCtxID != ""
 }
 
 // HandleFaaSManagerUpdate handles faas manager update
@@ -968,14 +830,6 @@ func (gi *GenericInstancePool) HandleInstanceEvent(eventType registry.EventType,
 		With(zap.Any("FuncKey", gi.FuncSpec.FuncKey)).
 		With(zap.Any("ResKey", instance.ResKey)).
 		With(zap.Any("InstanceID", instance.InstanceID)).With(zap.Any("eventType", eventType))
-	if eventType == registry.SubEventTypeUpdate &&
-		gi.FuncSpec.ExtendedMetaData.EnableSessionCtx && instance.SessionCtxID == nil &&
-		instance.InstanceStatus.Code == int32(constant.KernelInstanceStatusRunning) &&
-		(instance.InstanceType == types.InstanceTypeReserved || instance.InstanceType == types.InstanceTypeScaled) {
-		logger.Warnf("session context is enabled but instance has no session context ID, deleting instance")
-		go DeleteUnexpectInstance(instance.ParentID, instance.InstanceID, instance.FuncKey, logger)
-		return
-	}
 	// Reserved instance must have insConfig.
 	insConfResKey := gi.defaultResKey
 	insConfResKey.InvokeLabel = instance.ResKey.InvokeLabel
@@ -990,14 +844,9 @@ func (gi *GenericInstancePool) HandleInstanceEvent(eventType registry.EventType,
 	switch eventType {
 	case registry.SubEventTypeUpdate:
 		gi.handleInstanceUpdate(instance, logger)
-		if instance.SessionCtxID != nil {
-			gi.scheduleSessionCtxIdleTimer(instance)
-		}
 	case registry.SubEventTypeDelete:
-		gi.cancelSessionCtxIdleTimer(instance.InstanceID)
 		gi.handleInstanceDelete(instance, logger)
 	case registry.SubEventTypeRemove:
-		gi.cancelSessionCtxIdleTimer(instance.InstanceID)
 		gi.removeInstance(instance, logger)
 	default:
 		logger.Warnf("unsupported instance event type: %s", eventType)

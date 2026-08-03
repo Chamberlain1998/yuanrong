@@ -63,24 +63,25 @@ func (ls *LiteScheduler) handleAcquire(req *LiteRequest, startTime time.Time) *c
 		return liteErrResp(statuscode.FuncMetaNotFoundErrCode, statuscode.FuncMetaNotFoundErrMsg, startTime)
 	}
 	pool.Lock()
+	bindingKey := sessionBindingKey(req.SessionID, req.SessionCtxID)
 	// 1. session sticky
-	if binding, ok := pool.sessions[req.SessionID]; ok {
+	if binding, ok := pool.sessions[bindingKey]; req.SessionID != "" && ok {
 		instanceID := binding.instanceID
 		if slot := pool.instances[instanceID]; slot != nil &&
 			(slot.Status == InstanceStatusRunning || slot.Status == InstanceStatusSubHealth) &&
 			slot.InUse < slot.Capacity {
 			// Cancel any pending idle-unbind timer for this session.
-			pool.cancelSessionUnbind(req.SessionID)
+			pool.cancelSessionUnbind(bindingKey)
 			logger.Debugf("lite acquire session sticky hit: instance %s (inUse %d/%d)", instanceID, slot.InUse+1, slot.Capacity)
 			resp := ls.assignInstance(pool, req, slot, startTime)
 			pool.Unlock()
 			return resp
 		}
 		logger.Infof("lite acquire session sticky invalidated: instance %s absent/unhealthy/full, redispatch", instanceID)
-		pool.removeSessionBinding(req.SessionID)
+		pool.removeSessionBinding(bindingKey)
 	}
 	// 2. dispatch
-	slots := pool.candidateSlotsLocked()
+	slots := pool.candidateSlotsLocked(req.SessionCtxID)
 	chosen := pool.dispatcher.Select(slots)
 	if chosen != nil {
 		logger.Debugf("lite acquire dispatched: instance %s (inUse %d/%d, %d candidates)",
@@ -108,11 +109,14 @@ func (ls *LiteScheduler) assignInstance(pool *LiteFunctionPool, req *LiteRequest
 	// ++ is enough. atomic here would be misleading and is unnecessary.
 	pool.seqCounter++
 	seq := int(pool.seqCounter)
-	allocID := genAllocationID(req.SessionID, slot.InstanceID, seq)
+	allocID := genAllocationID(allocationSessionID(req.SessionID, req.SessionCtxID), slot.InstanceID, seq)
 	slot.InUse++
-	pool.bindSessionOnAcquire(req.SessionID, slot.InstanceID)
+	if req.SessionID != "" {
+		pool.bindSessionOnAcquire(sessionBindingKey(req.SessionID, req.SessionCtxID), slot.InstanceID)
+	}
 	alloc := &Allocation{
-		AllocationID: allocID, SessionID: req.SessionID, SessionTTL: req.SessionTTL,
+		AllocationID: allocID, SessionID: req.SessionID, SessionCtxID: req.SessionCtxID,
+		SessionTTL: req.SessionTTL,
 		TenantID:   req.TenantID,
 		InstanceID: slot.InstanceID, FuncKey: req.FuncKey,
 		ExpireAt: time.Now().Add(liteTTL()), CreatedAt: time.Now(),
@@ -169,9 +173,12 @@ func (ls *LiteScheduler) handleRelease(req *LiteRequest, startTime time.Time) *c
 			logCap = s.Capacity
 		}
 		// Decrement session's activeAllocs; if zero, mark for idle-unbind timer.
-		needUnbindTimer, _ = pool.unbindSessionOnRelease(alloc.SessionID)
-		if needUnbindTimer {
-			unbindSessionID = alloc.SessionID
+		if alloc.SessionID != "" {
+			needUnbindTimer, _ = pool.unbindSessionOnRelease(
+				sessionBindingKey(alloc.SessionID, alloc.SessionCtxID))
+			if needUnbindTimer {
+				unbindSessionID = sessionBindingKey(alloc.SessionID, alloc.SessionCtxID)
+			}
 		}
 		slot = pool.instances[alloc.InstanceID]
 		pool.Unlock()
@@ -351,12 +358,13 @@ func (ls *LiteScheduler) reacquireAllocation(req *LiteRequest, metrics *types.In
 		return liteErrResp(statuscode.LeaseIDIllegalCode, statuscode.LeaseIDIllegalMsg, startTime)
 	}
 	sessionID, sessionTTL, _ := extractSessionConfig(metrics.ReacquireData)
-	if sessionID == "" || sessionTTL < 0 {
-		logger.Warnf("lite retain reacquire session config is invalid: sessionID empty=%t, sessionTTL=%d",
-			sessionID == "", sessionTTL)
+	sessionCtxID := extractSessionCtxID(metrics.ReacquireData)
+	if (sessionID == "" && sessionCtxID == "") || sessionTTL < 0 {
+		logger.Warnf("lite retain reacquire session config is invalid: session and context empty=%t, sessionTTL=%d",
+			sessionID == "" && sessionCtxID == "", sessionTTL)
 		return liteErrResp(statuscode.InstanceSessionInvalidErrCode, "session config invalid", startTime)
 	}
-	if sessionHash(sessionID) != expectedSessionHash {
+	if sessionHash(allocationSessionID(sessionID, sessionCtxID)) != expectedSessionHash {
 		logger.Warnf("lite retain reacquire session hash does not match allocation ID")
 		return liteErrResp(statuscode.LeaseIDIllegalCode, statuscode.LeaseIDIllegalMsg, startTime)
 	}
@@ -367,7 +375,11 @@ func (ls *LiteScheduler) reacquireAllocation(req *LiteRequest, metrics *types.In
 	}
 	tenantID := splitFuncKey(funcKey).tenantID
 	if ls.ownerProxy != nil {
-		ownerID, owned := ls.ownerProxy.CheckHashOwner(tenantID + "/" + sessionID)
+		routingID := sessionID
+		if sessionCtxID != "" {
+			routingID = funcKey + "/" + sessionCtxID
+		}
+		ownerID, owned := ls.ownerProxy.CheckHashOwner(tenantID + "/" + routingID)
 		if !owned {
 			logger.Warnf("lite retain reacquire is not session owner, reroute to %s", ownerID)
 			// Keep ErrorMessage as the raw InstanceID. The frontend consumes it
@@ -394,7 +406,8 @@ func (ls *LiteScheduler) reacquireAllocation(req *LiteRequest, metrics *types.In
 		return liteErrResp(statuscode.InstanceStatusAbnormalCode,
 			constant.LeaseErrorInstanceIsAbnormalMessage, startTime)
 	}
-	if binding, ok := pool.sessions[sessionID]; ok && binding.instanceID != instanceID {
+	bindingKey := sessionBindingKey(sessionID, sessionCtxID)
+	if binding, ok := pool.sessions[bindingKey]; sessionID != "" && ok && binding.instanceID != instanceID {
 		pool.Unlock()
 		logger.Warnf("lite retain reacquire session is already bound to instance %s, requested %s",
 			binding.instanceID, instanceID)
@@ -423,6 +436,7 @@ func (ls *LiteScheduler) reacquireAllocation(req *LiteRequest, metrics *types.In
 	alloc = &Allocation{
 		AllocationID: allocID,
 		SessionID:    sessionID,
+		SessionCtxID: sessionCtxID,
 		SessionTTL:   sessionTTL,
 		TenantID:     tenantID,
 		InstanceID:   instanceID,
@@ -432,7 +446,9 @@ func (ls *LiteScheduler) reacquireAllocation(req *LiteRequest, metrics *types.In
 	}
 	ls.allocations[allocID] = alloc
 	slot.InUse++
-	pool.bindSessionOnAcquire(sessionID, instanceID)
+	if sessionID != "" {
+		pool.bindSessionOnAcquire(bindingKey, instanceID)
+	}
 	overCapacity := slot.InUse > slot.Capacity
 	newInUse := slot.InUse
 	capacity := slot.Capacity
@@ -550,10 +566,11 @@ func (ls *LiteScheduler) handleColdStart(pool *LiteFunctionPool, req *LiteReques
 	if ls.scaleHintSender != nil {
 		logger.Infof("lite cold start: emit scale hint (inUse %d, capacity %d)",
 			pool.currentInUse(), pool.currentCapacity())
-		ls.scaleHintSender.Send(&ScaleHint{
+		response, sendErr := ls.scaleHintSender.Send(&ScaleHint{
 			FuncKey:                 req.FuncKey,
 			TenantID:                req.TenantID,
 			SessionID:               req.SessionID,
+			SessionCtxID:            req.SessionCtxID,
 			Reason:                  "cold_start",
 			RequestedConcurrency:    1,
 			CurrentLocalConcurrency: pool.currentInUse(),
@@ -562,6 +579,12 @@ func (ls *LiteScheduler) handleColdStart(pool *LiteFunctionPool, req *LiteReques
 			TraceID:                 req.TraceID,
 			RequestID:               req.TraceID,
 		})
+		if sendErr != nil {
+			logger.Warnf("lite cold start: scale hint failed: %v", sendErr)
+		}
+		if response != nil && response.ErrorCode != 0 {
+			return liteErrResp(response.ErrorCode, response.ErrorMessage, startTime)
+		}
 	} else {
 		logger.Warnf("lite cold start: scaleHintSender is nil, cannot request scale-up")
 	}
@@ -588,7 +611,7 @@ func (ls *LiteScheduler) waitForInstance(pool *LiteFunctionPool, req *LiteReques
 	defer ticker.Stop()
 	for {
 		pool.Lock()
-		chosen := pool.dispatcher.Select(pool.candidateSlotsLocked())
+		chosen := pool.dispatcher.Select(pool.candidateSlotsLocked(req.SessionCtxID))
 		if chosen != nil {
 			logger.Debugf("lite waitForInstance: slot appeared, instance %s", chosen.InstanceID)
 			resp := ls.assignInstance(pool, req, chosen, startTime)

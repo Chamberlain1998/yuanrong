@@ -55,6 +55,9 @@ type LiteInstance struct {
 	FunctionProxyID string
 	RouteAddress    string
 	AZ              string
+	SessionCtxID    string
+	IdleSince       time.Time
+	Reclaiming      bool
 }
 
 // sessionBinding tracks a session's binding to an instance plus the idle-unbind
@@ -128,18 +131,35 @@ func buildLiteInstanceFromInstance(ins *types.Instance) *LiteInstance {
 		FunctionProxyID: ins.FunctionProxyID,
 		RouteAddress:    ins.RouteAddress,
 		AZ:              ins.AZ,
+		SessionCtxID:    instanceSessionCtxID(ins),
 	}
 }
 
 // candidateSlotsLocked returns schedulable instances; caller must hold pool.Lock.
-func (p *LiteFunctionPool) candidateSlotsLocked() []*LiteInstance {
+func (p *LiteFunctionPool) candidateSlotsLocked(sessionCtxID string) []*LiteInstance {
 	out := make([]*LiteInstance, 0, len(p.instances))
 	for _, ins := range p.instances {
-		if (ins.Status == InstanceStatusRunning || ins.Status == InstanceStatusSubHealth) && ins.InUse < ins.Capacity {
+		if ins.SessionCtxID == sessionCtxID && !ins.Reclaiming &&
+			(ins.Status == InstanceStatusRunning || ins.Status == InstanceStatusSubHealth) &&
+			ins.InUse < ins.Capacity {
 			out = append(out, ins)
 		}
 	}
 	return out
+}
+
+func instanceSessionCtxID(ins *types.Instance) string {
+	if ins == nil || ins.SessionCtxID == nil {
+		return ""
+	}
+	return *ins.SessionCtxID
+}
+
+func sessionBindingKey(sessionID, sessionCtxID string) string {
+	if sessionCtxID == "" {
+		return sessionID
+	}
+	return types.JoinKey(sessionID, sessionCtxID)
 }
 
 // currentInUse returns the sum of InUse over all instances. It takes pool.RLock itself,

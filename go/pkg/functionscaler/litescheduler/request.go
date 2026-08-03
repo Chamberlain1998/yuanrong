@@ -37,6 +37,7 @@ type LiteRequest struct {
 	FuncKey           string
 	TenantID          string
 	SessionID         string
+	SessionCtxID      string
 	SessionTTL        int // seconds; 0 means use default
 	Concurrency       int
 	AllocationIDs     []string
@@ -71,16 +72,22 @@ func (ls *LiteScheduler) ParseRequest(op InstanceOperation, targetName string,
 	switch op {
 	case "acquire":
 		sessionID, sessionTTL, concurrency := extractSessionConfig(extraData)
-		if sessionID == "" {
-			return nil, false // 4d: non-session call chain -> legacy
-		}
 		funcKey := targetName
 		if !ls.isFuncEnabled(funcKey) {
 			return nil, false // 3: whitelist
 		}
+		sessionCtxID := extractSessionCtxID(extraData)
+		sessionCtxEnabled := false
+		if sessionCtxID != "" && ls.funcSpecGetter != nil {
+			funcSpec := ls.funcSpecGetter(funcKey)
+			sessionCtxEnabled = funcSpec != nil && funcSpec.ExtendedMetaData.EnableSessionCtx
+		}
+		if sessionID == "" && !sessionCtxEnabled {
+			return nil, false // non-session call chain -> legacy
+		}
 		logger.Debugf("lite parseRequest acquire enters lite branch: funcKey %s", funcKey)
 		return &LiteRequest{
-			Op: op, FuncKey: funcKey, SessionID: sessionID,
+			Op: op, FuncKey: funcKey, SessionID: sessionID, SessionCtxID: sessionCtxID,
 			SessionTTL:  sessionTTL,
 			Concurrency: concurrency,
 			TenantID:    splitFuncKey(funcKey).tenantID,
@@ -119,6 +126,17 @@ func (ls *LiteScheduler) ParseRequest(op InstanceOperation, targetName string,
 		}, true
 	}
 	return nil, false
+}
+
+func extractSessionCtxID(extraData []byte) string {
+	if len(extraData) == 0 {
+		return ""
+	}
+	m := map[string][]byte{}
+	if err := json.Unmarshal(extraData, &m); err != nil {
+		return ""
+	}
+	return string(m[constant.SessionCtxID])
 }
 
 // extractSessionConfig parses extraData for InstanceSessionConfig (key constant.InstanceSessionConfig).

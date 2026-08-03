@@ -206,3 +206,20 @@ func Test_ParseDsKey(t *testing.T) {
 	assert.Equal(t, ip, "")
 	assert.Equal(t, az, "")
 }
+
+func Test_ParseDsValue(t *testing.T) {
+	timestamp, status, err := parseDsValue("1748573798753243935;ready")
+	assert.NoError(t, err)
+	assert.Equal(t, "1748573798753243935", timestamp)
+	assert.Equal(t, "ready", status)
+
+	timestamp, status, err = parseDsValue("1748573798753243935;ready;;1.0.0")
+	assert.NoError(t, err)
+	assert.Equal(t, "1748573798753243935", timestamp)
+	assert.Equal(t, "ready", status)
+
+	timestamp, status, err = parseDsValue("1748573798753243935ready")
+	assert.Error(t, err)
+	assert.Empty(t, timestamp)
+	assert.Empty(t, status)
+}

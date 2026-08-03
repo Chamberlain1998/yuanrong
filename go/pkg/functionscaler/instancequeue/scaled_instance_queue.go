@@ -73,7 +73,6 @@ type ScaledInstanceQueue struct {
 	isFuncOwner        bool
 	stopCh             chan struct{}
 	createInstanceFunc CreateInstanceFunc
-	sessionCtxIdleFunc SessionCtxIdleFunc
 	deleteInstanceFunc DeleteInstanceFunc
 	signalInstanceFunc SignalInstanceFunc
 	*sync.Cond
@@ -95,7 +94,6 @@ func NewScaledInstanceQueue(config *InsQueConfig, metricsCollector metrics.Colle
 		concurrentNum:      utils.GetConcurrentNum(funcSpec.InstanceMetaData.ConcurrentNum),
 		stopCh:             make(chan struct{}),
 		createInstanceFunc: config.CreateInstanceFunc,
-		sessionCtxIdleFunc: config.SessionCtxIdleFunc,
 		deleteInstanceFunc: config.DeleteInstanceFunc,
 		signalInstanceFunc: config.SignalInstanceFunc,
 		Cond:               sync.NewCond(&sync.Mutex{}),
@@ -115,9 +113,6 @@ func DisableCreateRetry() {
 // SetInstanceScheduler sets instanceScheduler
 func (si *ScaledInstanceQueue) SetInstanceScheduler(instanceScheduler scheduler.InstanceScheduler) {
 	si.instanceScheduler = instanceScheduler
-	if schedulerWithIdleHandler, ok := instanceScheduler.(SessionCtxIdleHandlerSetter); ok {
-		schedulerWithIdleHandler.SetSessionCtxIdleHandler(si.sessionCtxIdleFunc)
-	}
 }
 
 // GetInstanceScheduler return queue's isntance scheduler
@@ -232,7 +227,7 @@ func (si *ScaledInstanceQueue) HandleFuncSpecUpdate(funcSpec *types.FunctionSpec
 		si.instanceScheduler.HandleFuncSpecUpdate(funcSpec)
 		si.instanceScaler.HandleFuncSpecUpdate(funcSpec)
 		// if unrecoverable createError happens, instanceScaler may stop, try again since function is updated
-		si.instanceScaler.SetEnable(si.isFuncOwner && !si.usesSessionCtxManualScale())
+		si.instanceScaler.SetEnable(si.isFuncOwner)
 		si.Cond.L.Lock()
 		si.updating = false
 		si.Cond.L.Unlock()
@@ -260,13 +255,7 @@ func (si *ScaledInstanceQueue) EnableInstanceScale() {
 	si.L.Lock()
 	isFuncOwner := si.isFuncOwner
 	si.L.Unlock()
-	si.instanceScaler.SetEnable(isFuncOwner && !si.usesSessionCtxManualScale())
-}
-
-func (si *ScaledInstanceQueue) usesSessionCtxManualScale() bool {
-	si.Cond.L.Lock()
-	defer si.Cond.L.Unlock()
-	return si.instanceType == types.InstanceTypeReserved && si.funcSpec.ExtendedMetaData.EnableSessionCtx
+	si.instanceScaler.SetEnable(isFuncOwner)
 }
 
 // HandleFaultyInstance will remove a faulty instance
@@ -471,67 +460,6 @@ func (si *ScaledInstanceQueue) createInstance(createReq *InstanceCreateRequest) 
 	return instance, createErr
 }
 
-// CreateSessionCtxInstance creates and registers a reserved instance bound to a session context.
-func (si *ScaledInstanceQueue) CreateSessionCtxInstance(traceID, sessionCtxID string) (*types.Instance, error) {
-	if si.createInstanceFunc == nil {
-		return nil, fmt.Errorf("instance creator is not configured")
-	}
-	si.Cond.L.Lock()
-	functionSignature := si.funcSig
-	si.Cond.L.Unlock()
-	instance, createErr := si.createInstanceFunc(traceID, "", si.instanceType, si.resKey, nil, "", &sessionCtxID)
-	if createErr == nil && instance == nil {
-		createErr = fmt.Errorf("created session context instance is nil")
-	}
-	select {
-	case <-si.funcCtx.Done():
-		createErr = ErrFunctionDeleted
-	default:
-		si.Cond.L.Lock()
-		checkFunctionSignature := si.funcSig
-		si.Cond.L.Unlock()
-		if functionSignature != checkFunctionSignature {
-			createErr = ErrFuncSigMismatch
-		}
-	}
-	if createErr != nil {
-		if instance != nil {
-			go si.deleteInstance(instance)
-		}
-		return nil, createErr
-	}
-	if err := si.instanceScheduler.AddInstance(instance); err != nil && err != scheduler.ErrInsAlreadyExist {
-		go si.deleteInstance(instance)
-		return nil, err
-	}
-	return instance, nil
-}
-
-// IsSessionCtxInstanceIdle reports whether a ctx instance has no active leases.
-func (si *ScaledInstanceQueue) IsSessionCtxInstanceIdle(instanceID, sessionCtxID string) bool {
-	sessionCtxScheduler, ok := si.instanceScheduler.(SessionCtxIdleScheduler)
-	return ok && sessionCtxScheduler.IsSessionCtxInstanceIdle(instanceID, sessionCtxID)
-}
-
-// DeleteIdleSessionCtxInstance removes and deletes a ctx instance if it is still fully idle.
-func (si *ScaledInstanceQueue) DeleteIdleSessionCtxInstance(instanceID, sessionCtxID string) bool {
-	sessionCtxScheduler, ok := si.instanceScheduler.(SessionCtxIdleScheduler)
-	if !ok {
-		return false
-	}
-	instance, err := sessionCtxScheduler.PopIdleSessionCtxInstance(instanceID, sessionCtxID)
-	if err != nil {
-		log.GetLogger().Errorf("failed to pop idle session context instance %s for function %s error %s",
-			instanceID, si.funcKeyWithRes, err.Error())
-		return false
-	}
-	if instance == nil {
-		return false
-	}
-	go si.deleteInstance(instance)
-	return true
-}
-
 // ScaleDownHandler handles instance scale down planed by instanceScaler, consider to handle delete retry in future
 func (si *ScaledInstanceQueue) ScaleDownHandler(insNum int, callback scaler.ScaleDownCallback) {
 	for i := 0; i < insNum; i++ {
@@ -608,7 +536,7 @@ func (si *ScaledInstanceQueue) HandleFuncOwnerChange(fn utils.RecoverSessionCall
 	si.instanceScaler.SetEnable(false)
 	// reassign in instanceScheduler first then reset instanceScaler
 	si.instanceScheduler.HandleFuncOwnerUpdate(isFuncOwner)
-	si.instanceScaler.SetEnable(isFuncOwner && !si.usesSessionCtxManualScale())
+	si.instanceScaler.SetEnable(isFuncOwner)
 	// after owner change, need recover session info from datasystem
 	if isFuncOwner {
 		si.HandleInstanceSync(fn)
