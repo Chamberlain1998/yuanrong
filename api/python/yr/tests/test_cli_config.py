@@ -171,6 +171,79 @@ class TestCliConfig(unittest.TestCase):
                     value,
                 )
 
+    def test_local_ip_defaults_to_host_ip_for_backward_compatibility(self):
+        config = self._resolve_real_config('[values]\nhost_ip = "192.0.2.10"\n')
+
+        self._assert_dual_address_config(
+            config,
+            host_ip="192.0.2.10",
+            local_ip="192.0.2.10",
+        )
+
+    def test_local_ip_routes_runtime_traffic_over_local_bridge(self):
+        config = self._resolve_real_config(
+            '[values]\nhost_ip = "192.0.2.10"\n',
+            ('values.local_ip="172.17.0.1"',),
+        )
+
+        self._assert_dual_address_config(
+            config,
+            host_ip="192.0.2.10",
+            local_ip="172.17.0.1",
+        )
+
+    def _resolve_real_config(self, config_text, overrides=None):
+        self.config_path.write_text(config_text)
+        cli_dir = Path(__file__).resolve().parents[1] / "cli"
+        return FixedRuntimeConfigResolver(
+            self.config_path,
+            cli_dir,
+            overrides=overrides,
+            port_policy="FIX",
+        ).rendered_config
+
+    def _assert_dual_address_config(self, config, host_ip, local_ip):
+        values = config["values"]
+        proxy = config["function_proxy"]
+        agent = config["function_agent"]
+        proxy_port = values["function_proxy"]["port"]
+        proxy_grpc_port = values["function_proxy"]["grpc_listen_port"]
+        agent_port = values["function_agent"]["port"]
+
+        self.assertEqual(values["local_ip"], local_ip)
+        self.assertEqual(proxy["args"]["address"], f"{host_ip}:{proxy_port}")
+        self.assertEqual(proxy["args"]["ip"], local_ip)
+        self.assertEqual(
+            proxy["args"]["local_scheduler_address"],
+            f"{host_ip}:{proxy_port}",
+        )
+        self.assertEqual(proxy["args"]["proxy_ip"], local_ip)
+        self.assertEqual(proxy["args"]["host_ip"], host_ip)
+        self.assertEqual(proxy["args"]["agent_address"], f"{host_ip}:{proxy_port}")
+        self.assertEqual(proxy["env"]["LOCAL_IP"], local_ip)
+        self.assertEqual(proxy["env"]["HOST_IP"], host_ip)
+
+        self.assertEqual(agent["args"]["ip"], host_ip)
+        self.assertEqual(
+            agent["args"]["local_scheduler_address"],
+            f"{host_ip}:{proxy_port}",
+        )
+        self.assertEqual(agent["args"]["proxy_ip"], local_ip)
+        self.assertEqual(agent["args"]["host_ip"], host_ip)
+        self.assertEqual(agent["args"]["agent_address"], f"{host_ip}:{agent_port}")
+        self.assertEqual(agent["env"]["LOCAL_IP"], local_ip)
+        self.assertEqual(agent["env"]["HOST_IP"], host_ip)
+
+        function_system_address = f"{local_ip}:{proxy_grpc_port}"
+        self.assertEqual(
+            config["function_scheduler"]["args"]["functionSystemAddress"],
+            function_system_address,
+        )
+        self.assertEqual(
+            config["frontend"]["args"]["functionSystemAddress"],
+            function_system_address,
+        )
+
     def _write_default_templates(self, port):
         (self.cli_dir / "values.toml").write_text(
             f'[values]\ndeploy_path = "/tmp/yr-test-session"\n'
