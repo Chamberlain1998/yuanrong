@@ -19,10 +19,12 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <thread>
 
 #include "absl/synchronization/notification.h"
 #include "agent_session_manager.h"
@@ -54,6 +56,10 @@ const static std::string DEFAULT_FUNCTION_LIB_PATH = "/dcache/layer/func";
 const static std::string HETERO_NAME = "device";
 const static int SCHEDULER_DATA_INDEX = 2;
 const static int CONCURRENCY_RATE = 2;
+const static int GET_INSTANCE_INITIAL_RETRY_INTERVAL_MS = 10;
+const static int GET_INSTANCE_MAX_RETRY_INTERVAL_MS = 1000;
+const static int GET_INSTANCE_RETRY_BACKOFF_MULTIPLIER = 2;
+const static int GET_INSTANCE_MIN_REQUEST_TIMEOUT_SEC = 1;
 
 namespace {
 bool IsTruthyEnv(const char *value)
@@ -2400,40 +2406,143 @@ std::string InvokeAdaptor::BuildInstanceLookupId(const std::string &name, const 
     return name;
 }
 
-std::pair<libruntime::FunctionMeta, ErrorInfo> InvokeAdaptor::QueryInstanceMeta(const std::string &insId,
-                                                                                int timeoutSec)
+namespace {
+using QueryInstanceResult = std::pair<libruntime::FunctionMeta, ErrorInfo>;
+using QueryInstanceFuture = std::future<QueryInstanceResult>;
+using SteadyClockTimePoint = std::chrono::steady_clock::time_point;
+
+QueryInstanceResult ParseQueryInstanceResponse(const std::string &insId, const KillResponse &response,
+                                               const ErrorInfo &err)
+{
+    if (response.code() != common::ERR_NONE) {
+        YRLOG_DEBUG("get instance failed, instance id is {}, errcode is {}, err msg is {}", insId,
+                    fmt::underlying(response.code()), response.message());
+        ErrorInfo errorInfo(static_cast<ErrorCode>(response.code()), ModuleCode::RUNTIME, response.message());
+        errorInfo.SetIsTimeout(err.IsTimeout());
+        return {libruntime::FunctionMeta{}, errorInfo};
+    }
+
+    libruntime::FunctionMeta funcMeta;
+    if (auto status = google::protobuf::util::JsonStringToMessage(response.message(), &funcMeta); !status.ok()) {
+        YRLOG_WARN("Failed to serialize function meta to json string, error message: {}", status.message());
+    }
+    return {funcMeta, ErrorInfo()};
+}
+
+QueryInstanceFuture SendQueryInstanceRequest(const std::shared_ptr<FSClient> &fsClient, const std::string &insId,
+                                             int timeoutSec)
 {
     KillRequest killReq;
     killReq.set_requestid(YR::utility::IDGenerator::GenRequestId());
     killReq.set_instanceid(insId);
     killReq.set_signal(libruntime::Signal::GetInstance);
-    auto promise = std::promise<std::pair<libruntime::FunctionMeta, ErrorInfo>>();
-    auto future = promise.get_future();
-    this->invokeOrderMgr->RegisterInstanceAndUpdateOrder(insId);
-    this->fsClient->KillAsync(
+    auto promise = std::make_shared<std::promise<QueryInstanceResult>>();
+    auto future = promise->get_future();
+    fsClient->KillAsync(
         killReq,
-        [insId, &promise](const KillResponse &response, const ErrorInfo &err) -> void {
-            if (response.code() != common::ERR_NONE) {
-                YRLOG_DEBUG("get instance failed, instance id is {}, errcode is {}, err msg is {}", insId,
-                            fmt::underlying(response.code()), response.message());
-                YR::Libruntime::ErrorInfo errInfo(static_cast<ErrorCode>(response.code()), ModuleCode::RUNTIME,
-                                                  response.message());
-                errInfo.SetIsTimeout(err.IsTimeout());
-                promise.set_value(std::make_pair(libruntime::FunctionMeta{}, errInfo));
-            } else {
-                libruntime::FunctionMeta funcMeta;
-                if (auto status = google::protobuf::util::JsonStringToMessage(response.message(), &funcMeta);
-                    !status.ok()) {
-                    YRLOG_WARN("Failed to serialize function meta to json string, error message: {}", status.message());
-                }
-                promise.set_value(std::make_pair(funcMeta, YR::Libruntime::ErrorInfo()));
-            }
+        [insId, promise](const KillResponse &response, const ErrorInfo &err) {
+            promise->set_value(ParseQueryInstanceResponse(insId, response, err));
         },
         timeoutSec);
-    auto [funcMeta, errorInfo] = future.get();
-    YRLOG_DEBUG("get instance finished, err code is {}, err msg is {}, function meta is {}",
-                fmt::underlying(errorInfo.Code()), errorInfo.Msg(), funcMeta.DebugString());
-    return {funcMeta, errorInfo};
+    return future;
+}
+
+void LogQueryInstanceResult(const QueryInstanceResult &result, size_t attempt)
+{
+    YRLOG_DEBUG("get instance attempt {} finished, err code is {}, err msg is {}, function meta is {}", attempt,
+                fmt::underlying(result.second.Code()), result.second.Msg(), result.first.DebugString());
+}
+
+int GetRemainingQueryTimeoutSec(const SteadyClockTimePoint &deadline)
+{
+    const auto remaining = deadline - std::chrono::steady_clock::now();
+    const auto remainingSeconds = std::chrono::duration_cast<std::chrono::seconds>(remaining);
+    int timeoutSec = static_cast<int>(remainingSeconds.count());
+    if (remaining > remainingSeconds) {
+        ++timeoutSec;
+    }
+    return std::max(timeoutSec, GET_INSTANCE_MIN_REQUEST_TIMEOUT_SEC);
+}
+
+QueryInstanceResult QueryInstanceOnce(const std::shared_ptr<FSClient> &fsClient, const std::string &insId,
+                                      int timeoutSec)
+{
+    auto result = SendQueryInstanceRequest(fsClient, insId, timeoutSec).get();
+    LogQueryInstanceResult(result, 1);
+    return result;
+}
+
+QueryInstanceResult QueryInstanceBeforeDeadline(const std::shared_ptr<FSClient> &fsClient, const std::string &insId,
+                                                const SteadyClockTimePoint &deadline, size_t attempt)
+{
+    auto future = SendQueryInstanceRequest(fsClient, insId, GetRemainingQueryTimeoutSec(deadline));
+    if (future.wait_until(deadline) == std::future_status::timeout) {
+        ErrorInfo error(ErrorCode::ERR_GET_OPERATION_FAILED, ModuleCode::RUNTIME,
+                        "get instance timeout, instance id: " + insId);
+        error.SetIsTimeout(true);
+        return {libruntime::FunctionMeta{}, error};
+    }
+    auto result = future.get();
+    LogQueryInstanceResult(result, attempt);
+    return result;
+}
+
+QueryInstanceResult MarkQueryInstanceTimedOut(QueryInstanceResult result, const std::string &insId, int timeoutSec,
+                                              size_t attempts)
+{
+    result.second.SetIsTimeout(true);
+    YRLOG_WARN("get instance timed out after {} seconds, instance id is {}, attempts: {}, last error: {}", timeoutSec,
+               insId, attempts, result.second.CodeAndMsg());
+    return result;
+}
+
+bool BackoffBeforeQueryInstanceRetry(const std::string &insId, const ErrorInfo &error,
+                                     const SteadyClockTimePoint &deadline, size_t attempt,
+                                     std::chrono::milliseconds &retryInterval)
+{
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) {
+        return false;
+    }
+    const auto sleepDuration = std::min(
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(retryInterval), deadline - now);
+    YRLOG_DEBUG("get instance will retry, instance id is {}, attempt: {}, backoff: {} ms, last error code: {}", insId,
+                attempt, std::chrono::duration_cast<std::chrono::milliseconds>(sleepDuration).count(),
+                fmt::underlying(error.Code()));
+    std::this_thread::sleep_for(sleepDuration);
+    retryInterval = std::min(retryInterval * GET_INSTANCE_RETRY_BACKOFF_MULTIPLIER,
+                             std::chrono::milliseconds(GET_INSTANCE_MAX_RETRY_INTERVAL_MS));
+    return std::chrono::steady_clock::now() < deadline;
+}
+
+QueryInstanceResult QueryInstanceWithRetry(const std::shared_ptr<FSClient> &fsClient, const std::string &insId,
+                                           int timeoutSec)
+{
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeoutSec);
+    auto retryInterval = std::chrono::milliseconds(GET_INSTANCE_INITIAL_RETRY_INTERVAL_MS);
+    for (size_t attempt = 1; std::chrono::steady_clock::now() < deadline; ++attempt) {
+        auto result = QueryInstanceBeforeDeadline(fsClient, insId, deadline, attempt);
+        if (result.second.Code() != ErrorCode::ERR_INSTANCE_NOT_FOUND) {
+            return result;
+        }
+        if (!BackoffBeforeQueryInstanceRetry(insId, result.second, deadline, attempt, retryInterval)) {
+            return MarkQueryInstanceTimedOut(std::move(result), insId, timeoutSec, attempt);
+        }
+    }
+    ErrorInfo error(ErrorCode::ERR_GET_OPERATION_FAILED, ModuleCode::RUNTIME,
+                    "get instance timeout, instance id: " + insId);
+    return MarkQueryInstanceTimedOut({libruntime::FunctionMeta{}, error}, insId, timeoutSec, 0);
+}
+}  // namespace
+
+std::pair<libruntime::FunctionMeta, ErrorInfo> InvokeAdaptor::QueryInstanceMeta(const std::string &insId,
+                                                                                int timeoutSec)
+{
+    this->invokeOrderMgr->RegisterInstanceAndUpdateOrder(insId);
+    if (timeoutSec <= 0) {
+        return QueryInstanceOnce(this->fsClient, insId, timeoutSec);
+    }
+    return QueryInstanceWithRetry(this->fsClient, insId, timeoutSec);
 }
 
 void InvokeAdaptor::UpdateGetInstanceResult(const std::string &insId, libruntime::FunctionMeta &funcMeta,
