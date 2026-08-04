@@ -539,6 +539,9 @@ bool RequestResource::operator==(const RequestResource &r) const
             return false;
         }
     }
+    if (opts.sessionCtxId != r.opts.sessionCtxId) {
+        return false;
+    }
     if (r.opts.invokeLabels.size() != opts.invokeLabels.size()) {
         return false;
     }
@@ -622,6 +625,7 @@ std::size_t HashFn::operator()(const RequestResource &r) const
         std::size_t h11 = std::hash<int>()(r.opts.instanceSession->sessionTTL);
         result = result ^ h10 ^ h11;
     }
+    result = result ^ std::hash<std::string>()(r.opts.sessionCtxId);
     for (const auto &envPair : r.opts.envVars) {
         std::size_t h12 = std::hash<std::string>()(envPair.first);
         std::size_t h13 = std::hash<std::string>()(envPair.second);

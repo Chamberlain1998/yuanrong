@@ -76,6 +76,16 @@ type LiteScheduler struct {
 	expiryWheel timewheel.TimeWheel
 }
 
+func schedulerOwnerKey(tenantID, funcKey, sessionID, sessionCtxID string) string {
+	if sessionCtxID != "" {
+		return tenantID + "/" + funcKey + "/" + sessionCtxID
+	}
+	if sessionID != "" {
+		return tenantID + "/" + sessionID
+	}
+	return funcKey
+}
+
 // New constructs a LiteScheduler with injected dependencies. It does NOT snapshot
 // config: isFuncEnabled reads config.GlobalConfig.LiteScheduler live, which today is
 // loaded once at startup (no runtime hot-load path yet). The live-read is a forward
@@ -206,11 +216,8 @@ func (ls *LiteScheduler) Process(req *LiteRequest, traceID, traceParent string,
 	}
 	// owner check (acquire only; release/retain skip per spec)
 	if req.Op == "acquire" && ls.ownerProxy != nil {
-		routingID := req.SessionID
-		if req.SessionCtxID != "" {
-			routingID = req.FuncKey + "/" + req.SessionCtxID
-		}
-		ownerID, owned := ls.ownerProxy.CheckHashOwner(req.TenantID + "/" + routingID)
+		ownerID, owned := ls.ownerProxy.CheckHashOwner(
+			schedulerOwnerKey(req.TenantID, req.FuncKey, req.SessionID, req.SessionCtxID))
 		if !owned {
 			logger.Warnf("lite Process not owner of session (owner=%s), should reroute", ownerID)
 			data, _ := json.Marshal(liteErrResp(statuscode.AcquireNonOwnerSchedulerErrorCode,

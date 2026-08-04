@@ -51,6 +51,8 @@ public:
 
     void RemoveRoute(const std::string &functionId);
 
+    bool ContainsSchedulerId(const std::string &schedulerId) const;
+
     std::string Next(const std::string &functionId,
                      const std::shared_ptr<AvailableSchedulerInfos> &schedulerInfos = nullptr);
 

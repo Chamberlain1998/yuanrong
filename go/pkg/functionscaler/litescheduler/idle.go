@@ -34,7 +34,7 @@ type idleReporter struct {
 }
 
 func sessionContextRoutingKey(funcKey, sessionCtxID string) string {
-	return splitFuncKey(funcKey).tenantID + "/" + funcKey + "/" + sessionCtxID
+	return schedulerOwnerKey(splitFuncKey(funcKey).tenantID, funcKey, "", sessionCtxID)
 }
 
 func (ls *LiteScheduler) processSessionContextIdle() {

@@ -64,10 +64,16 @@ TEST_F(SchedulerManagerTest, AddAndRemove)
     schedulerMgr->Add("sched1", "sched1ID");
     schedulerMgr->Add("sched2", "sched2ID");
 
+    EXPECT_TRUE(schedulerMgr->ContainsSchedulerId("sched1ID"));
+    EXPECT_TRUE(schedulerMgr->ContainsSchedulerId("sched2ID"));
+    EXPECT_FALSE(schedulerMgr->ContainsSchedulerId(""));
+    EXPECT_FALSE(schedulerMgr->ContainsSchedulerId("missing"));
+
     EXPECT_EQ(schedulerMgr->Next("func1", schedulerInfos), "sched1ID");
     EXPECT_EQ(schedulerMgr->Next("func2", schedulerInfos), "sched2ID");
 
     schedulerMgr->Remove("sched1");
+    EXPECT_FALSE(schedulerMgr->ContainsSchedulerId("sched1ID"));
     EXPECT_EQ(schedulerMgr->Next("func1", schedulerInfos), "sched2ID");
 }
 

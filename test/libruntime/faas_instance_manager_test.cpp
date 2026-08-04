@@ -50,6 +50,7 @@ public:
     ~FaasInstanceManagerTest(){};
     void SetUp() override
     {
+        setenv("YR_LITE_SCHEDULER_ENABLE", "true", 1);
         Mkdir("/tmp/log");
         LogParam g_logParam = {
             .logLevel = "DEBUG",
@@ -79,8 +80,10 @@ public:
         insManager = std::make_shared<FaasInsManager>(cb, fsClient, memoryStore, reqMgr, librtCfg);
         insManager->UpdateSchdulerInfo("scheduler1", "scheduler1", "ADD");
     }
+
     void TearDown() override
     {
+        unsetenv("YR_LITE_SCHEDULER_ENABLE");
         if (insManager->leaseTimer) {
             insManager->leaseTimer->cancel();
             insManager->leaseTimer.reset();
@@ -701,6 +704,87 @@ TEST_F(FaasInstanceManagerTest, BuildAcquireRequestWithoutSessionCtx)
     ASSERT_EQ(err.Code(), ErrorCode::ERR_OK);
     // verify sessionCtxID is NOT in instanceRequirement
     ASSERT_EQ(mockFs->lastInstanceRequirement.find("sessionCtxID"), std::string::npos);
+}
+
+TEST_F(FaasInstanceManagerTest, SchedulerOwnerKeyUsesUnifiedPrecedence)
+{
+    InvokeOptions opts;
+    EXPECT_EQ(insManager->GetSchedulerOwnerKey("tenant/function/version", opts), "tenant/function/version");
+
+    opts.instanceSession = std::make_shared<InstanceSession>();
+    opts.instanceSession->sessionID = "instance-session";
+    EXPECT_EQ(insManager->GetSchedulerOwnerKey("tenant/function/version", opts), "tenant/instance-session");
+
+    opts.sessionCtxId = "session-context";
+    EXPECT_EQ(insManager->GetSchedulerOwnerKey("tenant/function/version", opts),
+              "tenant/tenant/function/version/session-context");
+}
+
+TEST_F(FaasInstanceManagerTest, SchedulerOwnerKeyUsesFunctionWhenLiteSchedulerDisabled)
+{
+    setenv("YR_LITE_SCHEDULER_ENABLE", "false", 1);
+    InvokeOptions opts;
+    opts.instanceSession = std::make_shared<InstanceSession>();
+    opts.instanceSession->sessionID = "instance-session";
+    opts.sessionCtxId = "session-context";
+
+    EXPECT_EQ(insManager->GetSchedulerOwnerKey("tenant/function/version", opts), "tenant/function/version");
+}
+
+TEST_F(FaasInstanceManagerTest, BuildAcquireRequestUsesOwnerKeyRoute)
+{
+    insManager->UpdateSchdulerInfo("scheduler2", "scheduler2", "ADD");
+    auto spec = std::make_shared<InvokeSpec>();
+    spec->functionMeta.functionId = "tenant/function/version";
+    spec->opts.sessionCtxId = "session-context";
+    const auto ownerKey = insManager->GetSchedulerOwnerKey(spec->functionMeta.functionId, spec->opts);
+    insManager->schedulerManagerGreen->SetRoute(ownerKey, "scheduler2");
+    insManager->schedulerManagerGreen->SetRoute(spec->functionMeta.functionId, "scheduler1");
+
+    auto acquireSpec = insManager->BuildAcquireRequest(spec);
+
+    EXPECT_EQ(acquireSpec->invokeInstanceId, "scheduler2");
+}
+
+TEST_F(FaasInstanceManagerTest, ReleaseFallsBackToRecalculatedOwnerWhenRecordedSchedulerIsUnavailable)
+{
+    RequestResource resource;
+    resource.opts.instanceSession = std::make_shared<InstanceSession>();
+    resource.opts.instanceSession->sessionID = "instance-session";
+    auto instanceInfo = std::make_shared<InstanceInfo>();
+    instanceInfo->leaseId = "lease-id";
+    instanceInfo->faasInfo.functionId = "tenant/function/version";
+    instanceInfo->faasInfo.schedulerInstanceID = "removed-scheduler";
+    instanceInfo->faasInfo.ringName = GREEN_RING_NAME;
+
+    insManager->ResolveLeaseScheduler(instanceInfo, resource);
+
+    EXPECT_EQ(instanceInfo->faasInfo.schedulerInstanceID, "scheduler1");
+}
+
+TEST_F(FaasInstanceManagerTest, BatchRetainFailoverUsesLeaseOwnerKey)
+{
+    insManager->UpdateSchdulerInfo("scheduler2", "scheduler2", "ADD");
+    RequestResource resource;
+    resource.functionMeta.functionId = "tenant/function/version";
+    resource.opts.sessionCtxId = "session-context";
+    auto requestInfo = std::make_shared<RequestResourceInfo>();
+    auto instanceInfo = std::make_shared<InstanceInfo>();
+    instanceInfo->leaseId = "lease-id";
+    instanceInfo->faasInfo.functionId = "tenant/function/version";
+    instanceInfo->faasInfo.schedulerInstanceID = "scheduler1";
+    instanceInfo->faasInfo.ringName = GREEN_RING_NAME;
+    requestInfo->instanceInfos[instanceInfo->leaseId] = instanceInfo;
+    insManager->requestResourceInfoMap[resource] = requestInfo;
+    insManager->globalLeases[instanceInfo->leaseId] = resource;
+    std::vector<std::string> leaseIds{instanceInfo->leaseId};
+    FaasInfoForBatchRenew batchInfo(instanceInfo->faasInfo, 0);
+
+    insManager->ChangeInstanceSchedulerId(batchInfo, leaseIds);
+
+    EXPECT_EQ(instanceInfo->faasInfo.schedulerInstanceID, "scheduler2");
+    const auto ownerKey = insManager->GetSchedulerOwnerKey(instanceInfo->faasInfo.functionId, resource.opts);
+    EXPECT_EQ(insManager->schedulerManagerGreen->Next(ownerKey), "scheduler2");
 }
 
 TEST_F(FaasInstanceManagerTest, BuildReacquireInstanceDataWithSessionCtx)

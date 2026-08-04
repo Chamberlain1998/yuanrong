@@ -67,6 +67,33 @@ func TestIsFuncEnabled(t *testing.T) {
 	})
 }
 
+func TestSchedulerOwnerKey(t *testing.T) {
+	const funcKey = "tenant/function/version"
+	tests := []struct {
+		name         string
+		sessionID    string
+		sessionCtxID string
+		expected     string
+	}{
+		{name: "function owner", expected: funcKey},
+		{name: "instance session owner", sessionID: "session", expected: "tenant/session"},
+		{
+			name:         "session context takes precedence",
+			sessionID:    "session",
+			sessionCtxID: "context",
+			expected:     "tenant/tenant/function/version/context",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			actual := schedulerOwnerKey("tenant", funcKey, test.sessionID, test.sessionCtxID)
+			if actual != test.expected {
+				t.Fatalf("unexpected owner key: got %q, want %q", actual, test.expected)
+			}
+		})
+	}
+}
+
 func TestProcessReverseLookupFillsSessionID(t *testing.T) {
 	convey.Convey("release reverse lookup fills sessionID from allocation", t, func() {
 		ls := &LiteScheduler{pools: map[string]*LiteFunctionPool{}, allocations: map[string]*Allocation{}}

@@ -108,6 +108,21 @@ func (f *FakeKvClient) KVDel(key string) api.ErrorInfo {
 	return api.ErrorInfo{}
 }
 
+func TestCheckStatusMissingObject(t *testing.T) {
+	missingErr := errors.New("Get failed: Runtime error: Fail to get object registry-key from remote worker, " +
+		"no object copy exists in any worker")
+	retry, err := checkStatus(api.ErrorInfo{Code: 4299, Err: missingErr}, &Config{}, "trace")
+	if retry || !errors.Is(err, ErrKeyNotFound) {
+		t.Fatalf("missing object should be mapped to ErrKeyNotFound, retry: %t, err: %v", retry, err)
+	}
+
+	storageErr := errors.New("Get failed: Runtime error: connection reset")
+	retry, err = checkStatus(api.ErrorInfo{Code: 4299, Err: storageErr}, &Config{}, "trace")
+	if retry || !errors.Is(err, storageErr) {
+		t.Fatalf("storage error should be preserved, retry: %t, err: %v", retry, err)
+	}
+}
+
 func (f *FakeKvClient) KVDelMulti(keys []string) ([]string, api.ErrorInfo) {
 	switch len(keys) {
 	case 2:
