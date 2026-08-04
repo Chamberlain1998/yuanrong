@@ -17,6 +17,7 @@
 """yr runtime main"""
 
 import json
+import logging
 import os
 import sys
 
@@ -25,10 +26,13 @@ from yr.apis import receive_request_loop, need_reinit, reinit
 from yr.config import Config
 from yr.common.utils import load_env_from_file, try_install_uvloop
 
+_logger = logging.getLogger(__name__)
+
 DEFAULT_LOG_DIR = "/home/snuser/log/"
 _ENV_KEY_FUNCTION_LIB_PATH = "YR_FUNCTION_LIB_PATH"
 _ENV_KEY_ENV_DELEGATE_DOWNLOAD = "ENV_DELEGATE_DOWNLOAD"
 _ENV_KEY_LAYER_LIB_PATH = "LAYER_LIB_PATH"
+_ENV_KEY_BOOTSTRAP_CMDS = "YR_RUNTIME_BOOTSTRAP_CMD"
 
 DEFAULT_RUNTIME_CONFIG = {
     "maxRequestBodySize": 6,
@@ -83,6 +87,57 @@ def insert_sys_path():
             sys.path.insert(1, path)
 
 
+_BOOTSTRAP_CMDS_MAX = 64
+
+
+def _start_bootstrap_cmds():
+    raw = os.environ.get(_ENV_KEY_BOOTSTRAP_CMDS, "").strip()
+    if not raw:
+        return
+    import json as _json
+    import subprocess
+    try:
+        cmds = _json.loads(raw)
+    except ValueError as e:
+        _logger.warning("invalid %s (not JSON): %s", _ENV_KEY_BOOTSTRAP_CMDS, e)
+        return
+    if not isinstance(cmds, list):
+        _logger.warning("invalid %s (expected a list, got %s)", _ENV_KEY_BOOTSTRAP_CMDS, type(cmds).__name__)
+        return
+    if len(cmds) > _BOOTSTRAP_CMDS_MAX:
+        _logger.warning("%s has %d entries, only the first %d will start",
+                         _ENV_KEY_BOOTSTRAP_CMDS, len(cmds), _BOOTSTRAP_CMDS_MAX)
+        cmds = cmds[:_BOOTSTRAP_CMDS_MAX]
+    log_dir = os.getenv("GLOG_log_dir", DEFAULT_LOG_DIR)
+    for idx, argv in enumerate(cmds):
+        if not isinstance(argv, list) or not all(isinstance(a, str) for a in argv):
+            _logger.warning("skip non-argv element in %s: %r", _ENV_KEY_BOOTSTRAP_CMDS, argv)
+            continue
+        try:
+            err_log = os.path.join(log_dir, "bootstrap_cmd_{}.log".format(idx))
+            err_fh = open(err_log, "ab")
+        except OSError as e:
+            _logger.warning("cannot open bootstrap log %s, stderr discarded: %s", err_log, e)
+            err_fh = subprocess.DEVNULL
+        try:
+            proc = subprocess.Popen(
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=err_fh,
+                start_new_session=True,
+            )
+            if err_fh is not subprocess.DEVNULL:
+                err_fh.close()
+        except (OSError, ValueError) as e:
+            _logger.warning("failed to start bootstrap cmd %r: %s", argv, e)
+            if err_fh is not subprocess.DEVNULL:
+                try:
+                    err_fh.close()
+                except OSError:
+                    pass
+
+
 def main():
     """main"""
     # If YR_SEED_FILE is set, read the specified file to block
@@ -98,6 +153,7 @@ def main():
 
     insert_sys_path()
     init(configure())
+    _start_bootstrap_cmds()
     try_install_uvloop()
     receive_request_loop()
 
