@@ -1416,6 +1416,99 @@ TEST_F(InvokeAdaptorTest, AdaptorGetInsPreservesCodeTest)
     ASSERT_EQ(std::string(res.code.begin(), res.code.end()), "serialized-code");
 }
 
+TEST_F(InvokeAdaptorTest, AdaptorGetInsRetriesNotFoundUntilSuccessTest)
+{
+    auto mockGwClient = std::make_shared<MockGwClient>();
+    auto fsClient = std::make_shared<FSClient>(mockGwClient);
+    invokeAdaptor->fsClient = fsClient;
+    int getInstanceAttempts = 0;
+
+    EXPECT_CALL(*mockGwClient, KillAsync(_, _, _))
+        .WillRepeatedly(Invoke([&getInstanceAttempts](const KillRequest &req, KillCallBack callback, int timeoutSec) {
+            KillResponse resp;
+            resp.set_code(::common::ErrorCode::ERR_NONE);
+            if (req.signal() == libruntime::Signal::GetInstance) {
+                EXPECT_GT(timeoutSec, 0);
+                ++getInstanceAttempts;
+                if (getInstanceAttempts == 1) {
+                    resp.set_code(::common::ErrorCode::ERR_INSTANCE_NOT_FOUND);
+                    resp.set_message("instance not found");
+                } else {
+                    libruntime::FunctionMeta meta;
+                    meta.set_modulename("test_yr_api");
+                    meta.set_classname("RetryActor");
+                    meta.set_language(libruntime::LanguageType::Python);
+                    std::string serializedMeta;
+                    EXPECT_TRUE(google::protobuf::util::MessageToJsonString(meta, &serializedMeta).ok());
+                    resp.set_message(serializedMeta);
+                }
+            }
+            callback(resp, ErrorInfo());
+        }));
+
+    auto [res, err] = invokeAdaptor->GetInstance("actor", "ns", 1);
+    EXPECT_TRUE(err.OK());
+    EXPECT_EQ(res.className, "RetryActor");
+    EXPECT_EQ(getInstanceAttempts, 2);
+}
+
+TEST_F(InvokeAdaptorTest, AdaptorGetInsRetriesUntilTimeoutTest)
+{
+    auto mockGwClient = std::make_shared<MockGwClient>();
+    auto fsClient = std::make_shared<FSClient>(mockGwClient);
+    invokeAdaptor->fsClient = fsClient;
+    int getInstanceAttempts = 0;
+
+    EXPECT_CALL(*mockGwClient, KillAsync(_, _, _))
+        .WillRepeatedly(Invoke([&getInstanceAttempts](const KillRequest &req, KillCallBack callback, int) {
+            KillResponse resp;
+            if (req.signal() == libruntime::Signal::GetInstance) {
+                ++getInstanceAttempts;
+                resp.set_code(::common::ErrorCode::ERR_INSTANCE_NOT_FOUND);
+                resp.set_message("instance not found");
+            } else {
+                resp.set_code(::common::ErrorCode::ERR_NONE);
+            }
+            callback(resp, ErrorInfo());
+        }));
+
+    const auto start = std::chrono::steady_clock::now();
+    auto [res, err] = invokeAdaptor->GetInstance("missing-actor", "ns", 1);
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    EXPECT_TRUE(res.className.empty());
+    EXPECT_EQ(err.Code(), ErrorCode::ERR_INSTANCE_NOT_FOUND);
+    EXPECT_TRUE(err.IsTimeout());
+    EXPECT_GE(elapsed, 900ms);
+    EXPECT_GT(getInstanceAttempts, 1);
+}
+
+TEST_F(InvokeAdaptorTest, AdaptorGetInsDoesNotRetryExitedErrorTest)
+{
+    auto mockGwClient = std::make_shared<MockGwClient>();
+    auto fsClient = std::make_shared<FSClient>(mockGwClient);
+    invokeAdaptor->fsClient = fsClient;
+    int getInstanceAttempts = 0;
+
+    EXPECT_CALL(*mockGwClient, KillAsync(_, _, _))
+        .WillRepeatedly(Invoke([&getInstanceAttempts](const KillRequest &req, KillCallBack callback, int) {
+            KillResponse resp;
+            if (req.signal() == libruntime::Signal::GetInstance) {
+                ++getInstanceAttempts;
+                resp.set_code(::common::ErrorCode::ERR_INSTANCE_EXITED);
+                resp.set_message("instance exited");
+            } else {
+                resp.set_code(::common::ErrorCode::ERR_NONE);
+            }
+            callback(resp, ErrorInfo());
+        }));
+
+    auto [res, err] = invokeAdaptor->GetInstance("actor", "ns", 1);
+    EXPECT_TRUE(res.className.empty());
+    EXPECT_EQ(err.Code(), ErrorCode::ERR_INSTANCE_EXITED);
+    EXPECT_FALSE(err.IsTimeout());
+    EXPECT_EQ(getInstanceAttempts, 1);
+}
+
 TEST_F(InvokeAdaptorTest, KillWithRoutingSetsKillRequestFieldsTest)
 {
     auto mockGwClient = std::make_shared<MockGwClient>();
