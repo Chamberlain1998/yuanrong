@@ -63,6 +63,11 @@ private:
                                                     const std::string &stateId = "");
     std::string GetNextSchedulerWithRing(const std::string &functionId, std::string ringName,
                                          const std::shared_ptr<AvailableSchedulerInfos> &schedulerInfos = nullptr);
+    std::string GetSchedulerOwnerKey(const std::string &functionId, const InvokeOptions &opts) const;
+    std::string GetNextOwnerScheduler(const std::string &functionId, const InvokeOptions &opts,
+                                      const std::string &ringName,
+                                      const std::shared_ptr<AvailableSchedulerInfos> &schedulerInfos = nullptr);
+    void ResolveLeaseScheduler(const std::shared_ptr<InstanceInfo> &ins, const RequestResource &resource);
     InvokeRequest BuildReleaseReq(const std::shared_ptr<InstanceInfo> &ins);
     bool AcquireFaasIns(const std::shared_ptr<InvokeSpec> spec, size_t reqNum);
     void HandleFaasInsInfo(std::shared_ptr<InstanceInfo> &faasInsInfo, const RequestResource &resource);

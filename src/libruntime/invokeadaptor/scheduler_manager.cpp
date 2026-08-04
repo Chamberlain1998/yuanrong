@@ -125,6 +125,16 @@ void SchedulerManager::RemoveRoute(const std::string &functionId)
     lruCache_.Erase(functionId);
 }
 
+bool SchedulerManager::ContainsSchedulerId(const std::string &schedulerId) const
+{
+    if (schedulerId.empty()) {
+        return false;
+    }
+    absl::ReaderMutexLock lk(&mtx_);
+    return std::any_of(schedulerInfoMap_.begin(), schedulerInfoMap_.end(),
+                       [&schedulerId](const auto &item) { return item.second == schedulerId; });
+}
+
 std::string SchedulerManager::Next(const std::string &functionId,
                                    const std::shared_ptr<AvailableSchedulerInfos> &schedulerInfos)
 {

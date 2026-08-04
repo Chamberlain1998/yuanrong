@@ -147,6 +147,30 @@ class TestCliConfig(unittest.TestCase):
                 ).rendered_config
                 self.assertEqual(config["frontend"]["ssl_enable"], expected)
 
+    def test_lite_scheduler_switch_is_injected_into_frontend_and_scheduler(self):
+        cli_dir = Path(__file__).resolve().parents[1] / "cli"
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                value = str(enabled).lower()
+                self.config_path.write_text(
+                    f"[values.lite_scheduler]\nenable = {value}\n"
+                )
+
+                config = FixedRuntimeConfigResolver(
+                    self.config_path, cli_dir, port_policy="FIX"
+                ).rendered_config
+
+                self.assertEqual(
+                    config["frontend"]["env"]["YR_LITE_SCHEDULER_ENABLE"],
+                    value,
+                )
+                self.assertEqual(
+                    config["function_scheduler"]["env"][
+                        "YR_LITE_SCHEDULER_ENABLE"
+                    ],
+                    value,
+                )
+
     def _write_default_templates(self, port):
         (self.cli_dir / "values.toml").write_text(
             f'[values]\ndeploy_path = "/tmp/yr-test-session"\n'

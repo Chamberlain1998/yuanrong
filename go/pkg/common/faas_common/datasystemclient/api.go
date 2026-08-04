@@ -410,7 +410,7 @@ func downloadArray(keys []string, config *Config, traceID string) ([][]byte, boo
 
 func checkStatus(status api.ErrorInfo, config *Config, traceID string) (bool, error) {
 	if status.IsError() {
-		if status.Code == errKeyNotFound {
+		if status.Code == errKeyNotFound || isMissingObject(status.Err) {
 			return false, ErrKeyNotFound
 		}
 		if shouldRetry(status.Code) {
@@ -423,6 +423,15 @@ func checkStatus(status api.ErrorInfo, config *Config, traceID string) (bool, er
 		return false, status.Err
 	}
 	return false, nil
+}
+
+func isMissingObject(err error) bool {
+	if err == nil {
+		return false
+	}
+	// DataSystem can report an absent object as a generic runtime error when no
+	// copy exists, rather than using the key-not-found status code.
+	return strings.Contains(strings.ToLower(err.Error()), "no object copy exists")
 }
 
 // DeleteArrayRetry - delete multiple keys at once; the first output parameter is the keys failed to delete

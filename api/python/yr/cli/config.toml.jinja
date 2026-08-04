@@ -598,6 +598,7 @@ DATASYSTEM_ADDR="{{ values.ds_worker.ip }}:{{ values.ds_worker.port }}"
 YR_DATASYSTEM_DEFAULT_WRITE_MODE="{{ values.runtime.default_write_mode }}"
 INSTANCE_ID="driver-scheduler-{{ values.node_id }}"
 FAAS_LOG_PATH="{{ values.fs.log.path }}"
+YR_LITE_SCHEDULER_ENABLE="{{ 'true' if values.lite_scheduler.enable else 'false' }}"
 
 [function_scheduler.health_check]
 enable = true
@@ -655,6 +656,7 @@ DATASYSTEM_ADDR="{{ values.ds_worker.ip }}:{{ values.ds_worker.port }}"
 YR_DATASYSTEM_DEFAULT_WRITE_MODE="{{ values.runtime.default_write_mode }}"
 INSTANCE_ID="driver-frontend-{{ values.node_id }}"
 FAAS_LOG_PATH="{{ values.fs.log.path }}"
+YR_LITE_SCHEDULER_ENABLE="{{ 'true' if values.lite_scheduler.enable else 'false' }}"
 LOG_CONFIG = '''{{ fs_log_config | tojson }}'''
 # SSH bastion env consumed by frontend sshproxy via os.Getenv. Values mirror
 # deploy/process/config.sh defaults. Only YR_FRONTEND_SSH_ENABLE toggles the

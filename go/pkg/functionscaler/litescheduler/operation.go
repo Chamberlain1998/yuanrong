@@ -375,11 +375,8 @@ func (ls *LiteScheduler) reacquireAllocation(req *LiteRequest, metrics *types.In
 	}
 	tenantID := splitFuncKey(funcKey).tenantID
 	if ls.ownerProxy != nil {
-		routingID := sessionID
-		if sessionCtxID != "" {
-			routingID = funcKey + "/" + sessionCtxID
-		}
-		ownerID, owned := ls.ownerProxy.CheckHashOwner(tenantID + "/" + routingID)
+		ownerID, owned := ls.ownerProxy.CheckHashOwner(
+			schedulerOwnerKey(tenantID, funcKey, sessionID, sessionCtxID))
 		if !owned {
 			logger.Warnf("lite retain reacquire is not session owner, reroute to %s", ownerID)
 			// Keep ErrorMessage as the raw InstanceID. The frontend consumes it

@@ -234,6 +234,13 @@ TEST_F(InvokeSpecTest, RequestResourceEqualTest)
 
     ASSERT_EQ(r9 == r10, true);
     ASSERT_EQ(r9.opts.instanceSession == r10.opts.instanceSession, false);
+
+    RequestResource r11;
+    RequestResource r12;
+    r11.opts.sessionCtxId = "ctx-a";
+    r12.opts.sessionCtxId = "ctx-b";
+    ASSERT_FALSE(r11 == r12);
+    ASSERT_NE(HashFn{}(r11), HashFn{}(r12));
 }
 
 TEST_F(InvokeSpecTest, GetInstanceIdTest)
