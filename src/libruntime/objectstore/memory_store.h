@@ -75,8 +75,12 @@ struct ObjectDetail {
     absl::Notification notification;
     std::promise<std::string> instanceRoute;
     std::shared_future<std::string> instanceRouteFuture;
+    bool hasInstanceRoute = false;
+    std::string latestInstanceRoute;
     std::promise<std::string> instanceProxyID;
     std::shared_future<std::string> instanceProxyIDFuture;
+    bool hasInstanceProxyID = false;
+    std::string latestInstanceProxyID;
 
     ObjectDetail()
     {

@@ -605,10 +605,17 @@ TEST_F(InvokeAdaptorTest, InvokeNotifyHandlerTest)
     spec->invokeType = libruntime::InvokeType::InvokeFunction;
     spec->returnIds = returnObjs;
     spec->requestId = "cae7c30c8d63f5ed01";
+    spec->instanceId = kMockObjectId;
     spec->functionMeta = YR::Libruntime::FunctionMeta{
         .apiType = libruntime::ApiType::Function, .functionId = "functionId", .name = "name", .ns = "ns"};
+    ASSERT_TRUE(memoryStore->SetInstanceRoute(kMockObjectId, "old-route"));
+    ASSERT_TRUE(memoryStore->SetInstanceProxyID(kMockObjectId, "old-proxy"));
+    req.mutable_runtimeinfo()->set_route("new-route");
+    req.mutable_runtimeinfo()->set_proxyid("new-proxy");
     invokeAdaptor->requestManager->PushRequest(spec);
     invokeAdaptor->InvokeNotifyHandler(req, err);
+    EXPECT_EQ(memoryStore->GetInstanceRoute(kMockObjectId), "new-route");
+    EXPECT_EQ(memoryStore->GetInstanceProxyID(kMockObjectId), "new-proxy");
     auto spec2 = invokeAdaptor->requestManager->GetRequest(req.requestid());
     EXPECT_TRUE(spec2 == nullptr);
     invokeAdaptor->requestManager->RemoveRequest("cae7c30c8d63f5ed01");

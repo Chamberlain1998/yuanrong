@@ -1531,7 +1531,7 @@ void InvokeAdaptor::CreateNotifyHandler(const NotifyRequest &req)
     } else {
         HandleCreateNotifySuccess(req, spec);
     }
-    CleanupCreateNotifyRequest(rawRequestId, req);
+    CleanupNotifyRequest(rawRequestId, req);
 }
 
 bool InvokeAdaptor::HandleCreateNotifyError(const NotifyRequest &req, const std::shared_ptr<InvokeSpec> &spec)
@@ -1559,14 +1559,7 @@ void InvokeAdaptor::HandleCreateNotifySuccess(const NotifyRequest &req, const st
 {
     YRLOG_DEBUG("Succeed to create instance, request ID: {}, instance ID: {}", req.requestid(), spec->instanceId);
     invokeOrderMgr->NotifyInvokeSuccess(spec);
-    if (req.has_runtimeinfo()) {
-        if (!req.runtimeinfo().route().empty()) {
-            memStore->SetInstanceRoute(spec->returnIds[0].id, req.runtimeinfo().route());
-        }
-        if (!req.runtimeinfo().proxyid().empty()) {
-            memStore->SetInstanceProxyID(spec->returnIds[0].id, req.runtimeinfo().proxyid());
-        }
-    }
+    UpdateInstanceRuntimeInfo(req, spec->returnIds[0].id);
     memStore->SetReady(spec->returnIds[0].id);
     if (spec->functionMeta.apiType != libruntime::ApiType::Posix) {
         if (auto insId = spec->GetNamedInstanceId(); !insId.empty()) {
@@ -1576,7 +1569,7 @@ void InvokeAdaptor::HandleCreateNotifySuccess(const NotifyRequest &req, const st
     }
 }
 
-void InvokeAdaptor::CleanupCreateNotifyRequest(const std::string &rawRequestId, const NotifyRequest &req)
+void InvokeAdaptor::CleanupNotifyRequest(const std::string &rawRequestId, const NotifyRequest &req)
 {
     auto ids = memStore->UnbindObjRefInReq(rawRequestId);
     auto errorInfo = memStore->DecreGlobalReference(ids);
@@ -1586,6 +1579,19 @@ void InvokeAdaptor::CleanupCreateNotifyRequest(const std::string &rawRequestId, 
     }
 
     (void)requestManager->RemoveRequest(rawRequestId);
+}
+
+void InvokeAdaptor::UpdateInstanceRuntimeInfo(const NotifyRequest &req, const std::string &instanceId)
+{
+    if (!req.has_runtimeinfo() || instanceId.empty()) {
+        return;
+    }
+    if (!req.runtimeinfo().route().empty()) {
+        memStore->SetInstanceRoute(instanceId, req.runtimeinfo().route());
+    }
+    if (!req.runtimeinfo().proxyid().empty()) {
+        memStore->SetInstanceProxyID(instanceId, req.runtimeinfo().proxyid());
+    }
 }
 
 void InvokeAdaptor::HandleReturnedObject(const NotifyRequest &req, const std::shared_ptr<InvokeSpec> &spec)
@@ -1642,6 +1648,7 @@ void InvokeAdaptor::InvokeNotifyHandler(const NotifyRequest &req, const ErrorInf
     if (spec->IsStaleDuplicateNotify(seq)) {
         return;
     }
+    UpdateInstanceRuntimeInfo(req, spec->instanceId);
     if (req.code() != common::ERR_NONE) {
         bool isConsumeRetryTime = false;
         if (!NeedRetry(static_cast<ErrorCode>(req.code()), spec, isConsumeRetryTime)) {
@@ -1673,13 +1680,7 @@ void InvokeAdaptor::InvokeNotifyHandler(const NotifyRequest &req, const ErrorInf
         invokeOrderMgr->NotifyInvokeSuccess(spec);
         HandleReturnedObject(req, spec);
     }
-    auto ids = memStore->UnbindObjRefInReq(rawRequestId);
-    auto errorInfo = memStore->DecreGlobalReference(ids);
-    if (!errorInfo.OK()) {
-        YRLOG_WARN("failed to decrease by requestid {}. Code: {}, MCode: {}, Msg: {}", req.requestid(),
-                   fmt::underlying(errorInfo.Code()), fmt::underlying(errorInfo.MCode()), errorInfo.Msg());
-    }
-    (void)requestManager->RemoveRequest(rawRequestId);
+    CleanupNotifyRequest(rawRequestId, req);
 }
 
 void InvokeAdaptor::ProcessErr(const std::shared_ptr<InvokeSpec> &spec, const ErrorInfo &errInfo)
