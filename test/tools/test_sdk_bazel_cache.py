@@ -2,7 +2,10 @@
 
 """Regression contracts for SDK Bazel cache reuse and Jenkins compatibility."""
 
+import os
 import pathlib
+import subprocess
+import tempfile
 import unittest
 
 
@@ -85,6 +88,80 @@ class SdkBazelCacheTest(unittest.TestCase):
         )
         self.assertIn("SDK_BUILD_MODE=common", prime_script)
         self.assertIn('if [ -z "${REMOTE_CACHE:-}" ]', prime_script)
+
+    def test_macos_sdk_uses_persistent_local_caches(self):
+        pipeline = (REPO_ROOT / ".buildkite/pipeline.dynamic.yml").read_text(
+            encoding="utf-8"
+        )
+        sdk_script = (
+            REPO_ROOT / ".buildkite/build_openyuanrong_sdk_wheels.sh"
+        ).read_text(encoding="utf-8")
+        cache_script = (
+            REPO_ROOT / ".buildkite/configure_macos_local_cache.sh"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(". .buildkite/configure_macos_local_cache.sh", pipeline)
+        self.assertIn("report_macos_local_cache", pipeline)
+        self.assertIn('SDK_BAZEL_DISK_CACHE="${_YR_MACOS_CACHE_ROOT}', cache_script)
+        self.assertIn('BUILDKITE_BUILD_PATH:-}', cache_script)
+        self.assertIn('cache_args=(-l "${SDK_BAZEL_DISK_CACHE}")', sdk_script)
+
+        with tempfile.TemporaryDirectory() as cache_root:
+            env = os.environ.copy()
+            env["YR_MACOS_CACHE_ROOT"] = cache_root
+            result = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    (
+                        '. "$1"; '
+                        'printf "%s\\n%s\\n%s\\n" '
+                        '"$SDK_BAZEL_DISK_CACHE" '
+                        '"$BAZEL_REPOSITORY_CACHE" '
+                        '"$PIP_CACHE_DIR"'
+                    ),
+                    "bash",
+                    str(REPO_ROOT / ".buildkite/configure_macos_local_cache.sh"),
+                ],
+                cwd=REPO_ROOT,
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            cache_paths = result.stdout.splitlines()[-3:]
+            self.assertEqual(len(cache_paths), 3)
+            for cache_path in cache_paths:
+                self.assertTrue(pathlib.Path(cache_path).is_dir())
+                self.assertTrue(
+                    pathlib.Path(cache_path).is_relative_to(cache_root)
+                )
+
+    def test_macos_only_pipeline_emits_only_sdk_wheel_jobs(self):
+        env = os.environ.copy()
+        env.update(
+            {
+                "ENABLE_MACOS_SDK_ONLY": "true",
+                "ENABLE_MACOS_SDK_OVERRIDE": "false",
+                "SDK_PYTHON_VERSIONS": "python3.9 python3.10",
+            }
+        )
+        result = subprocess.run(
+            ["bash", str(REPO_ROOT / ".buildkite/pipeline.dynamic.yml")],
+            cwd=REPO_ROOT,
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(result.stdout.count("Build SDK macOS"), 2)
+        self.assertNotIn("Build X86", result.stdout)
+        self.assertNotIn("Build SDK X86", result.stdout)
+        self.assertNotIn("Build arm", result.stdout)
+        self.assertNotIn("Build Image", result.stdout)
+        self.assertNotIn("Test K8S", result.stdout)
+        self.assertNotIn("Publish Wheels", result.stdout)
 
 
 if __name__ == "__main__":
