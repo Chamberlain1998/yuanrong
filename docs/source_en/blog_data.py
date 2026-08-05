@@ -14,6 +14,19 @@
 
 BLOG_DATA = [
     {
+        "title": "openYuanrong: Building an Enterprise-Grade Distributed Foundation for the Agent Era",
+        "description": (
+            "In the recent 0.8.0 and 0.9.0 major releases, "
+            "openYuanrong has significantly enhanced its distributed capabilities "
+            "for enterprise-grade Agent applications. Building upon its existing distributed "
+            "kernel foundation, openYuanrong is committed to becoming "
+            "the enterprise-grade distributed infrastructure for the Agent era."
+        ),
+        "date": "2026-07-31",
+        "read_time": "15 min",
+        "link": "https://mp.weixin.qq.com/s/Ww2G56OKMPY_hiON3Ipu9Q"
+    },
+    {
         "title": "Enterprise-grade JiuwenSwarm Practice Exploration Based on openYuanrong",
         "description": (
             "As AI Agent applications move from personal assistants to enterprise-grade "
@@ -28,22 +41,6 @@ BLOG_DATA = [
         "date": "2026-05-25",
         "read_time": "12 min",
         "link": "https://www.openeuler.openatom.cn/en/blog/20260525-openYuanrong_09/20260525-openYuanrong_09.html"
-    },
-    {
-        "title": "What Distributed Infrastructure Does the Agent Era Need",
-        "description": (
-            "The non-determinism of Agent applications brings unique operational "
-            "characteristics and challenges such as high dynamism, insecurity, and long "
-            "sessions, which traditional K8s container microservice technology systems "
-            "struggle to meet. openYuanrong, with its distributed kernel philosophy "
-            "similar to a standalone OS, naturally supports Agent instance "
-            "auto-elasticity, secure sandbox isolation, session-affinity scheduling, and "
-            "distributed fault tolerance, providing matching distributed infrastructure "
-            "for enterprise-grade large-scale Agent applications."
-        ),
-        "date": "2026-05-08",
-        "read_time": "18 min",
-        "link": "https://www.infoq.cn/article/qYQfpT8BaIPEkbeSXwzu"
     },
     {
         "title": "YuanRong: A Production General-purpose Serverless System for Distributed Applications in the Cloud",
