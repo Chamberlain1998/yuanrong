@@ -62,7 +62,7 @@ bazelRemote:
   enabled: true
   # Mirror buchgr/bazel-remote-cache to SWR to avoid Docker Hub rate-limit
   image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/bazel-remote-cache:latest
-  maxSizeGb: 200
+  maxSizeGb: 150
   # Local cache directory on the build node
   hostPath: /mnt/paas
   resources:
