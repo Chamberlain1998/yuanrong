@@ -322,6 +322,8 @@ endpoint = "{{ 'https' if values.fs.tls.enable else 'http' }}://{{ values.functi
 [function_proxy.env]
 LD_LIBRARY_PATH = "{{ values.yr_package_path }}/functionsystem/lib:{{ values.ds_bin }}/lib" # datasystem lib is needed for libds_router_client.so which needs v1.1 libssl and libcrypto
 LD_PRELOAD = "" # for jemalloc use
+LOCAL_IP = "{{ values.local_ip }}"
+HOST_IP = "{{ values.function_proxy.ip }}"
 {% if values.runtime_launcher.enable %}
 CONTAINER_EP = "unix://{{ values.runtime_launcher.socket }}"
 {% endif %}
@@ -340,7 +342,7 @@ backend = "{{ values.runtime_launcher.backend }}"
 docker-host = "{{ values.runtime_launcher.docker_host }}"
 
 [function_proxy.args]
-ip = "{{ values.function_proxy.ip }}"
+ip = "{{ values.local_ip }}"
 {% if values.meta_store.enable %}
 meta_store_address = "{{ values.function_master.ip }}:{{ values.function_master.global_scheduler_port }}"
 {% else %}
@@ -440,7 +442,7 @@ enable_separated_redirect_runtime_std = true
 user_log_export_mode = "file"
 npu_collection_mode = "all"
 gpu_collection_enable = false
-proxy_ip = "{{ values.function_proxy.ip }}"
+proxy_ip = "{{ values.local_ip }}"
 proxy_grpc_server_port = "{{ values.function_proxy.grpc_listen_port }}"
 setCmdCred = false
 python_dependency_path = "{{ values.python_path }}:{{ values.yr_package_path }}/runtime/service/python"
@@ -489,6 +491,7 @@ RUNTIME_METRICS_CONFIG = "{{ values.fs.metrics.metrics_config }}"
 RUNTIME_METRICS_CONFIG_FILE = "{{ values.fs.metrics.metrics_config_file }}"
 YR_DATASYSTEM_DEFAULT_WRITE_MODE = "{{ values.runtime.default_write_mode }}"
 INIT_LABELS = ""
+LOCAL_IP = "{{ values.local_ip }}"
 HOST_IP = "{{ values.function_agent.ip }}"
 NODE_ID = "{{ values.node_id }}"
 {% if values.runtime_launcher.enable %}
@@ -525,6 +528,7 @@ user_log_export_mode = "file"
 npu_collection_mode = "all"
 gpu_collection_enable = false
 numa_collection_enable = false
+proxy_ip = "{{ values.local_ip }}"
 proxy_grpc_server_port = "{{ values.function_proxy.grpc_listen_port }}"
 setCmdCred = false
 python_dependency_path = "{{ values.python_path }}:{{ values.yr_package_path }}/runtime/service/python"
@@ -611,7 +615,7 @@ instanceId="driver-scheduler-{{ values.node_id }}"
 functionName='0/0-system-faasscheduler/$latest'
 logLevel="{{ values.fs.log.level }}"
 logPath="{{ values.fs.log.path }}"
-functionSystemAddress="{{ values.function_proxy.ip }}:{{ values.function_proxy.grpc_listen_port }}"
+functionSystemAddress="{{ values.local_ip }}:{{ values.function_proxy.grpc_listen_port }}"
 driverMode = true  
 enableMTLS = "{{ values.fs.tls.enable }}"
 privateKeyPath="{{ values.fs.tls.base_path }}/{{ values.fs.tls.key_file }}"
@@ -683,7 +687,7 @@ instanceId="driver-frontend-{{ values.node_id }}"
 functionName='0/0-system-faasfrontend/$latest'
 logLevel="{{ values.fs.log.level }}"
 logPath="{{ values.fs.log.path }}"
-functionSystemAddress="{{ values.function_proxy.ip }}:{{ values.function_proxy.grpc_listen_port }}"
+functionSystemAddress="{{ values.local_ip }}:{{ values.function_proxy.grpc_listen_port }}"
 driverMode = true  
 enableMTLS = "{{ values.fs.tls.enable }}"
 privateKeyPath="{{ values.fs.tls.base_path }}/{{ values.fs.tls.key_file }}"

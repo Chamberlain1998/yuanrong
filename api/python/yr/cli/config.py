@@ -226,6 +226,11 @@ class ConfigResolver:
             merged_user_config.get("values", {}),
             allow_unknown=True,
         )
+        # Keep the existing single-address behavior unless local_ip is explicit.
+        if "host_ip" in merged_values and "local_ip" not in merged_user_config.get(
+            "values", {}
+        ):
+            merged_values["local_ip"] = merged_values["host_ip"]
         logger.debug(f"Merged values: {merged_values}")
 
         # First pass: render root scalar values using runtime context

@@ -15,6 +15,8 @@
 
 [values]
 host_ip = "{{ ip }}"
+# In-node address used by runtimes and local services to reach Function Proxy.
+local_ip = "{{ ip }}"
 deploy_path = "{{ deploy_path }}"
 yr_package_path = "{{ yr_package_path }}"
 ds_bin = "{{ ds_bin }}"
