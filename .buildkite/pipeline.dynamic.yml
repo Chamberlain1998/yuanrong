@@ -8,6 +8,7 @@ BUILDER_IMAGE="${BUILDER_IMAGE_OVERRIDE:-${PYTHON314_BUILDER_IMAGE}}"
 SANDBOX_PACKAGER_IMAGE="${SANDBOX_PACKAGER_IMAGE:-swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/sandbox-packager:v20260506_kubectl}"
 SANDBOX_DEPLOYER_IMAGE="${SANDBOX_DEPLOYER_IMAGE:-swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/sandbox-deployer:v20260506_kubectl_py39}"
 ENABLE_MACOS_SDK="${ENABLE_MACOS_SDK_OVERRIDE:-${ENABLE_MACOS_SDK:-true}}"
+ENABLE_MACOS_SDK_ONLY="${ENABLE_MACOS_SDK_ONLY:-false}"
 ENABLE_LINUX_ARM="${ENABLE_LINUX_ARM:-true}"
 ENABLE_RUNTIME_X86="${ENABLE_RUNTIME_X86:-true}"
 ENABLE_RUNTIME_ARM="${ENABLE_RUNTIME_ARM:-true}"
@@ -41,6 +42,10 @@ is_enabled() {
     *) return 1 ;;
   esac
 }
+
+if is_enabled "${ENABLE_MACOS_SDK_ONLY}"; then
+  ENABLE_MACOS_SDK=true
+fi
 
 # Generate the publish step when either PUBLISH_PYPI or PUBLISH_TEST_PYPI is explicitly
 # enabled, or when neither is set (default: true).  Do NOT suppress the step just because
@@ -651,6 +656,7 @@ YAML
 }
 
 echo "steps:"
+if ! is_enabled "${ENABLE_MACOS_SDK_ONLY}"; then
 if is_enabled "${ENABLE_PYTHON314_BUILDER_BOOTSTRAP}"; then
   emit_python314_builder_bootstrap
   exit 0
@@ -1950,6 +1956,7 @@ fi
 if is_enabled "${ENABLE_SANDBOX_PACKAGE}"; then
   emit_sandbox_sdk_test
 fi
+fi
 
 case "${ENABLE_MACOS_SDK}" in
   1|true|TRUE|yes|YES|on|ON)
@@ -1980,10 +1987,12 @@ cat << YAML
 
       echo "=== [2/4] Ensure macOS SDK toolchain ==="
       SKIP_BREW_UPDATE="\$\${SKIP_BREW_UPDATE:-1}" bash scripts/ensure-macos-build-tools.sh
+      . .buildkite/configure_macos_local_cache.sh
 
       echo "=== [3/4] Build openyuanrong-sdk wheels ==="
       rm -f output/openyuanrong_sdk-*.whl
       bash .buildkite/build_openyuanrong_sdk_wheels.sh output
+      report_macos_local_cache
 
       echo "=== [4/4] Collect openyuanrong-sdk artifacts ==="
       rm -rf artifacts/openyuanrong-sdk
@@ -2019,6 +2028,6 @@ done
 ;;
 esac
 
-if is_enabled "${ENABLE_TEST_PYPI_PUBLISH}"; then
+if ! is_enabled "${ENABLE_MACOS_SDK_ONLY}" && is_enabled "${ENABLE_TEST_PYPI_PUBLISH}"; then
   emit_test_pypi_publish
 fi

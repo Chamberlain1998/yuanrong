@@ -91,8 +91,12 @@ build_sdk_wheel() {
     local py_version="$1"
     local python_bin="$2"
     local output_root="${SDK_BAZEL_BUILD_ROOT}/${py_version}"
+    local cache_args=()
 
     ensure_sdk_python_packages "${python_bin}"
+    if [ -n "${SDK_BAZEL_DISK_CACHE:-}" ]; then
+        cache_args=(-l "${SDK_BAZEL_DISK_CACHE}")
+    fi
 
     # rrt-runtime ships as the standalone openyuanrong-rrt wheel (built once per
     # arch), so the per-cp SDK build skips the Rust target instead of recompiling
@@ -101,7 +105,11 @@ build_sdk_wheel() {
         BUILD_SDK_WHEEL_ONLY=1 \
         BAZEL_OUTPUT_USER_ROOT="${output_root}" \
         BAZEL_OUTPUT_BASE="${output_root}/output" \
-        bash "${ROOT_DIR}/build.sh" -p "${python_bin}" -v "${BUILD_VERSION}" -j "${SDK_BAZEL_JOBS}"
+        bash "${ROOT_DIR}/build.sh" \
+            -p "${python_bin}" \
+            -v "${BUILD_VERSION}" \
+            -j "${SDK_BAZEL_JOBS}" \
+            "${cache_args[@]}"
     if [ "${OUTPUT_DIR}" != "${ROOT_DIR}/output" ]; then
         cp -R "${ROOT_DIR}"/output/openyuanrong_sdk-*.whl "${OUTPUT_DIR}/"
     fi
@@ -121,13 +129,21 @@ build_sdk_common() {
     local py_version="$1"
     local python_bin="$2"
     local output_root="${SDK_BAZEL_BUILD_ROOT}/common"
+    local cache_args=()
 
     printf 'Priming shared SDK native Bazel actions with %s (%s)\n' "${py_version}" "${python_bin}" >&2
+    if [ -n "${SDK_BAZEL_DISK_CACHE:-}" ]; then
+        cache_args=(-l "${SDK_BAZEL_DISK_CACHE}")
+    fi
     BUILD_SKIP_RUST=1 \
         BUILD_SDK_COMMON_ONLY=1 \
         BAZEL_OUTPUT_USER_ROOT="${output_root}" \
         BAZEL_OUTPUT_BASE="${output_root}/output" \
-        bash "${ROOT_DIR}/build.sh" -p "${python_bin}" -v "${BUILD_VERSION}" -j "${SDK_BAZEL_JOBS}"
+        bash "${ROOT_DIR}/build.sh" \
+            -p "${python_bin}" \
+            -v "${BUILD_VERSION}" \
+            -j "${SDK_BAZEL_JOBS}" \
+            "${cache_args[@]}"
 }
 
 main() {

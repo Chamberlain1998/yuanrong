@@ -59,6 +59,7 @@ SDK_COMMON_BAZEL_TARGETS="//api/cpp:cpp_strip"
 SDK_WHEEL_BAZEL_TARGETS="//api/cpp:yr_cpp_pkg //api/python:yr_python_pkg"
 BUILD_SDK_COMMON_ONLY="${BUILD_SDK_COMMON_ONLY:-0}"
 BUILD_SDK_WHEEL_ONLY="${BUILD_SDK_WHEEL_ONLY:-0}"
+LOCAL_DISK_CACHE="${BAZEL_DISK_CACHE:-}"
 
 # On macOS, check for Java availability and adjust targets
 if [[ "$(uname)" == "Darwin" ]]; then
@@ -432,10 +433,7 @@ while getopts 'athr:l:v:S:DcCgPET:p:B:m:j:gGU' opt; do
 		REMOTE_CACHE="${OPTARG}"
 		;;
 	l)
-		if [ ! -d "${OPTARG}" ]; then
-			mkdir -p ${OPTARG}
-		fi
-		BAZEL_OPTIONS="$BAZEL_OPTIONS --disk_cache=${OPTARG} "
+		LOCAL_DISK_CACHE="${OPTARG}"
 		;;
 	v)
 		BUILD_VERSION="${OPTARG}"
@@ -552,6 +550,11 @@ fi
 if [ -n "${BAZEL_REPOSITORY_CACHE:-}" ]; then
 	mkdir -p "${BAZEL_REPOSITORY_CACHE}"
 	BAZEL_OPTIONS="$BAZEL_OPTIONS --repository_cache=${BAZEL_REPOSITORY_CACHE}"
+fi
+
+if [ -n "${LOCAL_DISK_CACHE}" ]; then
+	mkdir -p "${LOCAL_DISK_CACHE}"
+	BAZEL_OPTIONS="$BAZEL_OPTIONS --disk_cache=${LOCAL_DISK_CACHE}"
 fi
 
 if [ "$BAZEL_COMMAND" != "clean" ] && [ "${SKIP_RUNTIME_DEPENDENCY_DOWNLOAD:-0}" != "1" ]; then

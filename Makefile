@@ -1,4 +1,4 @@
-.PHONY: help frontend datasystem functionsystem runtime_launcher yuanrong dashboard rust sandbox-sdk pkg aio image all clean
+.PHONY: help frontend datasystem functionsystem runtime_launcher runtime runtime-ut yuanrong dashboard rust rust-ut sandbox-sdk pkg aio image all clean
 
 # Bazel remote cache server (optional, can be set via environment variable)
 # Example: REMOTE_CACHE=https://192.0.2.1:9090 make yuanrong
@@ -10,6 +10,35 @@ DATASYSTEM_PYTHON ?= on
 DATASYSTEM_JAVA ?= on
 BUILD_VERSION ?=
 BUILD_VERSION_ARG := $(if $(BUILD_VERSION),-v $(BUILD_VERSION),)
+LOCAL_CACHE_ROOT ?=
+LOCAL_CACHE_PROFILE ?=
+FUNCTIONSYSTEM_BUILDER ?= cmake
+LOCAL_CACHE_RUN :=
+FUNCTIONSYSTEM_BUILDER_ARGS :=
+
+ifneq ($(strip $(LOCAL_CACHE_ROOT)$(LOCAL_CACHE_PROFILE)),)
+ifeq ($(strip $(LOCAL_CACHE_ROOT)),)
+$(error LOCAL_CACHE_ROOT is required when LOCAL_CACHE_PROFILE is set)
+endif
+ifeq ($(strip $(LOCAL_CACHE_PROFILE)),)
+$(error LOCAL_CACHE_PROFILE is required when LOCAL_CACHE_ROOT is set)
+endif
+ifneq ($(LOCAL_CACHE_PROFILE),release)
+ifneq ($(LOCAL_CACHE_PROFILE),ut)
+$(error LOCAL_CACHE_PROFILE must be release or ut)
+endif
+endif
+LOCAL_CACHE_RUN := bash "$(CURDIR)/scripts/with_local_build_cache.sh" --root "$(abspath $(LOCAL_CACHE_ROOT))" --profile "$(LOCAL_CACHE_PROFILE)" --
+endif
+
+ifeq ($(FUNCTIONSYSTEM_BUILDER),bazel)
+FUNCTIONSYSTEM_BUILDER_ARGS := --builder bazel
+ifneq ($(strip $(LOCAL_CACHE_ROOT)),)
+FUNCTIONSYSTEM_BUILDER_ARGS += --bazel_local_cache_root "$(abspath $(LOCAL_CACHE_ROOT))/functionsystem" --bazel_cache_profile "$(LOCAL_CACHE_PROFILE)"
+endif
+else ifneq ($(FUNCTIONSYSTEM_BUILDER),cmake)
+$(error FUNCTIONSYSTEM_BUILDER must be cmake or bazel)
+endif
 
 help:
 	@echo "Available targets:"
@@ -21,6 +50,8 @@ help:
 	@echo "  make yuanrong       - Build runtime"
 	@echo "  make dashboard      - Build dashboard"
 	@echo "  make rust           - Build rrt-runtime"
+	@echo "  make rust-ut        - Run rrt-runtime Rust tests"
+	@echo "  make runtime-ut     - Run YuanRong runtime tests"
 	@echo "  make sandbox-sdk    - Build openyuanrong-sandbox wheel"
 	@echo "  make pkg            - Copy packages to example/aio/pkg/"
 	@echo "  make aio            - Copy packages and build AIO image"
@@ -37,6 +68,10 @@ help:
 	@echo "                      Example: make all FUNCTIONSYSTEM_JOBS=6"
 	@echo "  DATASYSTEM_JAVA    - Build datasystem Java SDK jar; defaults to on"
 	@echo "                      Example: make datasystem DATASYSTEM_JAVA=off"
+	@echo "  LOCAL_CACHE_ROOT   - Enable the opt-in local developer cache"
+	@echo "  LOCAL_CACHE_PROFILE - Cache profile: release or ut (required with root)"
+	@echo "                      Example: make yuanrong LOCAL_CACHE_ROOT=.yr-cache/local LOCAL_CACHE_PROFILE=release"
+	@echo "  FUNCTIONSYSTEM_BUILDER - functionsystem builder: cmake (default) or bazel"
 
 clean:
 	@echo "Cleaning build outputs..."
@@ -72,7 +107,7 @@ frontend:
 		echo "Warning: frontend/go.mod not found, skipping mod fix"; \
 	fi
 	@if [ -f "frontend/build.sh" ]; then \
-		bash frontend/build.sh; \
+		$(LOCAL_CACHE_RUN) bash frontend/build.sh; \
 	else \
 		echo "Error: frontend/build.sh not found!"; \
 		exit 1; \
@@ -82,7 +117,7 @@ frontend:
 
 datasystem:
 	@rm -rf datasystem/output/*
-	bash datasystem/build.sh -X off -P $(DATASYSTEM_PYTHON) -J $(DATASYSTEM_JAVA) -G on -i on -j $(JOBS) $(BUILD_VERSION_ARG)
+	$(LOCAL_CACHE_RUN) bash datasystem/build.sh -X off -P $(DATASYSTEM_PYTHON) -J $(DATASYSTEM_JAVA) -G on -i on -j $(JOBS) $(BUILD_VERSION_ARG)
 	@mkdir -p output
 	@cp datasystem/output/yr-datasystem-*.tar.gz output/
 	@mkdir -p functionsystem/vendor/src
@@ -93,21 +128,21 @@ datasystem:
 
 runtime_launcher:
 	@echo "Building runtime-launcher..."
-	cd functionsystem && bash run.sh build --component runtime_launcher $(BUILD_VERSION_ARG) && cd -
+	cd functionsystem && $(LOCAL_CACHE_RUN) bash run.sh build --component runtime_launcher $(BUILD_VERSION_ARG) && cd -
 	@mkdir -p output
 	@cp functionsystem/runtime-launcher/bin/runtime/runtime-launcher output/runtime-launcher
 	@echo "Runtime-launcher built successfully!"
 
 rust:
 	@echo "Building rrt-runtime (Rust sandbox runtime)..."
-	@command -v cargo >/dev/null 2>&1 || { echo "Error: cargo not found. Build inside the rust compile image."; exit 1; }
-	cd api/rust/rrt-daemon && cargo build --release --bin rrt-runtime
-	@mkdir -p output
-	@cp api/rust/rrt-daemon/target/release/rrt-runtime output/rrt-runtime
-	@echo "rrt-runtime built successfully!"
+	$(LOCAL_CACHE_RUN) bash scripts/build_rrt_runtime.sh
+
+rust-ut:
+	@echo "Running rrt-runtime Rust tests..."
+	$(LOCAL_CACHE_RUN) cargo test --manifest-path api/rust/Cargo.toml -p rrt-daemon
 
 functionsystem:
-	cd functionsystem && bash run.sh build -j $(FUNCTIONSYSTEM_JOBS) $(BUILD_VERSION_ARG) && bash run.sh pack $(BUILD_VERSION_ARG) && cd -
+	cd functionsystem && $(LOCAL_CACHE_RUN) bash run.sh build -j $(FUNCTIONSYSTEM_JOBS) $(FUNCTIONSYSTEM_BUILDER_ARGS) $(BUILD_VERSION_ARG) && bash run.sh pack $(BUILD_VERSION_ARG) && cd -
 	mkdir -p output
 	cp -ar functionsystem/output/metrics ./
 	cp functionsystem/output/yr-functionsystem*.tar.gz output/
@@ -115,18 +150,22 @@ functionsystem:
 	cp functionsystem/runtime-launcher/bin/runtime/runtime-launcher output/ 2>/dev/null || true
 
 dashboard:
-	cd go && bash build.sh && cd -
+	cd go && $(LOCAL_CACHE_RUN) bash build.sh && cd -
 	mkdir -p output
 	cp go/output/yr-dashboard*.tar.gz output/
 	cp go/output/yr-faas*.tar.gz output/
 
 runtime:
 	@echo "Building yuanrong runtime..."
-	bash build.sh -j $(JOBS) $(BUILD_VERSION_ARG)
+	$(LOCAL_CACHE_RUN) bash build.sh -j $(JOBS) $(BUILD_VERSION_ARG)
+
+runtime-ut:
+	@echo "Running yuanrong runtime tests..."
+	$(LOCAL_CACHE_RUN) bash build.sh -t -j $(JOBS) $(BUILD_VERSION_ARG)
 
 yuanrong:
 	@echo "Building yuanrong..."
-	bash build.sh -P -j $(JOBS) $(BUILD_VERSION_ARG)
+	$(LOCAL_CACHE_RUN) bash build.sh -P -j $(JOBS) $(BUILD_VERSION_ARG)
 
 image:
 	@echo "Building aio images via deploy/sandbox/docker/build-images.sh..."
@@ -139,7 +178,7 @@ sandbox-sdk:
 		exit 1; \
 	fi
 	@mkdir -p output
-	@bash sandbox-sdk/build.sh "$(CURDIR)/output"
+	@$(LOCAL_CACHE_RUN) bash sandbox-sdk/build.sh "$(CURDIR)/output"
 
 pkg:
 	@echo "Copying packages to example/aio/pkg/..."
