@@ -115,8 +115,13 @@ def faas_call_handler(posix_args: List[Any]) -> str:
     """faas call handler"""
     _logger.info("Faas call handler called.")
     error_code = FaasErrorCode.NONE_ERROR
+    if len(posix_args) <= _INDEX_CALL_USER_EVENT:
+        err_msg = "faas executor find empty user call code"
+        _logger.error(err_msg)
+        error_code = FaasErrorCode.INIT_FUNCTION_FAIL
+        return transform_call_response_to_str(err_msg, error_code)
     event = parse_faas_param(posix_args[_INDEX_CALL_USER_EVENT])
-    trace_id = get_trace_id_from_params(posix_args[_INDEX_META_DATA])
+    trace_id = get_trace_id_from_params(posix_args[_INDEX_META_DATA]) if len(posix_args) > _INDEX_META_DATA else ""
     header = {}
     header_trace_id = ""
     if isinstance(event, dict):
@@ -145,27 +150,27 @@ def faas_call_handler(posix_args: List[Any]) -> str:
         try:
             file_path = event.get("path")
             file_data = event.get("data")
-            if file_path is None or file_data is None:
-                raise RuntimeError("file_write requires 'path' and 'data' fields")
+            if not file_path or not isinstance(file_data, (str, bytes)):
+                raise RuntimeError("file_write requires 'path' (str) and 'data' (base64 str/bytes)")
             result = FileHandler.file_write(
                 file_path, file_data, event.get("mode", "wb"),
                 event.get("upload_id", ""), event.get("is_last", False)
             )
             return transform_call_response_to_str(result, FaasErrorCode.NONE_ERROR)
-        except Exception as err:
+        except (OSError, ValueError, RuntimeError) as err:
             err_msg = f"file_write failed. err: {err}. traceback: {traceback.format_exc()}"
             _logger.exception(err_msg)
             raise RuntimeError(err_msg) from err
     if file_op == "file_read":
         try:
             file_path = event.get("path")
-            if file_path is None:
+            if not file_path:
                 raise RuntimeError("file_read requires 'path' field")
-            result = FileHandler.file_read(
-                file_path, event.get("offset", 0), event.get("length", _DEFAULT_READ_LENGTH)
-            )
+            offset = event.get("offset", 0)
+            length = event.get("length", _DEFAULT_READ_LENGTH)
+            result = FileHandler.file_read(file_path, offset, length)
             return transform_call_response_to_str(result, FaasErrorCode.NONE_ERROR)
-        except Exception as err:
+        except (OSError, ValueError, RuntimeError) as err:
             err_msg = f"file_read failed. err: {err}. traceback: {traceback.format_exc()}"
             _logger.exception(err_msg)
             raise RuntimeError(err_msg) from err

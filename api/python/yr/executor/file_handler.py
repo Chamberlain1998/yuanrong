@@ -18,11 +18,22 @@
 
 import base64
 import os
+import re
 import logging
 
 _logger = logging.getLogger(__name__)
 
 _DEFAULT_READ_LENGTH = 2097152  # 2MB, base64 encoded ≈ 2.7MB, under 4MB gRPC limit
+_MAX_WRITE_CHUNK_SIZE = 4 * 1024 * 1024  # 4MB raw data per chunk
+_MAX_READ_LENGTH = 4 * 1024 * 1024  # 4MB max per read
+_ALLOWED_WRITE_MODES = ("wb", "ab")
+_SAFE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_\-]+$")
+
+
+def _validate_upload_id(upload_id: str) -> None:
+    """Reject upload_id containing path separators or traversal sequences."""
+    if not _SAFE_ID_PATTERN.match(upload_id):
+        raise ValueError("upload_id contains invalid characters")
 
 
 class FileHandler:
@@ -55,7 +66,13 @@ class FileHandler:
         Returns:
             dict with ``success``, ``path`` and cumulative ``size``.
         """
-        raw_data = base64.b64decode(data) if data else b""
+        if mode not in _ALLOWED_WRITE_MODES:
+            raise ValueError(f"invalid mode '{mode}', must be one of {_ALLOWED_WRITE_MODES}")
+        if upload_id:
+            _validate_upload_id(upload_id)
+        raw_data = base64.b64decode(data, validate=True) if data else b""
+        if len(raw_data) > _MAX_WRITE_CHUNK_SIZE:
+            raise ValueError(f"data size {len(raw_data)} exceeds max chunk size {_MAX_WRITE_CHUNK_SIZE}")
 
         parent_dir = os.path.dirname(path)
         if parent_dir:
@@ -101,6 +118,12 @@ class FileHandler:
             ``total_size``. Raises FileNotFoundError when the file does not
             exist (left for the caller to handle).
         """
+        if offset < 0:
+            raise ValueError(f"offset must be non-negative, got {offset}")
+        if length <= 0:
+            raise ValueError(f"length must be positive, got {length}")
+        if length > _MAX_READ_LENGTH:
+            raise ValueError(f"length {length} exceeds max read size {_MAX_READ_LENGTH}")
         total_size = os.path.getsize(path)
         with open(path, "rb") as f:
             f.seek(offset)

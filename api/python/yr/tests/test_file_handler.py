@@ -105,6 +105,25 @@ class TestFileHandlerWrite(TestCase):
         with open(path, "rb") as f:
             self.assertEqual(f.read(), raw)
 
+    def test_write_rejects_invalid_mode(self):
+        """Non-whitelisted mode should be rejected."""
+        path = self._path("bad_mode.bin")
+        with self.assertRaises(ValueError):
+            FileHandler.file_write(path, base64.b64encode(b"x").decode(), mode="r+")
+
+    def test_write_rejects_invalid_upload_id(self):
+        """upload_id with path separators should be rejected."""
+        path = self._path("bad_upload_id.bin")
+        with self.assertRaises(ValueError):
+            FileHandler.file_write(path, base64.b64encode(b"x").decode(),
+                                   mode="wb", upload_id="../../evil", is_last=True)
+
+    def test_write_rejects_invalid_base64(self):
+        """Invalid base64 characters should be rejected with strict validation."""
+        path = self._path("bad_b64.bin")
+        with self.assertRaises(Exception):
+            FileHandler.file_write(path, "!!!not-base64!!!", mode="wb")
+
     def _path(self, name):
         return os.path.join(self.tmpdir, name)
 
@@ -179,6 +198,30 @@ class TestFileHandlerRead(TestCase):
         result = FileHandler.file_read(path, offset=5, length=1024)
         self.assertEqual(base64.b64decode(result["data"]), b"")
         self.assertTrue(result["is_last"])
+
+    def test_read_rejects_negative_offset(self):
+        """Negative offset should be rejected."""
+        path = self._path("neg_offset.bin")
+        with open(path, "wb") as f:
+            f.write(b"data")
+        with self.assertRaises(ValueError):
+            FileHandler.file_read(path, offset=-1, length=10)
+
+    def test_read_rejects_non_positive_length(self):
+        """Zero or negative length should be rejected."""
+        path = self._path("zero_len.bin")
+        with open(path, "wb") as f:
+            f.write(b"data")
+        with self.assertRaises(ValueError):
+            FileHandler.file_read(path, offset=0, length=0)
+
+    def test_read_rejects_oversized_length(self):
+        """Length exceeding _MAX_READ_LENGTH should be rejected."""
+        path = self._path("oversized_len.bin")
+        with open(path, "wb") as f:
+            f.write(b"data")
+        with self.assertRaises(ValueError):
+            FileHandler.file_read(path, offset=0, length=8 * 1024 * 1024)
 
     def _path(self, name):
         return os.path.join(self.tmpdir, name)
