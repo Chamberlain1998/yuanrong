@@ -26,6 +26,23 @@ export SCCACHE_IDLE_TIMEOUT=0
 export CARGO_INCREMENTAL=0
 mkdir -p "$SCCACHE_DIR" "$CACHE_BASE/bin"
 
+# RRT jobs move CARGO_HOME onto the persistent build-cache volume. Preserve the
+# builder image's registry policy instead of silently falling back to crates.io.
+_cargo_config_source="${IMAGE_CARGO_CONFIG:-}"
+if [ -z "$_cargo_config_source" ]; then
+	for _candidate in /usr/local/cargo/config.toml /root/.cargo/config.toml; do
+		if [ -r "$_candidate" ]; then
+			_cargo_config_source="$_candidate"
+			break
+		fi
+	done
+fi
+if [ -n "${CARGO_HOME:-}" ] && [ -n "$_cargo_config_source" ]; then
+	mkdir -p "$CARGO_HOME"
+	install -m 0644 "$_cargo_config_source" "$CARGO_HOME/config.toml"
+	echo "cargo registry config: $_cargo_config_source -> $CARGO_HOME/config.toml" >&2
+fi
+
 _sccache_bin="$(command -v sccache 2>/dev/null || true)"
 if [ -z "$_sccache_bin" ] && [ -x "$CACHE_BASE/bin/sccache" ]; then
 	_sccache_bin="$CACHE_BASE/bin/sccache"
@@ -33,9 +50,14 @@ fi
 
 if [ -z "$_sccache_bin" ]; then
 	_ver="0.8.2"
-	_pkg="sccache-v${_ver}-x86_64-unknown-linux-musl"
+	case "$(uname -m)" in
+		aarch64 | arm64) _sccache_arch="aarch64" ;;
+		x86_64 | amd64) _sccache_arch="x86_64" ;;
+		*) _sccache_arch="" ;;
+	esac
+	_pkg="sccache-v${_ver}-${_sccache_arch}-unknown-linux-musl"
 	echo "sccache: not present; fetching prebuilt v${_ver} -> $CACHE_BASE/bin" >&2
-	if curl -fsSL --connect-timeout 10 --max-time 180 \
+	if [ -n "$_sccache_arch" ] && curl -fsSL --connect-timeout 10 --max-time 180 \
 		"https://github.com/mozilla/sccache/releases/download/v${_ver}/${_pkg}.tar.gz" \
 		-o /tmp/sccache.tgz &&
 		tar -xzf /tmp/sccache.tgz -C /tmp &&
