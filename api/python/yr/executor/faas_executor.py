@@ -35,6 +35,7 @@ from yr.common.constants import META_PREFIX, METALEN
 from yr.functionsdk.context import init_context, init_context_invoke, load_context_meta
 from yr.functionsdk.logger_manager import UserLogManager
 from yr.functionsdk.error_code import FaasErrorCode
+from yr.executor.file_handler import FileHandler, _DEFAULT_READ_LENGTH
 
 _STAGE_INIT = "init"
 _STAGE_INVOKE = "invoke"
@@ -113,13 +114,7 @@ def faas_init_handler(posix_args: List[Any]) -> str:
 def faas_call_handler(posix_args: List[Any]) -> str:
     """faas call handler"""
     _logger.info("Faas call handler called.")
-    user_code = CodeManager().load(constants.KEY_USER_CALL_ENTRY)
     error_code = FaasErrorCode.NONE_ERROR
-    if user_code is None:
-        err_msg = "faas executor find empty user call code"
-        _logger.error(err_msg)
-        error_code = FaasErrorCode.INIT_FUNCTION_FAIL
-        return transform_call_response_to_str(err_msg, error_code)
     event = parse_faas_param(posix_args[_INDEX_CALL_USER_EVENT])
     trace_id = get_trace_id_from_params(posix_args[_INDEX_META_DATA])
     header = {}
@@ -143,6 +138,43 @@ def faas_call_handler(posix_args: List[Any]) -> str:
                 return transform_call_response_to_str(err_msg, error_code)
         if event is None:
             event = {}
+    # file_op routing: handle container file operations for agent instances
+    # before entering the user code path so they don't occupy requestQueue.
+    file_op = event.get("file_op") if isinstance(event, dict) else None
+    if file_op == "file_write":
+        try:
+            file_path = event.get("path")
+            file_data = event.get("data")
+            if file_path is None or file_data is None:
+                raise RuntimeError("file_write requires 'path' and 'data' fields")
+            result = FileHandler.file_write(
+                file_path, file_data, event.get("mode", "wb"),
+                event.get("upload_id", ""), event.get("is_last", False)
+            )
+            return transform_call_response_to_str(result, FaasErrorCode.NONE_ERROR)
+        except Exception as err:
+            err_msg = f"file_write failed. err: {err}. traceback: {traceback.format_exc()}"
+            _logger.exception(err_msg)
+            raise RuntimeError(err_msg) from err
+    if file_op == "file_read":
+        try:
+            file_path = event.get("path")
+            if file_path is None:
+                raise RuntimeError("file_read requires 'path' field")
+            result = FileHandler.file_read(
+                file_path, event.get("offset", 0), event.get("length", _DEFAULT_READ_LENGTH)
+            )
+            return transform_call_response_to_str(result, FaasErrorCode.NONE_ERROR)
+        except Exception as err:
+            err_msg = f"file_read failed. err: {err}. traceback: {traceback.format_exc()}"
+            _logger.exception(err_msg)
+            raise RuntimeError(err_msg) from err
+    user_code = CodeManager().load(constants.KEY_USER_CALL_ENTRY)
+    if user_code is None:
+        err_msg = "faas executor find empty user call code"
+        _logger.error(err_msg)
+        error_code = FaasErrorCode.INIT_FUNCTION_FAIL
+        return transform_call_response_to_str(err_msg, error_code)
     is_event_enable = isinstance(header, dict) and header.get(_EVENT_HEADER) == _EVENT_HEADER_VALUE
     context = init_context_invoke(_STAGE_INVOKE, header)
     if len(context.get_trace_id()) == 0:
