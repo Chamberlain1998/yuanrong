@@ -1188,10 +1188,10 @@ bool MemoryStore::SetInstanceRoute(const std::string &id, const std::string &ins
     }
     std::shared_ptr<ObjectDetail> objDetail = it->second;
     std::unique_lock<std::mutex> objectDetailLock(objDetail->_mu);
-    try {
+    objDetail->latestInstanceRoute = instanceRoute;
+    if (!objDetail->hasInstanceRoute) {
+        objDetail->hasInstanceRoute = true;
         objDetail->instanceRoute.set_value(instanceRoute);
-    } catch (const std::future_error &e) {
-        YRLOG_DEBUG("has already set value of objid : {}", id);
     }
     return true;
 }
@@ -1211,6 +1211,9 @@ std::string MemoryStore::GetInstanceRoute(const std::string &objId, int timeoutS
         }
         objDetail = it->second;
         std::unique_lock<std::mutex> objectDetailLock(objDetail->_mu);
+        if (objDetail->hasInstanceRoute) {
+            return objDetail->latestInstanceRoute;
+        }
         f = objDetail->instanceRouteFuture;
     }
     if (timeoutSec != NO_TIMEOUT && f.wait_for(std::chrono::seconds(timeoutSec)) != std::future_status::ready) {
@@ -1236,13 +1239,12 @@ bool MemoryStore::SetInstanceProxyID(const std::string &id, const std::string &i
 
     // Lock objectDetail outside of mu to avoid nested lock
     std::unique_lock<std::mutex> objectDetailLock(objDetail->_mu);
-    try {
+    objDetail->latestInstanceProxyID = instanceProxyID;
+    if (!objDetail->hasInstanceProxyID) {
+        objDetail->hasInstanceProxyID = true;
         objDetail->instanceProxyID.set_value(instanceProxyID);
-        return true;
-    } catch (const std::future_error &e) {
-        YRLOG_WARN("Failed to set instanceProxyID for objid {}: {}", id, e.what());
-        return false;
     }
+    return true;
 }
 
 std::string MemoryStore::GetInstanceProxyID(const std::string &objId, int timeoutSec)
@@ -1258,6 +1260,9 @@ std::string MemoryStore::GetInstanceProxyID(const std::string &objId, int timeou
         }
         std::shared_ptr<ObjectDetail> objDetail = it->second;
         std::unique_lock<std::mutex> objectDetailLock(objDetail->_mu);
+        if (objDetail->hasInstanceProxyID) {
+            return objDetail->latestInstanceProxyID;
+        }
         f = objDetail->instanceProxyIDFuture;
     }
 

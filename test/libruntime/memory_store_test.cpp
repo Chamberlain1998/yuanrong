@@ -457,12 +457,19 @@ TEST_F(MemoryStoreTest, HandleInstanceRouteTest)
     ASSERT_TRUE(ok);
     ok = memoryStore->SetInstanceRoute(id, route);
     ASSERT_TRUE(ok);
-    ok = memoryStore->SetInstanceRoute(id, route);
+    const std::string updatedRoute = "updated-route";
+    ok = memoryStore->SetInstanceRoute(id, updatedRoute);
     ASSERT_TRUE(ok);
     res = memoryStore->GetInstanceRoute(id);
-    ASSERT_TRUE(res == route);
+    ASSERT_TRUE(res == updatedRoute);
     res = memoryStore->GetInstanceRoute(id, -1);
-    ASSERT_TRUE(res == route);
+    ASSERT_TRUE(res == updatedRoute);
+
+    const std::string proxyID = "proxy-id";
+    const std::string updatedProxyID = "updated-proxy-id";
+    ASSERT_TRUE(memoryStore->SetInstanceProxyID(id, proxyID));
+    ASSERT_TRUE(memoryStore->SetInstanceProxyID(id, updatedProxyID));
+    ASSERT_EQ(memoryStore->GetInstanceProxyID(id), updatedProxyID);
 }
 
 TEST_F(MemoryStoreTest, TestAddEventCallbackWithData)

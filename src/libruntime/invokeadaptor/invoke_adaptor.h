@@ -229,7 +229,8 @@ private:
     void CreateNotifyHandler(const NotifyRequest &req);
     bool HandleCreateNotifyError(const NotifyRequest &req, const std::shared_ptr<InvokeSpec> &spec);
     void HandleCreateNotifySuccess(const NotifyRequest &req, const std::shared_ptr<InvokeSpec> &spec);
-    void CleanupCreateNotifyRequest(const std::string &rawRequestId, const NotifyRequest &req);
+    void CleanupNotifyRequest(const std::string &rawRequestId, const NotifyRequest &req);
+    void UpdateInstanceRuntimeInfo(const NotifyRequest &req, const std::string &instanceId);
     ErrorInfo WriteDataToState(const std::string &instanceId, const std::shared_ptr<Buffer> data, std::string *state);
     ErrorInfo ReadDataFromState(const std::string &instanceId, const std::string &state, std::shared_ptr<Buffer> &data);
     SignalResponse SignalHandler(const SignalRequest &req);
