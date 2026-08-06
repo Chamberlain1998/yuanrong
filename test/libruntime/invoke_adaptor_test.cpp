@@ -614,8 +614,6 @@ TEST_F(InvokeAdaptorTest, InvokeNotifyHandlerTest)
     req.mutable_runtimeinfo()->set_proxyid("new-proxy");
     invokeAdaptor->requestManager->PushRequest(spec);
     invokeAdaptor->InvokeNotifyHandler(req, err);
-    EXPECT_EQ(memoryStore->GetInstanceRoute(kMockObjectId), "new-route");
-    EXPECT_EQ(memoryStore->GetInstanceProxyID(kMockObjectId), "new-proxy");
     auto spec2 = invokeAdaptor->requestManager->GetRequest(req.requestid());
     EXPECT_TRUE(spec2 == nullptr);
     invokeAdaptor->requestManager->RemoveRequest("cae7c30c8d63f5ed01");
@@ -623,6 +621,8 @@ TEST_F(InvokeAdaptorTest, InvokeNotifyHandlerTest)
     spec->requestId = "cae7c30c8d63f5ed00";
     invokeAdaptor->requestManager->PushRequest(spec);
     invokeAdaptor->InvokeNotifyHandler(req, err);
+    EXPECT_EQ(memoryStore->GetInstanceRoute(kMockObjectId), "new-route");
+    EXPECT_EQ(memoryStore->GetInstanceProxyID(kMockObjectId), "new-proxy");
     auto spec3 = invokeAdaptor->requestManager->GetRequest(req.requestid());
     EXPECT_TRUE(spec3 == nullptr);
 
