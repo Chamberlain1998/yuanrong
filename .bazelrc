@@ -16,7 +16,7 @@ build --per_file_copt=+com_google_protobuf@-fvisibility=hidden
 build --per_file_copt="\\.cc$@-w"
 build --platforms=@local_config_platform//:host
 build --action_env=BOOST_VERSION=1.87.0
-build --action_env=BUILD_VERSION=v0.7.0
+build --define=BUILD_VERSION=v0.7.0
 build:linux --define=ENABLE_OBSERVABILITY=true
 build:linux --define=ENABLE_DATASYSTEM=true
 # macOS specific build configuration (automatically applied on macOS via --enable_platform_specific_config)

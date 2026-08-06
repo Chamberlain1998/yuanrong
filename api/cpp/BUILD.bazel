@@ -7,9 +7,9 @@ genrule(
     cmd = """
             cat $(location :src/utils/version.h.in) > $@
             if [[ "$$(uname)" == "Darwin" ]]; then
-                sed -i '' "s/@BUILD_VERSION@/$$BUILD_VERSION/g" $@
+                sed -i '' "s/@BUILD_VERSION@/$(BUILD_VERSION)/g" $@
             else
-                sed -i "s/@BUILD_VERSION@/$$BUILD_VERSION/g" $@
+                sed -i "s/@BUILD_VERSION@/$(BUILD_VERSION)/g" $@
             fi
           """,
 )

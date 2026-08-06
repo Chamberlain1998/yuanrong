@@ -12,6 +12,9 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 PIPELINE = REPO_ROOT / ".buildkite" / "pipeline.dynamic.yml"
 CACHE_CONFIG_SCRIPT = REPO_ROOT / ".buildkite" / "configure_bazel_remote_cache.sh"
 BUILD_SCRIPT = REPO_ROOT / "build.sh"
+BAZELRC = REPO_ROOT / ".bazelrc"
+CPP_BUILD = REPO_ROOT / "api" / "cpp" / "BUILD.bazel"
+JAVA_BUILD = REPO_ROOT / "api" / "java" / "BUILD.bazel"
 COMPILE_IMAGE = REPO_ROOT / "ci" / "ubuntu" / "Dockerfile.ubuntu2004"
 
 
@@ -152,19 +155,27 @@ class BuildkiteMainPackagingTest(unittest.TestCase):
     def test_validation_package_version_does_not_invalidate_all_bazel_actions(self):
         pipeline = PIPELINE.read_text(encoding="utf-8")
         build_script = BUILD_SCRIPT.read_text(encoding="utf-8")
+        bazelrc = BAZELRC.read_text(encoding="utf-8")
+        cpp_build = CPP_BUILD.read_text(encoding="utf-8")
+        java_build = JAVA_BUILD.read_text(encoding="utf-8")
 
         self.assertIn(
             'BAZEL_BUILD_VERSION="${BAZEL_BUILD_VERSION:-${BUILD_VERSION}}"',
             build_script,
         )
         self.assertIn(
-            "--action_env=BUILD_VERSION=${BAZEL_BUILD_VERSION}",
+            "--define=BUILD_VERSION=${BAZEL_BUILD_VERSION}",
             build_script,
         )
         self.assertNotIn(
-            "--action_env=BUILD_VERSION=${BUILD_VERSION}",
+            "--action_env=BUILD_VERSION=${BAZEL_BUILD_VERSION}",
             build_script,
         )
+        self.assertNotIn("--action_env=BUILD_VERSION", bazelrc)
+        self.assertIn("build --define=BUILD_VERSION=v0.7.0", bazelrc)
+        self.assertIn("BUILD_VERSION", cpp_build)
+        self.assertIn("$(BUILD_VERSION)", cpp_build)
+        self.assertGreaterEqual(java_build.count("$(BUILD_VERSION)"), 2)
 
         stable_version = (
             r'BAZEL_BUILD_VERSION="\$\${BAZEL_BUILD_VERSION:-'

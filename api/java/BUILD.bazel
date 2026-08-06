@@ -434,7 +434,7 @@ genrule(
     # make jar with native files
     cd $$WORKING_DIR
     zip -rqy yr_api_sdk.jar .
-    cp -rf yr_api_sdk.jar $$JAVA_SDK_DIR/yr-api-sdk-$$BUILD_VERSION.jar
+    cp -rf yr_api_sdk.jar $$JAVA_SDK_DIR/yr-api-sdk-$(BUILD_VERSION).jar
     cp $$BASE_DIR/api/java/yr-api-sdk/resource/sdkpom.xml $$JAVA_SDK_DIR/pom.xml
 
     cd $$BASE_DIR && cp -rf $$WORKING_DIR/yr_api_sdk.jar $@
@@ -478,7 +478,7 @@ genrule(
         echo "$(locations :create_native_jar)"
         cp -rf $(locations yr_runtime_deploy.jar) $$JAVA_SERVICE_DIR/yr-runtime-1.0.0.jar &&
         cp -rf $$BASE_DIR/api/java/yr-runtime/src/main/resources/* $$JAVA_SERVICE_DIR/ &&
-        cp -rf $(locations :lib_faas_function_sdk) $$JAVA_SDK_DIR/faas-function-sdk-$$BUILD_VERSION.jar &&
+        cp -rf $(locations :lib_faas_function_sdk) $$JAVA_SDK_DIR/faas-function-sdk-$(BUILD_VERSION).jar &&
         mkdir -p $$JAVA_SERVICE_DIR/lib &&
         chmod +w $(locations :java_strip) &&
         if [[ "$$(uname)" != "Darwin" ]]; then chrpath -r '$$ORIGIN' $(locations :java_strip) 2>/dev/null || true; fi &&
