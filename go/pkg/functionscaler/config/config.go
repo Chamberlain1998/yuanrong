@@ -43,10 +43,16 @@ const (
 	defaultDockerRootPath           = "/var/lib/docker"
 	defaultFaasschedulerSTScertPath = "/opt/certs/HMSClientCloudAccelerateService/" +
 		"HMSCaaSYuanRongWorkerManager/HMSCaaSYuanRongWorkerManager.ini"
-	defaultPredictGroupWindow       = 15 * 60 * 1000
-	defaultDataSystemTimeoutMs      = 60000
-	defaultUploadDataSystemTimeout  = 10
-	defaultAcquireWaitTimeoutMs     = 3000
+	defaultPredictGroupWindow      = 15 * 60 * 1000
+	defaultDataSystemTimeoutMs     = 60000
+	defaultUploadDataSystemTimeout = 10
+	defaultAcquireWaitTimeoutMs    = 3000
+)
+
+// SessionStoreBackend 生产环境仅允许 redis/datasystem。
+const (
+	SessionStoreBackendRedis      = "redis"
+	SessionStoreBackendDataSystem = "datasystem"
 )
 
 var (
@@ -146,8 +152,26 @@ func loadFunctionConfig(GlobalConfig *types.Configuration) error {
 	if GlobalConfig.DataSystemConfig.UploadTTLSec <= 0 {
 		GlobalConfig.DataSystemConfig.UploadTTLSec = defaultUploadDataSystemTimeout
 	}
+	if err = validateSessionStoreBackend(&GlobalConfig.SessionStoreConfig); err != nil {
+		return err
+	}
 	normalizeLiteScheduler(&GlobalConfig.LiteScheduler)
 	return nil
+}
+
+// validateSessionStoreBackend enforces sessionStore.backend: 空值默认填 datasystem，
+// 非空值必须为 redis/datasystem，否则启动失败暴露误配。
+func validateSessionStoreBackend(cfg *types.SessionStoreConfig) error {
+	switch cfg.Backend {
+	case "":
+		cfg.Backend = SessionStoreBackendDataSystem
+		return nil
+	case SessionStoreBackendRedis, SessionStoreBackendDataSystem:
+		return nil
+	default:
+		return fmt.Errorf("sessionStore.backend must be %q or %q, got: %q",
+			SessionStoreBackendRedis, SessionStoreBackendDataSystem, cfg.Backend)
+	}
 }
 
 // normalizeLiteScheduler fills default values for LiteScheduler config.

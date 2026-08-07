@@ -135,6 +135,9 @@ func (f *fakeInstanceScheduler) SignalAllInstances(signalFunc scheduler.SignalIn
 	}
 }
 
+func (f *fakeInstanceScheduler) CleanExternalSessionRecords() {
+}
+
 func (f *fakeInstanceScheduler) Destroy() {
 }
 
@@ -692,9 +695,9 @@ func TestHandleFuncOwnerChange(t *testing.T) {
 	q := NewScaledInstanceQueue(basicInsQueConfig, metricsCollector)
 	q.instanceScheduler = &concurrencyscheduler.ScaledConcurrencyScheduler{}
 	q.instanceScaler = &scaler.AutoScaler{}
-	q.HandleFuncOwnerChange(nil)
+	q.HandleFuncOwnerChange()
 	setFuncOwner = true
-	q.HandleFuncOwnerChange(nil)
+	q.HandleFuncOwnerChange()
 	assert.Equal(t, true, q.isFuncOwner)
 }
 func TestScaledInstanceQueue_HandleFaaSSchedulerUpdate(t *testing.T) {

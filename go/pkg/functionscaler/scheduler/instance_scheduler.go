@@ -94,5 +94,9 @@ type InstanceScheduler interface {
 	HandleFuncOwnerUpdate(isFuncOwner bool)
 	HandleCreateError(createErr error)
 	SignalAllInstances(signalFunc SignalInstanceFunc)
+	// CleanExternalSessionRecords 删除本 scheduler 在外部存储的 per-session 绑定记录。
+	// 仅在 queue 被彻底销毁时（函数删除 / resKey 下线）调用——scheduler 重建场景不调，
+	// 保留旧记录供新 scheduler 懒恢复。无 session store 的实现可 no-op。
+	CleanExternalSessionRecords()
 	Destroy()
 }

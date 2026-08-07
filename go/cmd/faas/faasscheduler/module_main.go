@@ -78,6 +78,11 @@ func main() {
 		logAndPrintError(errMessage)
 		return
 	}
+	if err = functionscaler.InitSessionStoreRedis(stopCh); err != nil {
+		errMessage := fmt.Sprintf("init session store redis error: %s", err.Error())
+		logAndPrintError(errMessage)
+		return
+	}
 	if err = workermanager.InitLeaseInformer(stopCh); err != nil {
 		errMessage := fmt.Sprintf("init lease informer error: %s", err.Error())
 		logAndPrintError(errMessage)

@@ -300,3 +300,26 @@ func TestLoadFunctionConfigNormalizeLite(t *testing.T) {
 		convey.So(cfg.LiteScheduler.EnabledFunctions, convey.ShouldResemble, []string{"tenant1/funcA"})
 	})
 }
+
+func TestValidateSessionStoreBackend(t *testing.T) {
+	convey.Convey("sessionStore.backend 留空默认填 datasystem", t, func() {
+		cfg := types.SessionStoreConfig{}
+		err := validateSessionStoreBackend(&cfg)
+		convey.So(err, convey.ShouldBeNil)
+		convey.So(cfg.Backend, convey.ShouldEqual, SessionStoreBackendDataSystem)
+	})
+	convey.Convey("redis/datasystem 透传不变", t, func() {
+		for _, b := range []string{SessionStoreBackendRedis, SessionStoreBackendDataSystem} {
+			cfg := types.SessionStoreConfig{Backend: b}
+			err := validateSessionStoreBackend(&cfg)
+			convey.So(err, convey.ShouldBeNil)
+			convey.So(cfg.Backend, convey.ShouldEqual, b)
+		}
+	})
+	convey.Convey("未知 backend 报错", t, func() {
+		cfg := types.SessionStoreConfig{Backend: "foo"}
+		err := validateSessionStoreBackend(&cfg)
+		convey.So(err, convey.ShouldNotBeNil)
+		convey.So(cfg.Backend, convey.ShouldEqual, "foo")
+	})
+}

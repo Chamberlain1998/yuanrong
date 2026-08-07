@@ -171,7 +171,8 @@ func (ls *LiteScheduler) upsertPool(funcSpec *types.FunctionSpecification) {
 		pool = &LiteFunctionPool{
 			funcKey: funcSpec.FuncKey, funcSpec: funcSpec,
 			instances: map[string]*LiteInstance{}, sessions: map[string]*sessionBinding{},
-			dispatcher: newDispatcher(funcSpec),
+			dispatcher:   newDispatcher(funcSpec),
+			sessionStore: newLiteSessionStore(funcSpec.FuncKey),
 		}
 		ls.pools[funcSpec.FuncKey] = pool
 		logger.Infof("lite pool created: dispatcher %s", pool.dispatcher.Policy())
@@ -186,12 +187,22 @@ func (ls *LiteScheduler) deletePool(funcKey string) {
 	ls.poolsMu.Lock()
 	pool, ok := ls.pools[funcKey]
 	if ok {
-		// Stop all session idle-unbind timers before deleting the pool.
+		// Stop all session idle-unbind timers and snapshot the sessionID list under
+		// pool.Lock, then clear the map. We do NOT call removeSessionBinding here:
+		// it would enqueue async Deletes that the about-to-stop worker would drop.
+		// Instead cleanExternalRecords deletes them synchronously below.
 		pool.Lock()
-		for sessionID := range pool.sessions {
-			pool.removeSessionBinding(sessionID)
+		sessionIDs := make([]string, 0, len(pool.sessions))
+		for sid, binding := range pool.sessions {
+			binding.stopTimer()
+			sessionIDs = append(sessionIDs, sid)
 		}
+		pool.sessions = make(map[string]*sessionBinding)
 		pool.Unlock()
+		// Stop the async worker first so no in-flight op races the sync cleanup,
+		// then synchronously delete all external records (cold path, blocking OK).
+		pool.sessionStore.stop()
+		pool.sessionStore.cleanExternalRecords(sessionIDs)
 	}
 	delete(ls.pools, funcKey)
 	ls.poolsMu.Unlock()

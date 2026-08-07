@@ -21,7 +21,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"sync"
 	"testing"
 	"time"
@@ -31,7 +30,6 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	"yuanrong.org/kernel/pkg/common/faas_common/constant"
-	"yuanrong.org/kernel/pkg/common/faas_common/datasystemclient"
 	"yuanrong.org/kernel/pkg/common/faas_common/etcd3"
 	"yuanrong.org/kernel/pkg/common/faas_common/instanceconfig"
 	"yuanrong.org/kernel/pkg/common/faas_common/queue"
@@ -41,9 +39,9 @@ import (
 	"yuanrong.org/kernel/pkg/functionscaler/lease"
 	"yuanrong.org/kernel/pkg/functionscaler/metrics"
 	"yuanrong.org/kernel/pkg/functionscaler/registry"
-	"yuanrong.org/kernel/pkg/functionscaler/rollout"
 	"yuanrong.org/kernel/pkg/functionscaler/scheduler"
 	"yuanrong.org/kernel/pkg/functionscaler/selfregister"
+	"yuanrong.org/kernel/pkg/functionscaler/session"
 	"yuanrong.org/kernel/pkg/functionscaler/types"
 )
 
@@ -155,7 +153,6 @@ func TestMain(m *testing.M) {
 		BurstScaleNum: 100000,
 	}
 	config.GlobalConfig.LeaseSpan = 500
-	config.GlobalConfig.EnableSessionRecover = true
 	registry.InitRegistry(make(chan struct{}))
 	m.Run()
 }
@@ -310,15 +307,6 @@ func TestAcquireInstanceOtherQueue(t *testing.T) {
 }
 
 func TestAcquireInstanceWithSession(t *testing.T) {
-	defer gomonkey.ApplyFunc((*sessionManager).saveSessionRecordToDataSystem, func(_ *sessionManager) {
-		return
-	}).Reset()
-	defer gomonkey.ApplyFunc((*sessionManager).deleteSessionRecordToDataSystem, func(_ *sessionManager) {
-		return
-	}).Reset()
-	defer gomonkey.ApplyFunc((*sessionManager).loadSessionFromDataSystem, func(_ *sessionManager) map[string][]SessionInDS {
-		return map[string][]SessionInDS{}
-	}).Reset()
 	bcs := newBasicConcurrencyScheduler(&types.FunctionSpecification{
 		FuncKey:          "testFunction",
 		InstanceMetaData: commonTypes.InstanceMetaData{ConcurrentNum: 4},
@@ -382,15 +370,6 @@ func TestAcquireInstanceWithSession(t *testing.T) {
 }
 
 func TestReleaseInstance(t *testing.T) {
-	defer gomonkey.ApplyFunc((*sessionManager).saveSessionRecordToDataSystem, func(_ *sessionManager) {
-		return
-	}).Reset()
-	defer gomonkey.ApplyFunc((*sessionManager).deleteSessionRecordToDataSystem, func(_ *sessionManager) {
-		return
-	}).Reset()
-	defer gomonkey.ApplyFunc((*sessionManager).loadSessionFromDataSystem, func(_ *sessionManager) map[string][]SessionInDS {
-		return map[string][]SessionInDS{}
-	}).Reset()
 	bcs := newBasicConcurrencyScheduler(&types.FunctionSpecification{
 		FuncKey:          "testFunction",
 		InstanceMetaData: commonTypes.InstanceMetaData{ConcurrentNum: 2},
@@ -441,11 +420,6 @@ func TestReleaseInstance(t *testing.T) {
 }
 
 func TestReleaseInstanceWithSession(t *testing.T) {
-	mockTimer := time.NewTimer(100 * time.Millisecond)
-	defer gomonkey.ApplyFunc(time.NewTimer, func(d time.Duration) *time.Timer {
-		mockTimer.Reset(100 * time.Millisecond)
-		return mockTimer
-	}).Reset()
 	defer gomonkey.ApplyFunc((*lease.GenericInstanceLeaseManager).CreateInstanceLease,
 		func(_ *lease.GenericInstanceLeaseManager,
 			insAlloc *types.InstanceAllocation, interval time.Duration, callback func()) (types.InstanceLease, error) {
@@ -457,6 +431,11 @@ func TestReleaseInstanceWithSession(t *testing.T) {
 	}, resspeckey.ResSpecKey{}, "",
 		queue.NewPriorityQueue(getInstanceID, priorityFuncForReservedInstance),
 		queue.NewPriorityQueue(getInstanceID, priorityFuncForReservedInstance))
+	mockTimer := time.NewTimer(100 * time.Millisecond)
+	bcs.newSessionExpireTimer = func(d time.Duration) *time.Timer {
+		mockTimer.Reset(100 * time.Millisecond)
+		return mockTimer
+	}
 	bcs.isFuncOwner = true
 	checkInUseInsThd := 0
 	checkAvailInsThd := 0
@@ -1332,188 +1311,7 @@ func TestInstanceQueue_Range(t *testing.T) {
 	})
 }
 
-func TestRecoverSessionRecordFromDataSystem(t *testing.T) {
-	config.GlobalConfig.EnableSessionRecover = true
-	defer gomonkey.ApplyFunc(datasystemclient.KVGetWithRetry, func(key string, option *datasystemclient.Option, traceID string) ([]byte, error) {
-		return []byte("{\"38b03220-7f67-473e-8000-000000000030\":[{\"sessionID\":\"bbbbb\",\"sessionTTL\":3600,\"concurrency\":3},{\"sessionID\":\"ccccc\",\"sessionTTL\":3600,\"concurrency\":3}]}"), nil
-	}).Reset()
-
-	config.GlobalConfig.DataSystemConfig = types.DataSystemConfig{
-		CurrentCluster:  "",
-		UploadWriteMode: 0,
-		UploadTTLSec:    10,
-	}
-	sc := newBasicConcurrencyScheduler(&types.FunctionSpecification{
-		FuncKey:          "testFunction",
-		InstanceMetaData: commonTypes.InstanceMetaData{ConcurrentNum: 2},
-	}, resspeckey.ResSpecKey{}, "",
-		queue.NewPriorityQueue(getInstanceID, priorityFuncForReservedInstance),
-		queue.NewPriorityQueue(getInstanceID, priorityFuncForReservedInstance))
-	sc.HandleFuncOwnerUpdate(true)
-	instance := &types.Instance{
-		InstanceID:        "38b03220-7f67-473e-8000-000000000030",
-		ConcurrentNum:     6,
-		ResKey:            resspeckey.ResSpecKey{},
-		Permanent:         true,
-		CreateSchedulerID: "abc",
-		InstanceStatus:    commonTypes.InstanceStatus{Code: int32(constant.KernelInstanceStatusRunning)},
-	}
-	assert.NoError(t, sc.AddInstance(instance))
-	i := 0
-	defer gomonkey.ApplyFunc(datasystemclient.KVPutWithRetry, func(key string, value []byte, option *datasystemclient.Option, traceID string) error {
-		i++
-		return fmt.Errorf("put failed")
-	}).Reset()
-	defer gomonkey.ApplyFunc(datasystemclient.KVDelWithRetry, func(key string, option *datasystemclient.Option, traceID string) error {
-		i++
-		return fmt.Errorf("del failed")
-	}).Reset()
-	sc.RecoverSessionRecordFromDataSystem(func(sessInfo *types.SessionInfo, instance *types.Instance) {})
-	assert.Equal(t, 2, len(sc.sessionManager.sessionMap))
-	sc.sessionManager.delSession("bbbbb")
-	sc.sessionManager.delSession("ccccc")
-	time.Sleep(10 * time.Millisecond)
-	assert.Equal(t, 4, i)
-}
-
-func TestRecoverSessionRecordFromDataSystemInGray(t *testing.T) {
-	config.GlobalConfig.EnableSessionRecover = true
-	defer gomonkey.ApplyFunc(datasystemclient.KVGetWithRetry, func(key string, option *datasystemclient.Option, traceID string) ([]byte, error) {
-		return []byte("{\"38b03220-7f67-473e-8000-000000000030\":[{\"SchedulerID\":\"1.1.1.1\",\"sessionID\":\"bbbbb\",\"sessionTTL\":3600,\"concurrency\":3},{\"SchedulerID\":\"2.2.2.2\",\"sessionID\":\"ccccc\",\"sessionTTL\":3600,\"concurrency\":3}]}"), nil
-	}).Reset()
-	delCnt := 0
-	putCnt := 0
-	defer gomonkey.ApplyFunc(datasystemclient.KVPutWithRetry, func(key string, value []byte, option *datasystemclient.Option, traceID string) error {
-		putCnt++
-		return nil
-	}).Reset()
-	defer gomonkey.ApplyFunc(datasystemclient.KVDelWithRetry, func(key string, option *datasystemclient.Option, traceID string) error {
-		delCnt++
-		return nil
-	}).Reset()
-	rollout.GetGlobalRolloutConfig().SetUpdating(true)
-	defer func() {
-		rollout.GetGlobalRolloutConfig().SetUpdating(false)
-	}()
-	config.GlobalConfig.DataSystemConfig = types.DataSystemConfig{
-		CurrentCluster:  "",
-		UploadWriteMode: 0,
-		UploadTTLSec:    10,
-	}
-	os.Setenv("POD_IP", "1.1.1.1")
-	defer os.Unsetenv("POD_IP")
-	sc := newBasicConcurrencyScheduler(&types.FunctionSpecification{
-		FuncKey:          "testFunction",
-		InstanceMetaData: commonTypes.InstanceMetaData{ConcurrentNum: 2},
-	}, resspeckey.ResSpecKey{}, "",
-		queue.NewPriorityQueue(getInstanceID, priorityFuncForReservedInstance),
-		queue.NewPriorityQueue(getInstanceID, priorityFuncForReservedInstance))
-	sc.HandleFuncOwnerUpdate(true)
-	instance := &types.Instance{
-		InstanceID:        "38b03220-7f67-473e-8000-000000000030",
-		ConcurrentNum:     6,
-		ResKey:            resspeckey.ResSpecKey{},
-		Permanent:         true,
-		CreateSchedulerID: "abc",
-		InstanceStatus:    commonTypes.InstanceStatus{Code: int32(constant.KernelInstanceStatusRunning)},
-	}
-	assert.NoError(t, sc.AddInstance(instance))
-	sc.RecoverSessionRecordFromDataSystem(func(sessInfo *types.SessionInfo, instance *types.Instance) {})
-	assert.Equal(t, 1, len(sc.sessionManager.sessionMap))
-	_, exist := sc.sessionManager.getSession("bbbbb")
-	assert.Equal(t, exist, true)
-	_, exist = sc.sessionManager.getSession("ccccc")
-	assert.Equal(t, exist, false)
-	insId := sc.sessionManager.queryInsBySessionFromDS("ccccc", "", false)
-	assert.Equal(t, insId, "38b03220-7f67-473e-8000-000000000030")
-	insId = sc.sessionManager.queryInsBySessionFromDS("aaaaa", "", false)
-	assert.Equal(t, insId, "")
-	sc.sessionManager.triggerDeleteSessionRecord()
-	time.Sleep(10 * time.Millisecond)
-	assert.Equal(t, delCnt, 0)
-	assert.Equal(t, putCnt, 2)
-}
-
-func TestRecoverSessionRecordSwitch(t *testing.T) {
-	config.GlobalConfig.EnableSessionRecover = false
-	sc := newBasicConcurrencyScheduler(&types.FunctionSpecification{
-		FuncKey:          "testFunction",
-		InstanceMetaData: commonTypes.InstanceMetaData{ConcurrentNum: 2},
-	}, resspeckey.ResSpecKey{}, "",
-		queue.NewPriorityQueue(getInstanceID, priorityFuncForReservedInstance),
-		queue.NewPriorityQueue(getInstanceID, priorityFuncForReservedInstance))
-	sc.HandleFuncOwnerUpdate(true)
-	instance := &types.Instance{
-		InstanceID:        "38b03220-7f67-473e-8000-000000000030",
-		ConcurrentNum:     6,
-		ResKey:            resspeckey.ResSpecKey{},
-		Permanent:         true,
-		CreateSchedulerID: "abc",
-		InstanceStatus:    commonTypes.InstanceStatus{Code: int32(constant.KernelInstanceStatusRunning)},
-	}
-	assert.NoError(t, sc.AddInstance(instance))
-	i := 0
-	defer gomonkey.ApplyFunc((*sessionManager).saveSessionRecordToDataSystem, func(_ *sessionManager) {
-		i++
-		return
-	}).Reset()
-	defer gomonkey.ApplyFunc((*sessionManager).deleteSessionRecordToDataSystem, func(_ *sessionManager) {
-		i++
-		return
-	}).Reset()
-	sc.sessionManager.triggerSaveSessionRecord()
-	sc.sessionManager.triggerSaveSessionRecord()
-	time.Sleep(10 * time.Millisecond)
-	assert.Equal(t, 0, i)
-}
-
-func TestSaveSessionRecord(t *testing.T) {
-	config.GlobalConfig.EnableSessionRecover = true
-	sc := newBasicConcurrencyScheduler(&types.FunctionSpecification{
-		FuncKey:          "testFunction",
-		InstanceMetaData: commonTypes.InstanceMetaData{ConcurrentNum: 2},
-	}, resspeckey.ResSpecKey{}, "",
-		queue.NewPriorityQueue(getInstanceID, priorityFuncForReservedInstance),
-		queue.NewPriorityQueue(getInstanceID, priorityFuncForReservedInstance))
-	sc.HandleFuncOwnerUpdate(true)
-	instance := &types.Instance{
-		InstanceID:        "38b03220-7f67-473e-8000-000000000030",
-		ConcurrentNum:     6,
-		ResKey:            resspeckey.ResSpecKey{},
-		Permanent:         true,
-		CreateSchedulerID: "abc",
-		InstanceStatus:    commonTypes.InstanceStatus{Code: int32(constant.KernelInstanceStatusRunning)},
-	}
-	assert.NoError(t, sc.AddInstance(instance))
-
-	i := 0
-	defer gomonkey.ApplyFunc(datasystemclient.KVPutWithRetry, func(key string, value []byte, option *datasystemclient.Option, traceID string) error {
-		i++
-		assert.Equal(t, "sessioncache--6f273ad8e3999bbc", key)
-		return nil
-	}).Reset()
-	sc.sessionManager.addSession("sessionid", &sessionRecord{
-		ttl:         0,
-		concurrency: 0,
-		sessionID:   "sessionid",
-		insElem: &instanceElement{
-			instance: instance,
-		},
-	})
-	time.Sleep(10 * time.Millisecond)
-	assert.Equal(t, 1, i)
-}
-
 func TestAcquireInstanceWithSessionFullConcurrency(t *testing.T) {
-	defer gomonkey.ApplyFunc((*sessionManager).saveSessionRecordToDataSystem, func(_ *sessionManager) {
-		return
-	}).Reset()
-	defer gomonkey.ApplyFunc((*sessionManager).deleteSessionRecordToDataSystem, func(_ *sessionManager) {
-		return
-	}).Reset()
-	defer gomonkey.ApplyFunc((*sessionManager).loadSessionFromDataSystem, func(_ *sessionManager) map[string][]SessionInDS {
-		return map[string][]SessionInDS{}
-	}).Reset()
 	bcs := newBasicConcurrencyScheduler(&types.FunctionSpecification{
 		FuncKey:          "testFunction",
 		InstanceMetaData: commonTypes.InstanceMetaData{ConcurrentNum: 4},
@@ -1553,15 +1351,6 @@ func TestAcquireInstanceWithSessionFullConcurrency(t *testing.T) {
 }
 
 func TestAcquireInstanceWithSessionFullConcurrencyInsufficient(t *testing.T) {
-	defer gomonkey.ApplyFunc((*sessionManager).saveSessionRecordToDataSystem, func(_ *sessionManager) {
-		return
-	}).Reset()
-	defer gomonkey.ApplyFunc((*sessionManager).deleteSessionRecordToDataSystem, func(_ *sessionManager) {
-		return
-	}).Reset()
-	defer gomonkey.ApplyFunc((*sessionManager).loadSessionFromDataSystem, func(_ *sessionManager) map[string][]SessionInDS {
-		return map[string][]SessionInDS{}
-	}).Reset()
 	bcs := newBasicConcurrencyScheduler(&types.FunctionSpecification{
 		FuncKey:          "testFunction",
 		InstanceMetaData: commonTypes.InstanceMetaData{ConcurrentNum: 4},
@@ -1589,15 +1378,6 @@ func TestAcquireInstanceWithSessionFullConcurrencyInsufficient(t *testing.T) {
 }
 
 func TestAcquireReleaseSessionFullConcurrency(t *testing.T) {
-	defer gomonkey.ApplyFunc((*sessionManager).saveSessionRecordToDataSystem, func(_ *sessionManager) {
-		return
-	}).Reset()
-	defer gomonkey.ApplyFunc((*sessionManager).deleteSessionRecordToDataSystem, func(_ *sessionManager) {
-		return
-	}).Reset()
-	defer gomonkey.ApplyFunc((*sessionManager).loadSessionFromDataSystem, func(_ *sessionManager) map[string][]SessionInDS {
-		return map[string][]SessionInDS{}
-	}).Reset()
 	bcs := newBasicConcurrencyScheduler(&types.FunctionSpecification{
 		FuncKey:          "testFunction",
 		InstanceMetaData: commonTypes.InstanceMetaData{ConcurrentNum: 4},
@@ -1640,15 +1420,6 @@ func TestAcquireReleaseSessionFullConcurrency(t *testing.T) {
 }
 
 func TestAcquireInstanceWithSessionFullConcurrencyMonopolyChoosesFullyIdleInstance(t *testing.T) {
-	defer gomonkey.ApplyFunc((*sessionManager).saveSessionRecordToDataSystem, func(_ *sessionManager) {
-		return
-	}).Reset()
-	defer gomonkey.ApplyFunc((*sessionManager).deleteSessionRecordToDataSystem, func(_ *sessionManager) {
-		return
-	}).Reset()
-	defer gomonkey.ApplyFunc((*sessionManager).loadSessionFromDataSystem, func(_ *sessionManager) map[string][]SessionInDS {
-		return map[string][]SessionInDS{}
-	}).Reset()
 	bcs := newBasicConcurrencyScheduler(&types.FunctionSpecification{
 		FuncKey:          "testFunction",
 		InstanceMetaData: commonTypes.InstanceMetaData{ConcurrentNum: 4},
@@ -1687,26 +1458,17 @@ func TestAcquireInstanceWithSessionFullConcurrencyMonopolyChoosesFullyIdleInstan
 }
 
 func TestSessionFullConcurrencyTTLExpire(t *testing.T) {
-	mockTimer := time.NewTimer(100 * time.Millisecond)
-	defer gomonkey.ApplyFunc(time.NewTimer, func(d time.Duration) *time.Timer {
-		mockTimer.Reset(100 * time.Millisecond)
-		return mockTimer
-	}).Reset()
-	defer gomonkey.ApplyFunc((*sessionManager).saveSessionRecordToDataSystem, func(_ *sessionManager) {
-		return
-	}).Reset()
-	defer gomonkey.ApplyFunc((*sessionManager).deleteSessionRecordToDataSystem, func(_ *sessionManager) {
-		return
-	}).Reset()
-	defer gomonkey.ApplyFunc((*sessionManager).loadSessionFromDataSystem, func(_ *sessionManager) map[string][]SessionInDS {
-		return map[string][]SessionInDS{}
-	}).Reset()
 	bcs := newBasicConcurrencyScheduler(&types.FunctionSpecification{
 		FuncKey:          "testFunction",
 		InstanceMetaData: commonTypes.InstanceMetaData{ConcurrentNum: 4},
 	}, resspeckey.ResSpecKey{}, "",
 		queue.NewPriorityQueue(getInstanceID, priorityFuncForReservedInstance),
 		queue.NewPriorityQueue(getInstanceID, priorityFuncForReservedInstance))
+	mockTimer := time.NewTimer(100 * time.Millisecond)
+	bcs.newSessionExpireTimer = func(d time.Duration) *time.Timer {
+		mockTimer.Reset(100 * time.Millisecond)
+		return mockTimer
+	}
 	bcs.HandleFuncOwnerUpdate(true)
 	checkInUseInsThd := 0
 	checkAvailInsThd := 0
@@ -1735,6 +1497,7 @@ func TestSessionFullConcurrencyTTLExpire(t *testing.T) {
 	assert.Equal(t, "instance1", acqIns.Instance.InstanceID)
 	assert.Equal(t, 4, checkInUseInsThd)
 	assert.Equal(t, 0, checkAvailInsThd)
+	assert.NotNil(t, acqIns, "acqIns must not be nil before ReleaseInstance")
 	err = bcs.ReleaseInstance(acqIns)
 	assert.Nil(t, err)
 	assert.Equal(t, 4, checkInUseInsThd)
@@ -1746,43 +1509,433 @@ func TestSessionFullConcurrencyTTLExpire(t *testing.T) {
 	assert.False(t, exist)
 }
 
-func TestRecoverSessionRecordFullConcurrency(t *testing.T) {
-	config.GlobalConfig.EnableSessionRecover = true
-	defer gomonkey.ApplyFunc(datasystemclient.KVGetWithRetry, func(key string, option *datasystemclient.Option, traceID string) ([]byte, error) {
-		return []byte("{\"instance1\":[{\"sessionID\":\"session1\",\"sessionTTL\":3600,\"concurrency\":4}]}"), nil
-	}).Reset()
-	config.GlobalConfig.DataSystemConfig = types.DataSystemConfig{
-		CurrentCluster:  "",
-		UploadWriteMode: 0,
-		UploadTTLSec:    10,
+// fakeSessionStore 记录 Save/Get/Delete 调用，用于懒恢复路径验证。
+type fakeSessionStore struct {
+	mu      sync.Mutex
+	records map[string]*session.StoreRecord
+	saveCnt int
+	getCnt  int
+	delCnt  int
+	getErr  error
+	saveErr error // 注入后 Save 返回该错误，用于验证 fail-open 不阻断主流程
+}
+
+func newFakeSessionStore() *fakeSessionStore {
+	return &fakeSessionStore{records: make(map[string]*session.StoreRecord)}
+}
+
+func (f *fakeSessionStore) Save(key string, record session.StoreRecord) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.saveCnt++
+	if f.saveErr != nil {
+		return f.saveErr
 	}
-	sc := newBasicConcurrencyScheduler(&types.FunctionSpecification{
+	cp := record
+	f.records[key] = &cp
+	return nil
+}
+
+func (f *fakeSessionStore) Get(key string) (*session.StoreRecord, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.getCnt++
+	if f.getErr != nil {
+		return nil, f.getErr
+	}
+	if r, ok := f.records[key]; ok {
+		cp := *r
+		return &cp, nil
+	}
+	return nil, nil
+}
+
+func (f *fakeSessionStore) Delete(key string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.delCnt++
+	delete(f.records, key)
+	return nil
+}
+
+func (f *fakeSessionStore) Backend() string { return "fake" }
+
+func (f *fakeSessionStore) saveCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.saveCnt
+}
+func (f *fakeSessionStore) getCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.getCnt
+}
+func (f *fakeSessionStore) delCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.delCnt
+}
+
+// newBcsWithStore 构造一个 owner scheduler 并注入 fake store，便于懒恢复测试。
+func newBcsWithStore(store session.Store) basicConcurrencyScheduler {
+	bcs := newBasicConcurrencyScheduler(&types.FunctionSpecification{
 		FuncKey:          "testFunction",
 		InstanceMetaData: commonTypes.InstanceMetaData{ConcurrentNum: 4},
 	}, resspeckey.ResSpecKey{}, "",
 		queue.NewPriorityQueue(getInstanceID, priorityFuncForReservedInstance),
 		queue.NewPriorityQueue(getInstanceID, priorityFuncForReservedInstance))
-	sc.HandleFuncOwnerUpdate(true)
-	instance := &types.Instance{
-		InstanceID:        "instance1",
-		ConcurrentNum:     4,
-		ResKey:            resspeckey.ResSpecKey{},
-		Permanent:         true,
-		CreateSchedulerID: "abc",
-		InstanceStatus:    commonTypes.InstanceStatus{Code: int32(constant.KernelInstanceStatusRunning)},
-	}
-	assert.NoError(t, sc.AddInstance(instance))
-	defer gomonkey.ApplyFunc(datasystemclient.KVPutWithRetry, func(key string, value []byte, option *datasystemclient.Option, traceID string) error {
-		return nil
-	}).Reset()
-	defer gomonkey.ApplyFunc(datasystemclient.KVDelWithRetry, func(key string, option *datasystemclient.Option, traceID string) error {
-		return nil
-	}).Reset()
-	sc.RecoverSessionRecordFromDataSystem(func(sessInfo *types.SessionInfo, instance *types.Instance) {})
-	assert.Equal(t, 1, len(sc.sessionManager.sessionMap))
-	record, exist := sc.sessionManager.getSession("session1")
+	bcs.sessionManager.coord = session.NewCoordinator(store)
+	bcs.HandleFuncOwnerUpdate(true)
+	return bcs
+}
+
+func addTestInstance(bcs *basicConcurrencyScheduler, instanceID string, concurrentNum int) {
+	bcs.AddInstance(&types.Instance{
+		InstanceID:     instanceID,
+		ConcurrentNum:  concurrentNum,
+		ResKey:         resspeckey.ResSpecKey{},
+		InstanceStatus: commonTypes.InstanceStatus{Code: int32(constant.KernelInstanceStatusRunning)},
+	})
+}
+
+// TestLocalSessionHitDoesNotAccessStore: 本地命中时不访问外部存储。第一次 acquire 走
+// miss→store miss→bind→Save；第二次 acquire 本地命中，store.Get/Save 不增加。
+func TestLocalSessionHitDoesNotAccessStore(t *testing.T) {
+	store := newFakeSessionStore()
+	bcs := newBcsWithStore(store)
+	addTestInstance(&bcs, "instance1", 4)
+	acqIns1, err := bcs.AcquireInstance(&types.InstanceAcquireRequest{
+		InstanceSession: commonTypes.InstanceSessionConfig{SessionID: "s1", Concurrency: 2},
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, "instance1", acqIns1.Instance.InstanceID)
+	assert.Equal(t, 1, store.getCount())
+	bcs.sessionManager.coord.Drain(time.Second)
+	assert.Equal(t, 1, store.saveCount())
+	acqIns2, err := bcs.AcquireInstance(&types.InstanceAcquireRequest{
+		InstanceSession: commonTypes.InstanceSessionConfig{SessionID: "s1", Concurrency: 2},
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, "instance1", acqIns2.Instance.InstanceID)
+	assert.Equal(t, 1, store.getCount(), "local hit must not access store")
+	assert.Equal(t, 1, store.saveCount(), "local hit must not save")
+}
+
+// TestLocalMissStoreMissCreatesSessionAndSaves: 本地 miss + 外部 miss → 新绑定并 Save。
+func TestLocalMissStoreMissCreatesSessionAndSaves(t *testing.T) {
+	store := newFakeSessionStore()
+	bcs := newBcsWithStore(store)
+	addTestInstance(&bcs, "instance1", 4)
+	acqIns, err := bcs.AcquireInstance(&types.InstanceAcquireRequest{
+		InstanceSession: commonTypes.InstanceSessionConfig{SessionID: "s1", Concurrency: 2},
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, "instance1", acqIns.Instance.InstanceID)
+	assert.Equal(t, 1, store.getCount())
+	bcs.sessionManager.coord.Drain(time.Second)
+	assert.Equal(t, 1, store.saveCount())
+	rec, exist := bcs.sessionManager.getSession("s1")
 	assert.True(t, exist)
-	assert.Equal(t, 4, record.concurrency)
-	assert.Equal(t, 4, len(record.allocThdMap))
-	sc.sessionManager.delSession("session1")
+	assert.Equal(t, 2, rec.concurrency)
+}
+
+// TestLocalMissStoreHitLazyRecoversAndRefreshes: 本地 miss + 外部 hit + 实例可用 → 懒恢复
+// 并用 store 的 Concurrency 重建绑定（TTL 用请求的，与缓存命中路径对齐），Save 刷新物理 TTL。
+func TestLocalMissStoreHitLazyRecoversAndRefreshes(t *testing.T) {
+	store := newFakeSessionStore()
+	sessionKey := "s1"
+	// 预置外部记录：绑定 instance1，原始 concurrency=2, ttl=100s
+	_ = store.Save(sessionKey, session.StoreRecord{
+		InstanceID: "instance1", SessionID: sessionKey, SessionTTL: 100, Concurrency: 2,
+	})
+	store.saveCnt = 0 // 重置计数，只观测懒恢复期间的 Save
+	bcs := newBcsWithStore(store)
+	addTestInstance(&bcs, "instance1", 4)
+	// 请求携带 Concurrency=0（哨兵），懒恢复时应被 store 的 Concurrency=2 覆盖；
+	// TTL=100 由请求直接提供（applyStoreDesignate 不再覆写 TTL，与缓存命中路径对齐）。
+	acqIns, err := bcs.AcquireInstance(&types.InstanceAcquireRequest{
+		InstanceSession: commonTypes.InstanceSessionConfig{SessionID: sessionKey,
+			SessionTTL: 100, Concurrency: 0},
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, "instance1", acqIns.Instance.InstanceID)
+	assert.Equal(t, 1, store.getCount(), "local miss must query store")
+	bcs.sessionManager.coord.Drain(time.Second)
+	assert.Equal(t, 1, store.saveCount(), "lazy recover must refresh store")
+	rec, exist := bcs.sessionManager.getSession(sessionKey)
+	assert.True(t, exist)
+	assert.Equal(t, 2, rec.concurrency, "concurrency restored from store record")
+	assert.Equal(t, 100*time.Second, rec.ttl, "ttl from request (not overwritten by store)")
+}
+
+// TestLocalMissStoreHitInstanceGoneDeletesAndRebinds: 本地 miss + 外部 hit 但实例已不在
+// 任何队列 → 删除外部旧记录并回退到新 session 绑定到可用实例。
+func TestLocalMissStoreHitInstanceGoneDeletesAndRebinds(t *testing.T) {
+	store := newFakeSessionStore()
+	sessionKey := "s1"
+	_ = store.Save(sessionKey, session.StoreRecord{
+		InstanceID: "instance-gone", SessionID: sessionKey, SessionTTL: 100, Concurrency: 2,
+	})
+	store.saveCnt = 0
+	bcs := newBcsWithStore(store)
+	addTestInstance(&bcs, "instance1", 4) // instance-gone 不在队列
+	acqIns, err := bcs.AcquireInstance(&types.InstanceAcquireRequest{
+		InstanceSession: commonTypes.InstanceSessionConfig{SessionID: sessionKey, Concurrency: 2},
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, "instance1", acqIns.Instance.InstanceID)
+	assert.Equal(t, 1, store.getCount(), "must query store on local miss")
+	bcs.sessionManager.coord.Drain(time.Second)
+	assert.Equal(t, 1, store.delCount(), "stale store record must be deleted")
+	assert.Equal(t, 1, store.saveCount(), "new binding must save")
+	// 外部记录应被新绑定覆盖
+	rec, _ := store.Get(sessionKey)
+	assert.NotNil(t, rec)
+	assert.Equal(t, "instance1", rec.InstanceID)
+}
+
+// TestSessionExpireDeletesStoreRecord: session 正常过期解绑时删除外部记录。
+func TestSessionExpireDeletesStoreRecord(t *testing.T) {
+	defer gomonkey.ApplyFunc((*lease.GenericInstanceLeaseManager).CreateInstanceLease,
+		func(_ *lease.GenericInstanceLeaseManager,
+			insAlloc *types.InstanceAllocation, interval time.Duration, callback func()) (types.InstanceLease, error) {
+			return nil, nil
+		}).Reset()
+	store := newFakeSessionStore()
+	bcs := newBcsWithStore(store)
+	mockTimer := time.NewTimer(100 * time.Millisecond)
+	bcs.newSessionExpireTimer = func(d time.Duration) *time.Timer {
+		mockTimer.Reset(100 * time.Millisecond)
+		return mockTimer
+	}
+	addTestInstance(&bcs, "instance1", 4)
+	acqIns, err := bcs.AcquireInstance(&types.InstanceAcquireRequest{
+		InstanceSession: commonTypes.InstanceSessionConfig{SessionID: "s1", SessionTTL: 1, Concurrency: -1},
+	})
+	assert.NoError(t, err)
+	bcs.sessionManager.coord.Drain(time.Second)
+	assert.Equal(t, 1, store.saveCount())
+	assert.NotNil(t, acqIns, "acqIns must not be nil before ReleaseInstance")
+	err = bcs.ReleaseInstance(acqIns)
+	assert.Nil(t, err)
+	time.Sleep(150 * time.Millisecond)
+	bcs.sessionManager.coord.Drain(time.Second)
+	assert.Equal(t, 1, store.delCount(), "session expire must delete store record")
+	_, exist := bcs.sessionManager.getSession("s1")
+	assert.False(t, exist)
+}
+
+// TestSessionStoreKeyWithSessionCtx: EnableSessionCtx 开启时，同一 sessionID 不同
+// sessionCtxID 在外部存储落到不同 key（sessionManager 把逻辑 cache key 透传给 store）。
+func TestSessionStoreKeyWithSessionCtx(t *testing.T) {
+	store := newFakeSessionStore()
+	bcs := newBasicConcurrencyScheduler(&types.FunctionSpecification{
+		FuncKey:          "testFunction",
+		InstanceMetaData: commonTypes.InstanceMetaData{ConcurrentNum: 4},
+	}, resspeckey.ResSpecKey{}, "",
+		queue.NewPriorityQueue(getInstanceID, priorityFuncForReservedInstance),
+		queue.NewPriorityQueue(getInstanceID, priorityFuncForReservedInstance))
+	bcs.sessionManager.coord = session.NewCoordinator(store)
+	bcs.HandleFuncOwnerUpdate(true)
+	instance := &types.Instance{InstanceID: "instance1", ConcurrentNum: 4,
+		ResKey:         resspeckey.ResSpecKey{},
+		InstanceStatus: commonTypes.InstanceStatus{Code: int32(constant.KernelInstanceStatusRunning)}}
+	// 直接用两个不同逻辑 cache key 调 addSession，验证 store 收到不同 key
+	bcs.sessionManager.addSession("s1\x00ctxA", &sessionRecord{
+		sessionID: "s1", sessionCtxID: "ctxA", concurrency: 1,
+		insElem: &instanceElement{instance: instance},
+	})
+	bcs.sessionManager.addSession("s1\x00ctxB", &sessionRecord{
+		sessionID: "s1", sessionCtxID: "ctxB", concurrency: 1,
+		insElem: &instanceElement{instance: instance},
+	})
+	bcs.sessionManager.coord.Drain(time.Second)
+	assert.Equal(t, 2, len(store.records), "different sessionCtx must produce different store keys")
+}
+
+// newBcsWithStoreAndSessionCtx 构造 EnableSessionCtx=true 的 owner scheduler，
+// 用于 sessionCtx 维度的懒恢复与 designate 路径测试。
+func newBcsWithStoreAndSessionCtx(store session.Store) basicConcurrencyScheduler {
+	bcs := newBasicConcurrencyScheduler(&types.FunctionSpecification{
+		FuncKey:          "testFunction",
+		InstanceMetaData: commonTypes.InstanceMetaData{ConcurrentNum: 4},
+		ExtendedMetaData: commonTypes.ExtendedMetaData{EnableSessionCtx: true},
+	}, resspeckey.ResSpecKey{}, "",
+		queue.NewPriorityQueue(getInstanceID, priorityFuncForReservedInstance),
+		queue.NewPriorityQueue(getInstanceID, priorityFuncForReservedInstance))
+	bcs.sessionManager.coord = session.NewCoordinator(store)
+	bcs.HandleFuncOwnerUpdate(true)
+	return bcs
+}
+
+// addTestInstanceWithCtx 添加一个带 SessionCtxID 的实例到 self queue。
+func addTestInstanceWithCtx(bcs *basicConcurrencyScheduler, instanceID, sessionCtxID string, concurrentNum int) {
+	ctxID := sessionCtxID
+	bcs.AddInstance(&types.Instance{
+		InstanceID:     instanceID,
+		ConcurrentNum:  concurrentNum,
+		ResKey:         resspeckey.ResSpecKey{},
+		InstanceStatus: commonTypes.InstanceStatus{Code: int32(constant.KernelInstanceStatusRunning)},
+		SessionCtxID:   &ctxID,
+	})
+}
+
+// addTestInstanceToOtherQueue 手动把实例塞到 other queue，绕过 checkSelfInstance 路由，
+// 用于 routeDesignateInstance 的 other-queue 命中分支测试。
+func addTestInstanceToOtherQueue(bcs *basicConcurrencyScheduler, instanceID string, concurrentNum int) {
+	insElem := &instanceElement{
+		instance: &types.Instance{
+			InstanceID:     instanceID,
+			ConcurrentNum:  concurrentNum,
+			ResKey:         resspeckey.ResSpecKey{},
+			InstanceStatus: commonTypes.InstanceStatus{Code: int32(constant.KernelInstanceStatusRunning)},
+		},
+		isNewInstance: true,
+	}
+	insElem.initThreadMap()
+	_ = bcs.otherInstanceQueue.PushBack(insElem)
+}
+
+// TestAcquireEarlyReturnNoStoreAccess: DesignateInstanceID 已设置或 SessionID 为空时，
+// acquire 路径不查 store（peekLocalSession 早返回 sessionKey=""，Phase 2 跳过）。
+func TestAcquireEarlyReturnNoStoreAccess(t *testing.T) {
+	defer gomonkey.ApplyFunc((*lease.GenericInstanceLeaseManager).CreateInstanceLease,
+		func(_ *lease.GenericInstanceLeaseManager,
+			insAlloc *types.InstanceAllocation, interval time.Duration, callback func()) (types.InstanceLease, error) {
+			return nil, nil
+		}).Reset()
+	store := newFakeSessionStore()
+	bcs := newBcsWithStore(store)
+	addTestInstance(&bcs, "instance1", 4)
+
+	// 分支1: DesignateInstanceID 已设置 → 不查 store
+	req1 := &types.InstanceAcquireRequest{
+		DesignateInstanceID: "instance1",
+		InstanceSession:     commonTypes.InstanceSessionConfig{SessionID: "s1", Concurrency: 2},
+	}
+	acqIns, err := bcs.AcquireInstance(req1)
+	assert.NoError(t, err)
+	assert.Equal(t, "instance1", acqIns.Instance.InstanceID)
+	assert.Equal(t, 0, store.getCount(), "must not query store when DesignateInstanceID is preset")
+
+	// 分支2: SessionID 为空 → 不查 store
+	req2 := &types.InstanceAcquireRequest{}
+	acqIns2, err := bcs.AcquireInstance(req2)
+	assert.NoError(t, err)
+	assert.Equal(t, "instance1", acqIns2.Instance.InstanceID)
+	assert.Equal(t, 0, store.getCount(), "must not query store when SessionID is empty")
+}
+
+// TestAcquireStoreErrorFailOpen: 本地 miss + store.Get 出错 → fail-open, 不填
+// DesignateInstanceID，按新 session 绑定，acquire 仍成功。
+func TestAcquireStoreErrorFailOpen(t *testing.T) {
+	defer gomonkey.ApplyFunc((*lease.GenericInstanceLeaseManager).CreateInstanceLease,
+		func(_ *lease.GenericInstanceLeaseManager,
+			insAlloc *types.InstanceAllocation, interval time.Duration, callback func()) (types.InstanceLease, error) {
+			return nil, nil
+		}).Reset()
+	store := newFakeSessionStore()
+	store.getErr = errors.New("redis down")
+	bcs := newBcsWithStore(store)
+	addTestInstance(&bcs, "instance1", 4)
+
+	acqIns, err := bcs.AcquireInstance(&types.InstanceAcquireRequest{
+		InstanceSession: commonTypes.InstanceSessionConfig{SessionID: "s1", Concurrency: 2},
+	})
+	assert.NoError(t, err, "store error must not block acquire (fail-open)")
+	assert.Equal(t, "instance1", acqIns.Instance.InstanceID)
+	assert.Equal(t, 1, store.getCount(), "local miss must query store once")
+}
+
+// TestRouteDesignateInstanceThreeBranches: routeDesignateInstance 三分支
+//   - designate 在 self queue → true
+//   - designate 在 other queue → false
+//   - designate 都不在 → 保留原 useSelfInstance
+func TestRouteDesignateInstanceThreeBranches(t *testing.T) {
+	store := newFakeSessionStore()
+	bcs := newBcsWithStore(store)
+	addTestInstance(&bcs, "instance-self", 4)              // self queue
+	addTestInstanceToOtherQueue(&bcs, "instance-other", 4) // other queue
+
+	// 分支1: designate 在 self queue
+	got := bcs.routeDesignateInstance(&types.InstanceAcquireRequest{
+		DesignateInstanceID: "instance-self",
+	}, false)
+	assert.True(t, got, "designate in self queue must return true")
+
+	// 分支2: designate 在 other queue
+	got = bcs.routeDesignateInstance(&types.InstanceAcquireRequest{
+		DesignateInstanceID: "instance-other",
+	}, true)
+	assert.False(t, got, "designate in other queue must return false")
+
+	// 分支3: designate 都不在 → 保留原值（true / false 各测一次）
+	got = bcs.routeDesignateInstance(&types.InstanceAcquireRequest{
+		DesignateInstanceID: "not-exist",
+	}, true)
+	assert.True(t, got, "designate in neither queue must preserve original useSelfInstance=true")
+	got = bcs.routeDesignateInstance(&types.InstanceAcquireRequest{
+		DesignateInstanceID: "not-exist",
+	}, false)
+	assert.False(t, got, "designate in neither queue must preserve original useSelfInstance=false")
+
+	// 空 designate → 保留原值（短路返回）
+	got = bcs.routeDesignateInstance(&types.InstanceAcquireRequest{}, true)
+	assert.True(t, got, "empty designate must short-circuit and preserve original")
+}
+
+// TestAcquireDesignateInstanceSessionCtxMismatchDeletesStore: 懒恢复命中但实例 SessionCtx
+// 与请求不匹配 → 视为陈旧记录，删除外部记录。这是 commit 新增的分支（acquireDesignateInstance:969）。
+func TestAcquireDesignateInstanceSessionCtxMismatchDeletesStore(t *testing.T) {
+	store := newFakeSessionStore()
+	bcs := newBcsWithStoreAndSessionCtx(store)
+	addTestInstanceWithCtx(&bcs, "instance1", "ctx-instance", 4)
+
+	// 预置外部记录：sessionKey = "s1\x00ctx-req"（EnableSessionCtx 时 cacheKey 拼接规则）
+	// 指向 instance1，但 instance1 的 SessionCtxID="ctx-instance" ≠ 请求 "ctx-req"
+	sessionKey := "s1\x00ctx-req"
+	_ = store.Save(sessionKey, session.StoreRecord{
+		InstanceID: "instance1", SessionID: "s1", SessionTTL: 100, Concurrency: 2,
+	})
+	store.saveCnt = 0 // 重置，只观测 acquire 期间的 Save
+
+	// acquire：本地 miss → store hit → 填 DesignateInstanceID="instance1"
+	// → acquireDesignateInstance → matchesSessionCtx("ctx-instance", "ctx-req")=false → delSession
+	acqIns, err := bcs.AcquireInstance(&types.InstanceAcquireRequest{
+		InstanceSession: commonTypes.InstanceSessionConfig{SessionID: "s1", Concurrency: 2},
+		SessionCtxID:    "ctx-req",
+	})
+	// 没有匹配 sessionCtx 的可用实例，acquire 失败是预期；关键是验证旧 store 记录被删
+	assert.Error(t, err, "no instance matches sessionCtx, acquire must fail")
+	assert.Nil(t, acqIns)
+	assert.Equal(t, 1, store.getCount(), "must query store on local miss")
+	bcs.sessionManager.coord.Drain(time.Second)
+	assert.Equal(t, 1, store.delCount(), "stale store record (sessionCtx mismatch) must be deleted")
+	assert.Equal(t, 0, store.saveCount(), "no new binding should be saved when acquire fails")
+}
+
+// TestSaveSessionToStoreFailureDoesNotBlockAcquire: store.Save 返回错误时，fail-open
+// 不阻断主流程，acquire 仍成功。覆盖 saveSessionToStore 的 fail-open 行为。
+func TestSaveSessionToStoreFailureDoesNotBlockAcquire(t *testing.T) {
+	defer gomonkey.ApplyFunc((*lease.GenericInstanceLeaseManager).CreateInstanceLease,
+		func(_ *lease.GenericInstanceLeaseManager,
+			insAlloc *types.InstanceAllocation, interval time.Duration, callback func()) (types.InstanceLease, error) {
+			return nil, nil
+		}).Reset()
+	store := newFakeSessionStore()
+	store.saveErr = errors.New("redis write down")
+	bcs := newBcsWithStore(store)
+	addTestInstance(&bcs, "instance1", 4)
+
+	acqIns, err := bcs.AcquireInstance(&types.InstanceAcquireRequest{
+		InstanceSession: commonTypes.InstanceSessionConfig{SessionID: "s1", Concurrency: 2},
+	})
+	assert.NoError(t, err, "store Save failure must not block acquire (fail-open)")
+	assert.Equal(t, "instance1", acqIns.Instance.InstanceID)
+	bcs.sessionManager.coord.Drain(time.Second)
+	assert.Equal(t, 1, store.saveCount(), "save must be attempted once despite error")
+	// 本地 session 仍应建立（外部存储失败不影响本地绑定）
+	rec, exist := bcs.sessionManager.getSession("s1")
+	assert.True(t, exist, "local session must be established despite store failure")
+	assert.Equal(t, 2, rec.concurrency)
 }

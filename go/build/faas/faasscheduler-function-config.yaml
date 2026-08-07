@@ -93,6 +93,23 @@ data:
             "enable": {{ .Values.global.scc.enable }},
             "secretName": {{ quote .Values.global.scc.secretName }},
             "algorithm": {{ quote .Values.global.scc.algorithm }}
+          },
+          "sessionStore": {
+            "backend": "datasystem",
+            "backendTTLSeconds": 86400,
+            "redisConfig": {
+              "clusterID": "",
+              "serverAddr": "",
+              "serverMode": "",
+              "password": "",
+              "enableTLS": false,
+              "timeoutConf": {
+                "dialTimeout": 3,
+                "readTimeout": 1,
+                "writeTimeout": 3,
+                "idleTimeout": 300
+              }
+            }
           }
         }
       }

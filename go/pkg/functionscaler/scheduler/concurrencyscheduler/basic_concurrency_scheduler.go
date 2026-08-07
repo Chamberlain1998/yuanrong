@@ -41,6 +41,7 @@ import (
 	"yuanrong.org/kernel/pkg/functionscaler/requestqueue"
 	"yuanrong.org/kernel/pkg/functionscaler/scheduler"
 	"yuanrong.org/kernel/pkg/functionscaler/selfregister"
+	"yuanrong.org/kernel/pkg/functionscaler/session"
 	"yuanrong.org/kernel/pkg/functionscaler/signalmanager"
 	"yuanrong.org/kernel/pkg/functionscaler/types"
 	"yuanrong.org/kernel/pkg/functionscaler/utils"
@@ -54,7 +55,6 @@ const (
 
 	randomThreadIDLength = 8
 
-	recordTriggerChanLen   = 10
 	maxColdStartTraceQueue = 1024
 )
 
@@ -499,20 +499,24 @@ func (i *instanceQueueWithObserver) handleSubHealthInstanceUpdateMetrics(oldInsA
 }
 
 type basicConcurrencyScheduler struct {
-	funcSpec             *types.FunctionSpecification
-	insAcqReqQueue       *requestqueue.InsAcqReqQueue
-	leaseManager         lease.InstanceLeaseManager
-	selfInstanceQueue    queue.Queue
-	otherInstanceQueue   queue.Queue
-	selfSubHealthRecord  map[string]*instanceElement
-	otherSubHealthRecord map[string]*instanceElement
-	sessionManager       *sessionManager
-	observers            map[scheduler.InstanceTopic][]*instanceObserver
-	funcKeyWithRes       string
-	concurrentNum        int
-	isFuncOwner          bool
-	stopped              bool
-	leaseInterval        time.Duration
+	funcSpec              *types.FunctionSpecification
+	insAcqReqQueue        *requestqueue.InsAcqReqQueue
+	leaseManager          lease.InstanceLeaseManager
+	selfInstanceQueue     queue.Queue
+	otherInstanceQueue    queue.Queue
+	selfSubHealthRecord   map[string]*instanceElement
+	otherSubHealthRecord  map[string]*instanceElement
+	sessionManager        *sessionManager
+	observers             map[scheduler.InstanceTopic][]*instanceObserver
+	funcKeyWithRes        string
+	concurrentNum         int
+	isFuncOwner           bool
+	stopped               bool
+	leaseInterval         time.Duration
+	sessionCtxIdleHandler func(*types.Instance)
+	// newSessionExpireTimer 创建 session 过期计时器。生产用 time.NewTimer；测试注入可控
+	// factory 避免全局 patch time.NewTimer（否则会干扰包内其他测试遗留的 lease goroutine）。
+	newSessionExpireTimer func(d time.Duration) *time.Timer
 	*sync.RWMutex
 	*sync.Cond
 	coldStartTraceMu    sync.Mutex
@@ -533,28 +537,27 @@ func newBasicConcurrencyScheduler(funcSpec *types.FunctionSpecification, resKey 
 	}
 	mutex := &sync.RWMutex{}
 	funcKeyWitRes := fmt.Sprintf("%s-%s", funcSpec.FuncKey, resKey.String())
+	funcCacheKey := makeSessionCacheKey(funcSpec.FuncMetaData.Name, funcKeyWitRes)
+	store := session.MakeStore(funcSpec.FuncKey)
 	bcs := basicConcurrencyScheduler{
-		funcSpec:             funcSpec,
-		funcKeyWithRes:       funcKeyWitRes,
-		leaseManager:         lease.NewGenericLeaseManager(funcKeyWitRes),
-		selfSubHealthRecord:  make(map[string]*instanceElement, utils.DefaultMapSize),
-		otherSubHealthRecord: make(map[string]*instanceElement, utils.DefaultMapSize),
-		sessionManager: makeSessionManager(makeSessionCacheKey(funcSpec.FuncMetaData.Name, funcKeyWitRes),
-			os.Getenv("HOST_IP"), instanceType),
-		observers:           make(map[scheduler.InstanceTopic][]*instanceObserver, utils.DefaultMapSize),
-		concurrentNum:       utils.GetConcurrentNum(funcSpec.InstanceMetaData.ConcurrentNum),
-		leaseInterval:       leaseInterval,
-		RWMutex:             mutex,
-		Cond:                sync.NewCond(mutex),
-		isFuncOwner:         selfregister.GlobalSchedulerProxy.IsFuncOwner(funcSpec.FuncKey),
-		coldStartTraceQueue: make([]*coldStartTraceContext, 0, utils.DefaultSliceSize),
+		funcSpec:              funcSpec,
+		funcKeyWithRes:        funcKeyWitRes,
+		leaseManager:          lease.NewGenericLeaseManager(funcKeyWitRes),
+		selfSubHealthRecord:   make(map[string]*instanceElement, utils.DefaultMapSize),
+		otherSubHealthRecord:  make(map[string]*instanceElement, utils.DefaultMapSize),
+		sessionManager:        makeSessionManager(funcCacheKey, os.Getenv("HOST_IP"), instanceType, store),
+		observers:             make(map[scheduler.InstanceTopic][]*instanceObserver, utils.DefaultMapSize),
+		concurrentNum:         utils.GetConcurrentNum(funcSpec.InstanceMetaData.ConcurrentNum),
+		leaseInterval:         leaseInterval,
+		newSessionExpireTimer: time.NewTimer,
+		RWMutex:               mutex,
+		Cond:                  sync.NewCond(mutex),
+		isFuncOwner:           selfregister.GlobalSchedulerProxy.IsFuncOwner(funcSpec.FuncKey),
+		coldStartTraceQueue:   make([]*coldStartTraceContext, 0, utils.DefaultSliceSize),
 	}
 	bcs.sessionManager.setFuncOwner(bcs.isFuncOwner)
 	bcs.createOtherInstanceQueue(otherInstanceQueue)
 	bcs.createSelfInstanceQueue(selfInstanceQueue)
-	if config.GlobalConfig.EnableSessionRecover {
-		go bcs.sessionManager.saveOrDeleteSessionRecordLoop()
-	}
 	return bcs
 }
 
@@ -606,65 +609,6 @@ func (bcs *basicConcurrencyScheduler) PopColdStartTrace() *types.TraceContext {
 	return nil
 }
 
-func (bcs *basicConcurrencyScheduler) RecoverSessionRecordFromDataSystem(fn utils.RecoverSessionCallback) {
-	if !config.GlobalConfig.EnableSessionRecover {
-		return
-	}
-	var sessionCache map[string][]SessionInDS
-	if bcs.sessionManager.isGrayStatus() {
-		sessionCache = bcs.sessionManager.loadSessionWithFilter(func(ds SessionInDS) bool {
-			return ds.SchedulerID == bcs.sessionManager.currentSchedulerID
-		})
-	} else {
-		sessionCache = bcs.sessionManager.loadSessionFromDataSystem()
-	}
-	if sessionCache == nil {
-		return
-	}
-	bcs.Lock()
-	bcs.loadSessionToInstanceQueue(fn, bcs.selfInstanceQueue, &sessionCache)
-	bcs.loadSessionToInstanceQueue(fn, bcs.otherInstanceQueue, &sessionCache)
-	bcs.Unlock()
-}
-
-func (bcs *basicConcurrencyScheduler) loadSessionToInstanceQueue(recoverCallback utils.RecoverSessionCallback,
-	queue queue.Queue, sessionCache *map[string][]SessionInDS) {
-	var instanceWaitBind []*instanceElement
-	queue.Range(func(obj interface{}) bool {
-		insElem, ok := obj.(*instanceElement)
-		if !ok {
-			return true
-		}
-		_, ok = (*sessionCache)[insElem.instance.InstanceID]
-		if ok {
-			instanceWaitBind = append(instanceWaitBind, insElem)
-		}
-		return true
-	})
-	for _, insElem := range instanceWaitBind {
-		sesses, ok := (*sessionCache)[insElem.instance.InstanceID]
-		if !ok {
-			continue
-		}
-		for _, sess := range sesses {
-			record, err := bcs.bindThdWithSession(queue, insElem, sess.InstanceSessionConfig)
-			if err != nil {
-				log.GetLogger().Errorf("bind session %s to instance %s failed, skip",
-					sess.SessionID, insElem.instance.InstanceID)
-				continue
-			}
-			bcs.sessionManager.addSession(bcs.getRecordCacheKey(record), record)
-			recoverCallback(&types.SessionInfo{
-				SessionID:  record.sessionID,
-				SessionCtx: record.ctx,
-			}, insElem.instance)
-			record.expiring.Store(true)
-			record.timer = time.NewTimer(record.ttl + 2*bcs.leaseInterval) // double lease timeout period.
-			go bcs.unbindInstanceSession(queue, record)
-		}
-	}
-}
-
 func (bcs *basicConcurrencyScheduler) createOtherInstanceQueue(instanceQueue queue.Queue) {
 	bcs.otherInstanceQueue = &instanceQueueWithSubHealthAndEvictingRecord{
 		instanceQueue:   instanceQueue,
@@ -690,40 +634,127 @@ func (bcs *basicConcurrencyScheduler) createSelfInstanceQueue(instanceQueue queu
 
 func (bcs *basicConcurrencyScheduler) scheduleRequest(insAcqReq *types.InstanceAcquireRequest) (
 	*types.InstanceAllocation, error) {
+	return bcs.acquireWithSessionResolve(insAcqReq)
+}
+
+// acquireWithSessionResolve 是 scheduleRequest/AcquireInstance 共用的锁拆分实现：
+//  0. 短路：noNeedQuerySession 返回 true（请求已预设 DesignateInstanceID，或不含 SessionID）时，
+//     直接跳到 Phase 3 末段的 route + acquire，不查本地缓存也不查外部存储。
+//  1. Phase 1（bcs 锁内）：peekLocalSession 查本地 sessionMap。命中→设 DesignateInstanceID。
+//     纯内存查询，持锁无 I/O。
+//  2. Phase 2（锁外）：本地 miss 时调 getSessionFromStore（singleflight 去重并发同 session）。
+//     存储 I/O 不在 bcs 锁内，不阻塞同函数其他 acquire/release/租约回收。
+//  3. Phase 3（bcs 锁内）：若 Phase 1/2 都 miss，applyStoreDesignate 重检本地（Phase 2 期间别的
+//     goroutine 可能已绑定），仍 miss 才用 store 记录填 DesignateInstanceID + TTL/Concurrency；
+//     之后 routeDesignateInstance 修正 self/other 队列，acquireInstanceInternal 实际获取实例。
+//
+// Phase 3 重检保证正确性：两个并发同 session acquire 都 miss→都 Get（singleflight 只实际查一次）
+// →先重检的先绑，后重检的看到本地已命中直接复用，不重复绑。
+func (bcs *basicConcurrencyScheduler) acquireWithSessionResolve(insAcqReq *types.InstanceAcquireRequest) (
+	*types.InstanceAllocation, error) {
+	designateInsHit := noNeedQuerySession(insAcqReq)
+	var (
+		sessionKey  string
+		localHit    bool
+		storeRecord *session.StoreRecord
+	)
+	if !designateInsHit {
+		bcs.Lock()
+		sessionKey = bcs.getSessionCacheKey(insAcqReq.InstanceSession.SessionID, insAcqReq.SessionCtxID)
+		localHit = bcs.peekLocalSession(sessionKey, insAcqReq)
+		bcs.Unlock()
+		if !localHit {
+			var err error
+			storeRecord, err = bcs.sessionManager.getSessionFromStore(sessionKey)
+			if err != nil {
+				log.GetLogger().With(zap.Any("sessionID", sessionKey)).
+					Debugf("get session from store failed, err: %v", err)
+			}
+		}
+	}
+
 	bcs.Lock()
 	defer bcs.Unlock()
+	if !designateInsHit && !localHit {
+		bcs.applyStoreDesignate(insAcqReq, sessionKey, storeRecord)
+	}
 	useSelfInstance := bcs.isFuncOwner || insAcqReq.TrafficLimited
+	useSelfInstance = bcs.routeDesignateInstance(insAcqReq, useSelfInstance)
 	var (
 		insAlloc *types.InstanceAllocation
 		err      error
 	)
-	// once a session is bound with an instance, all pending requests of this session will be marked as designate
-	// instance requests to avoid other instanceScheduler scheduling them (others don't have a bound record)
-	if insAcqReq.DesignateInstanceID == "" && len(insAcqReq.InstanceSession.SessionID) != 0 {
-		record, exist := bcs.sessionManager.getSession(bcs.getSessionCacheKey(insAcqReq.InstanceSession.SessionID,
-			insAcqReq.SessionCtxID))
-		if exist {
-			insAcqReq.DesignateInstanceID = record.insElem.instance.InstanceID
-		} else if bcs.sessionManager.isGrayStatus() || !bcs.isFuncOwner {
-			insAcqReq.DesignateInstanceID = bcs.sessionManager.queryInsBySessionFromDS(
-				insAcqReq.InstanceSession.SessionID, insAcqReq.SessionCtxID,
-				bcs.funcSpec.ExtendedMetaData.EnableSessionCtx)
-		}
-	}
-	// 适配当前灰度设计，从数据系统恢复session-instance时，需要判断instance在哪个queue，灰度需求完成后删除该逻辑
-	if insAcqReq.DesignateInstanceID != "" && (bcs.sessionManager.isGrayStatus() || !bcs.isFuncOwner) {
-		if bcs.selfInstanceQueue.GetByID(insAcqReq.DesignateInstanceID) == nil {
-			useSelfInstance = false
-		} else {
-			useSelfInstance = true
-		}
-	}
 	if useSelfInstance {
 		insAlloc, err = bcs.acquireInstanceInternal(bcs.selfInstanceQueue, insAcqReq)
 	} else {
 		insAlloc, err = bcs.acquireInstanceInternal(bcs.otherInstanceQueue, insAcqReq)
 	}
 	return insAlloc, err
+}
+
+// noNeedQuerySession 判断请求是否需要走 session 解析路径。
+// 返回 true 表示调用方已预设 DesignateInstanceID（指名请求某实例），或请求不含 SessionID
+// （无 session 亲和性需求）。acquireWithSessionResolve 据此跳过本地缓存查询、外部存储查询、
+// applyStoreDesignate 三步，直接进入 route + acquire。
+func noNeedQuerySession(insAcqReq *types.InstanceAcquireRequest) bool {
+	return insAcqReq.DesignateInstanceID != "" || len(insAcqReq.InstanceSession.SessionID) == 0
+}
+
+// peekLocalSession 查询本地 sessionMap；命中时把绑定实例的 InstanceID 写入
+// insAcqReq.DesignateInstanceID 并打 Debug 日志。sessionKey 由调用方用 getSessionCacheKey
+// 预先构造。调用方必须已持有 bcs.Lock（acquireWithSessionResolve 的 Phase 1 与
+// applyStoreDesignate 的重检均满足此约束）。返回是否命中。
+func (bcs *basicConcurrencyScheduler) peekLocalSession(sessionKey string,
+	insAcqReq *types.InstanceAcquireRequest) bool {
+	record, exist := bcs.sessionManager.getSession(sessionKey)
+	if exist {
+		insAcqReq.DesignateInstanceID = record.insElem.instance.InstanceID
+		log.GetLogger().With(zap.Any("sessionID", sessionKey)).
+			Debugf("get session from cache success, instanceID: %s", insAcqReq.DesignateInstanceID)
+	}
+	return exist
+}
+
+// applyStoreDesignate 在 bcs 锁内应用外部存储查询结果（Phase 3）。
+// 先 peekLocalSession 重检本地（Phase 2 期间别的 goroutine 可能已绑定），命中则用本地实例直接返回；
+// 仍 miss 才用 storeRecord 填 DesignateInstanceID + 用 store 的 Concurrency 回填请求
+// （Concurrency 是结构性参数，绑定时确定后不可动态改，懒恢复须沿用原绑定的值；
+// 与缓存命中路径对齐——缓存命中时复用既有 record.concurrency，请求的 Concurrency 被忽略）。
+// TTL 不从 store 覆写：与缓存命中路径对齐——缓存命中时 acquireSessionThread 用请求的 TTL
+// 更新 record.ttl；diff-write 保证 store 已是最近一次请求的 TTL，懒恢复时直接用请求的 TTL 即可，
+// 避免用 store 的旧值覆盖客户端故意变更的新 TTL。storeRecord == nil（外部 miss 或异常）时
+// fail-open，不填 DesignateInstanceID，按新 session 处理。
+func (bcs *basicConcurrencyScheduler) applyStoreDesignate(insAcqReq *types.InstanceAcquireRequest,
+	sessionKey string, storeRecord *session.StoreRecord) {
+	logger := log.GetLogger().With(zap.Any("sessionID", sessionKey))
+	if bcs.peekLocalSession(sessionKey, insAcqReq) {
+		return
+	}
+	if storeRecord == nil {
+		logger.Debugf("get session from store miss")
+		return
+	}
+	insAcqReq.DesignateInstanceID = storeRecord.InstanceID
+	insAcqReq.InstanceSession.Concurrency = storeRecord.Concurrency
+	logger.Debugf("get session from store success, instanceID: %s", insAcqReq.DesignateInstanceID)
+}
+
+// routeDesignateInstance 在 DesignateInstanceID 已设置时，按实例所在队列修正 useSelfInstance。
+// 懒恢复路径下 designate 实例可能在 self 或 other 队列（owner 崩溃后实例可能被重分配）。
+// 若 designate 已从两个队列中删除（实例被删），保留原 useSelfInstance，使上层
+// acquireDesignateInstance 返回 ErrInsNotExist 后能回退到 acquireSessionInstance 在原队列重新绑定新实例。
+func (bcs *basicConcurrencyScheduler) routeDesignateInstance(insAcqReq *types.InstanceAcquireRequest,
+	useSelfInstance bool) bool {
+	if insAcqReq.DesignateInstanceID == "" {
+		return useSelfInstance
+	}
+	if bcs.selfInstanceQueue.GetByID(insAcqReq.DesignateInstanceID) != nil {
+		return true
+	}
+	if bcs.otherInstanceQueue.GetByID(insAcqReq.DesignateInstanceID) != nil {
+		return false
+	}
+	return useSelfInstance
 }
 
 // GetInstanceNumber gets instance number inside instance queue
@@ -740,42 +771,7 @@ func (bcs *basicConcurrencyScheduler) GetInstanceNumber(onlySelf bool) int {
 // AcquireInstance acquires an instance
 func (bcs *basicConcurrencyScheduler) AcquireInstance(insAcqReq *types.InstanceAcquireRequest) (
 	*types.InstanceAllocation, error) {
-	bcs.Lock()
-	defer bcs.Unlock()
-	// use self instance when: 1. this scheduler is the funcOwner 2. this scheduler is not the funcOwner and funcOwner
-	// encounters traffic limitation so acquire request sent to this scheduler
-	// use other instance when: this scheduler is not the funcOwner and funcOwner breaks down so acquire request sent
-	// to this scheduler
-	useSelfInstance := bcs.isFuncOwner || insAcqReq.TrafficLimited
-	if insAcqReq.DesignateInstanceID == "" && len(insAcqReq.InstanceSession.SessionID) != 0 {
-		record, exist := bcs.sessionManager.getSession(bcs.getSessionCacheKey(insAcqReq.InstanceSession.SessionID,
-			insAcqReq.SessionCtxID))
-		if exist {
-			insAcqReq.DesignateInstanceID = record.insElem.instance.InstanceID
-		} else if bcs.sessionManager.isGrayStatus() || !bcs.isFuncOwner {
-			insAcqReq.DesignateInstanceID = bcs.sessionManager.queryInsBySessionFromDS(
-				insAcqReq.InstanceSession.SessionID, insAcqReq.SessionCtxID,
-				bcs.funcSpec.ExtendedMetaData.EnableSessionCtx)
-		}
-	}
-	if insAcqReq.DesignateInstanceID != "" && (bcs.sessionManager.isGrayStatus() || !bcs.isFuncOwner) {
-		// 适配当前灰度设计，从数据系统恢复session-instance时，需要判断instance在哪个queue，灰度需求完成后删除该逻辑
-		if bcs.selfInstanceQueue.GetByID(insAcqReq.DesignateInstanceID) != nil {
-			useSelfInstance = true
-		} else {
-			useSelfInstance = false
-		}
-	}
-	var (
-		insAlloc *types.InstanceAllocation
-		err      error
-	)
-	if useSelfInstance {
-		insAlloc, err = bcs.acquireInstanceInternal(bcs.selfInstanceQueue, insAcqReq)
-	} else {
-		insAlloc, err = bcs.acquireInstanceInternal(bcs.otherInstanceQueue, insAcqReq)
-	}
-	return insAlloc, err
+	return bcs.acquireWithSessionResolve(insAcqReq)
 }
 
 func (bcs *basicConcurrencyScheduler) HandleFuncSpecUpdate(funcSpec *types.FunctionSpecification) {
@@ -909,6 +905,19 @@ func (bcs *basicConcurrencyScheduler) acquireSessionInstance(instanceQueue queue
 			if insElem.instance.InstanceStatus.Code != int32(constant.KernelInstanceStatusRunning) {
 				return true
 			}
+			// When EnableSessionCtx, only bind to instances whose SessionCtxID
+			// matches the request's. This prevents binding to an instance with a
+			// different SessionCtxID, which would cause acquireSessionThread to
+			// fail with ErrInternal due to cache key mismatch.
+			if bcs.funcSpec.ExtendedMetaData.EnableSessionCtx && insAcqReq.SessionCtxID != "" {
+				instanceCtxID := ""
+				if insElem.instance.SessionCtxID != nil {
+					instanceCtxID = *insElem.instance.SessionCtxID
+				}
+				if instanceCtxID != insAcqReq.SessionCtxID {
+					return true
+				}
+			}
 			if insAcqReq.InstanceSession.Concurrency == -1 {
 				// Full-concurrency session must monopolize the whole instance, so only fully idle instances
 				// are eligible for binding.
@@ -980,6 +989,26 @@ func (bcs *basicConcurrencyScheduler) acquireDesignateInstance(instanceQueue que
 		return nil, scheduler.ErrInsSubHealthy
 	}
 	if len(insAcqReq.InstanceSession.SessionID) != 0 {
+		// sessionCtx mismatch: the designated instance's SessionCtxID doesn't match
+		// the request's. Delete the stale store record and fall through to new
+		// session binding (ErrInsNotExist triggers acquireSessionInstance fallback
+		// in acquireInstanceInternal, which filters by sessionCtx).
+		if bcs.funcSpec.ExtendedMetaData.EnableSessionCtx && insAcqReq.SessionCtxID != "" {
+			instanceCtxID := ""
+			if insElem.instance.SessionCtxID != nil {
+				instanceCtxID = *insElem.instance.SessionCtxID
+			}
+			if instanceCtxID != insAcqReq.SessionCtxID {
+				log.GetLogger().With(zap.Any("sessionID", insAcqReq.InstanceSession.SessionID),
+					zap.Any("funcKey", bcs.funcKeyWithRes)).
+					Infof("acquire designate instance %s sessionCtx mismatch: instance=%s, request=%s"+
+						", delete stale record and redispatch",
+						insAcqReq.DesignateInstanceID, instanceCtxID, insAcqReq.SessionCtxID)
+				bcs.sessionManager.delSession(bcs.getSessionCacheKey(insAcqReq.InstanceSession.SessionID,
+					insAcqReq.SessionCtxID))
+				return nil, scheduler.ErrInsNotExist
+			}
+		}
 		record, ok := bcs.sessionManager.getSession(bcs.getSessionCacheKey(insAcqReq.InstanceSession.SessionID,
 			insAcqReq.SessionCtxID))
 		// 指定的实例与session绑定的实例冲突，以指定实例为准
@@ -1133,7 +1162,13 @@ func (bcs *basicConcurrencyScheduler) acquireSessionThread(designateThreadID str
 		default:
 		}
 	}
+	// TTL 变化时差量写外部存储：先 snapshot oldTTL，赋值后比较，不同才异步入队 Save，
+	// 避免稳态下每次 acquire 都写外部存储。saveSessionToStore 异步入队，不阻塞 acquire。
+	oldTTL := record.ttl
 	record.ttl = time.Duration(sessionConfig.SessionTTL) * time.Second
+	if record.ttl != oldTTL {
+		bcs.sessionManager.saveSessionToStore(bcs.getRecordCacheKey(record), record)
+	}
 	if len(record.availThdMap) == 0 {
 		return nil, ErrNoInsThdAvail
 	}
@@ -1247,7 +1282,7 @@ func (bcs *basicConcurrencyScheduler) startUnbindInstanceSession(insQue queue.Qu
 	expiring, _ := record.expiring.Load().(bool)
 	if len(record.overAcqThdMap) == 0 && len(record.availThdMap) == len(record.allocThdMap) && !expiring {
 		record.expiring.Store(true)
-		record.timer = time.NewTimer(record.ttl)
+		record.timer = bcs.newSessionExpireTimer(record.ttl)
 		go bcs.unbindInstanceSession(insQue, record)
 	}
 }
@@ -1498,7 +1533,16 @@ func (bcs *basicConcurrencyScheduler) selectInstanceQueue(isSelfInstance bool) (
 	return bcs.otherInstanceQueue, bcs.otherSubHealthRecord
 }
 
-// Destroy destroys instanceScheduler
+// CleanExternalSessionRecords 删除本 scheduler 在外部存储的 per-session 记录。
+// 仅 queue 彻底销毁时（函数删除/resKey 下线）由 ScaledInstanceQueue.Destroy 调用。
+// scheduler 重建场景（oldInstanceScheduler.Destroy 直接调，不经过 queue.Destroy）不会触发，
+// 保留旧记录供新 scheduler 懒恢复。
+func (bcs *basicConcurrencyScheduler) CleanExternalSessionRecords() {
+	bcs.sessionManager.cleanExternalRecords()
+}
+
+// Destroy destroys instanceScheduler。不清理外部存储记录——清理由
+// CleanExternalSessionRecords 在 queue 销毁路径显式触发，Destroy 本身只停 worker + 清租约。
 func (bcs *basicConcurrencyScheduler) Destroy() {
 	bcs.Lock()
 	bcs.stopped = true

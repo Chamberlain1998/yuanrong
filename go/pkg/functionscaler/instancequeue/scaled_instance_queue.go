@@ -36,7 +36,6 @@ import (
 	"yuanrong.org/kernel/pkg/functionscaler/metrics"
 	"yuanrong.org/kernel/pkg/functionscaler/scaler"
 	"yuanrong.org/kernel/pkg/functionscaler/scheduler"
-	"yuanrong.org/kernel/pkg/functionscaler/scheduler/concurrencyscheduler"
 	"yuanrong.org/kernel/pkg/functionscaler/scheduler/microservicescheduler"
 	"yuanrong.org/kernel/pkg/functionscaler/scheduler/roundrobinscheduler"
 	"yuanrong.org/kernel/pkg/functionscaler/selfregister"
@@ -235,14 +234,10 @@ func (si *ScaledInstanceQueue) HandleFuncSpecUpdate(funcSpec *types.FunctionSpec
 	}
 }
 
-// HandleInstanceSync recover session record in scheduler
-func (si *ScaledInstanceQueue) HandleInstanceSync(fn utils.RecoverSessionCallback) {
-	if sc, ok := si.instanceScheduler.(*concurrencyscheduler.ScaledConcurrencyScheduler); ok {
-		sc.RecoverSessionRecordFromDataSystem(fn)
-	}
-	if sc, ok := si.instanceScheduler.(*concurrencyscheduler.ReservedConcurrencyScheduler); ok {
-		sc.RecoverSessionRecordFromDataSystem(fn)
-	}
+// HandleInstanceSync 是实例同步完成事件的钩子。session 绑定关系不再在此处全量恢复：
+// 恢复改为请求路径懒恢复（见 concurrencyscheduler.resolveSessionDesignate）。
+// 方法保留为空钩子，以维持实例同步事件处理结构，便于未来扩展。
+func (si *ScaledInstanceQueue) HandleInstanceSync() {
 }
 
 // HandleInsConfigUpdate updates instance configuration
@@ -317,6 +312,10 @@ func (si *ScaledInstanceQueue) Destroy() {
 	log.GetLogger().Infof("destroy instance queue type %s for function %s", si.instanceType, si.funcKeyWithRes)
 	commonUtils.SafeCloseChannel(si.stopCh)
 	si.insCreateQueue.destroy()
+	// 场景 1/2（函数删除/resKey 下线）：清理本 scheduler 的 per-session 外部记录。
+	// 必须在 instanceScheduler.Destroy（停 worker）前调——cleanExternalRecords 同步执行，
+	// 不经过异步 worker。场景 3（scheduler 重建）不走 Destroy，不触发清理。
+	si.instanceScheduler.CleanExternalSessionRecords()
 	si.instanceScheduler.Destroy()
 	si.instanceScaler.Destroy()
 	si.cleanInstances()
@@ -522,7 +521,7 @@ func (si *ScaledInstanceQueue) cleanInstances() {
 }
 
 // HandleFuncOwnerChange -
-func (si *ScaledInstanceQueue) HandleFuncOwnerChange(fn utils.RecoverSessionCallback) {
+func (si *ScaledInstanceQueue) HandleFuncOwnerChange() {
 	isFuncOwner := selfregister.GlobalSchedulerProxy.IsFuncOwner(si.funcKey)
 	si.Cond.L.Lock()
 	if si.isFuncOwner == isFuncOwner {
@@ -537,8 +536,5 @@ func (si *ScaledInstanceQueue) HandleFuncOwnerChange(fn utils.RecoverSessionCall
 	// reassign in instanceScheduler first then reset instanceScaler
 	si.instanceScheduler.HandleFuncOwnerUpdate(isFuncOwner)
 	si.instanceScaler.SetEnable(isFuncOwner)
-	// after owner change, need recover session info from datasystem
-	if isFuncOwner {
-		si.HandleInstanceSync(fn)
-	}
+	// session 恢复不再由 owner change 触发，改为请求路径懒恢复
 }

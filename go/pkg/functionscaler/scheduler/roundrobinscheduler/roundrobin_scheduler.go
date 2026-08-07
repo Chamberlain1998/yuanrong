@@ -355,6 +355,10 @@ func (rs *RoundRobinScheduler) SignalAllInstances(signalFunc scheduler.SignalIns
 	rs.RUnlock()
 }
 
+// CleanExternalSessionRecords no-op：roundrobin scheduler 不维护 session 绑定外部记录。
+func (rs *RoundRobinScheduler) CleanExternalSessionRecords() {
+}
+
 // Destroy destroys instanceScheduler
 func (rs *RoundRobinScheduler) Destroy() {
 }

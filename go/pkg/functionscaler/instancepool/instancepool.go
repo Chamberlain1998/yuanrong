@@ -1096,34 +1096,10 @@ func (gi *GenericInstancePool) removeInstance(instance *types.Instance, logger a
 }
 
 func (gi *GenericInstancePool) handleInstanceSynced() {
-	gi.Lock()
-	wg := sync.WaitGroup{}
-	for _, queue := range gi.reservedInstanceQueue {
-		wg.Add(1)
-		go func(queue *instancequeue.ScaledInstanceQueue) {
-			queue.HandleInstanceSync(gi.recoverFuncCall)
-			wg.Done()
-		}(queue)
-	}
-	for _, queue := range gi.scaledInstanceQueue {
-		wg.Add(1)
-		go func(queue *instancequeue.ScaledInstanceQueue) {
-			queue.HandleInstanceSync(gi.recoverFuncCall)
-			wg.Done()
-		}(queue)
-	}
-	gi.Unlock()
-	c := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(c)
-	}()
-	select {
-	case <-c:
-		log.GetLogger().Infof("handle all instance synced success")
-	case <-time.After(time.Minute):
-		log.GetLogger().Warnf("handle all instance synced timeout")
-	}
+	// 实例同步完成事件钩子。session 绑定关系不再在此处全量恢复：
+	// 恢复改为请求路径懒恢复（见 concurrencyscheduler.resolveSessionDesignate）。保留方法以维持实例同步事件处理结构。
+	log.GetLogger().Infof("instance synced for function %s, session recovery deferred to acquire path",
+		gi.FuncSpec.FuncKey)
 }
 
 // HandleInstanceConfigEvent updates instance configuration
@@ -1490,10 +1466,10 @@ func (gi *GenericInstancePool) handleManagedChange() {
 	log.GetLogger().Debugf("HandleFuncOwnerChange for function %s start",
 		gi.FuncSpec.FuncKey)
 	for _, q := range gi.scaledInstanceQueue {
-		q.HandleFuncOwnerChange(gi.recoverFuncCall)
+		q.HandleFuncOwnerChange()
 	}
 	for k, q := range gi.reservedInstanceQueue {
-		q.HandleFuncOwnerChange(gi.recoverFuncCall)
+		q.HandleFuncOwnerChange()
 		if _, ok := gi.insConfig[k]; ok {
 			scaledQueueHandleInsConfigUpdateFunc(q, gi.insConfig[k])
 		}

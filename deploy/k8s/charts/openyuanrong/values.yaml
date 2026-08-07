@@ -103,6 +103,21 @@ global:
       enabledTenants: []
       enabledFunctions: []
       acquireWaitTimeoutMs: 3000
+    sessionStore:
+      # 支持 "datasystem"（普通场景）或 "redis"（高性能场景），其他值启动失败。
+      backend: "datasystem"
+      backendTTLSeconds: 86400
+      redisConfig:
+        clusterID: ""
+        serverAddr: ""
+        serverMode: ""
+        password: ""
+        enableTLS: false
+        timeoutConf:
+          dialTimeout: 3
+          readTimeout: 1
+          writeTimeout: 3
+          idleTimeout: 300
   # component port
   port:
     iamAdapterHttpPort: 31218

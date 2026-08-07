@@ -24,11 +24,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"yuanrong.org/kernel/runtime/libruntime/api"
 
 	"yuanrong.org/kernel/pkg/common/faas_common/datasystemclient"
 	"yuanrong.org/kernel/pkg/common/faas_common/logger/log"
@@ -36,13 +35,30 @@ import (
 	"yuanrong.org/kernel/pkg/common/uuid"
 	"yuanrong.org/kernel/pkg/functionscaler/config"
 	"yuanrong.org/kernel/pkg/functionscaler/rollout"
+	"yuanrong.org/kernel/pkg/functionscaler/session"
 	"yuanrong.org/kernel/pkg/functionscaler/types"
 	"yuanrong.org/kernel/pkg/functionscaler/utils"
 )
 
-// SessionInDS -
-type SessionInDS struct {
-	SchedulerID                       string
+const (
+	// bulkCacheTTL bounds how long a parsed legacy bulk-package is reused
+	// across concurrent cache misses during canary, so the warm-up burst of
+	// misses on one function issues at most one DataSystem GET per window.
+	bulkCacheTTL = 2 * time.Second
+)
+
+// bulkKVGet is the DataSystem GET used by the legacy bulk-package migration
+// reader. Indirected as a package var so tests can inject a fake without a
+// live DataSystem deployment.
+var bulkKVGet = datasystemclient.KVGetWithRetry
+
+// legacySessionInDS mirrors the pre-reliability-redesign SessionInDS layout the
+// old concurrencyscheduler wrote into the function-level DataSystem bulk-package
+// (key: instanceType + funcKeyWithLabel, value: map[instanceID][]SessionInDS).
+// Used only to parse legacy bulk data during an upgrade canary so the new
+// scheduler inherits old session→instance bindings instead of rebinding.
+type legacySessionInDS struct {
+	SchedulerID                       string `json:"SchedulerID"`
 	SessionCtxID                      string `json:"sessionCtxID,omitempty"`
 	commonTypes.InstanceSessionConfig `json:",inline"`
 }
@@ -107,33 +123,41 @@ func (s *sessionRecord) GetOrReplaceDesignateThreadFromAvailThdMap(designateThre
 	return designateThreadID, nil
 }
 
+// sessionManager 维护本地 session 与实例/线程的绑定关系。
+// 外部存储（SessionStore）仅作为崩溃后懒恢复的索引：本地命中时不访问外部存储；
+// 本地 miss 时按 session cache key 查询外部记录。详见 faasscheduler Session 可靠性优化设计。
+//
+// 异步写入/单飞读/同步清理等存储协调逻辑已上移到 session.Coordinator，本结构只保留
+// sessionRecord→StoreRecord 的映射（concurrencyscheduler 的线程级绑定字段与 litescheduler
+// 不同，故映射各自保留）。详见 session.Coordinator 注释。
 type sessionManager struct {
-	currentSchedulerID  string
-	sessionMap          map[string]*sessionRecord
-	funcKeyWithLabel    string
-	recordSaveTrigger   chan struct{}
-	recordDeleteTrigger chan struct{}
-	currentNode         string
-	instanceType        types.InstanceType
-	ctx                 context.Context
-	cancel              func()
-	isFuncOwner         bool
+	currentSchedulerID string
+	sessionMap         map[string]*sessionRecord
+	funcKeyWithLabel   string
+	currentNode        string
+	instanceType       types.InstanceType
+	coord              *session.Coordinator
+	isFuncOwner        bool
+	// bulkCache/bulkLoadedAt/bulkMu back the legacy bulk-package migration reader
+	// (getRecordFromLegacyBulk). Only touched during a scheduler-upgrade canary
+	// when the primary backend is Redis. Per-function (one sessionManager per
+	// function), so the cache is naturally scoped to the function's bulk key.
+	bulkMu       sync.Mutex
+	bulkCache    map[string][]legacySessionInDS
+	bulkLoadedAt time.Time
 	*sync.RWMutex
 }
 
-func makeSessionManager(funcKeyWithLabel string, currentNode string, instanceType types.InstanceType) *sessionManager {
-	ctx, cancel := context.WithCancel(context.Background())
+func makeSessionManager(funcKeyWithLabel string, currentNode string, instanceType types.InstanceType,
+	store session.Store) *sessionManager {
 	return &sessionManager{
-		funcKeyWithLabel:    funcKeyWithLabel,
-		currentSchedulerID:  os.Getenv("POD_IP"),
-		sessionMap:          make(map[string]*sessionRecord, utils.DefaultMapSize),
-		recordSaveTrigger:   make(chan struct{}, recordTriggerChanLen),
-		recordDeleteTrigger: make(chan struct{}, recordTriggerChanLen),
-		currentNode:         currentNode,
-		instanceType:        instanceType,
-		ctx:                 ctx,
-		cancel:              cancel,
-		RWMutex:             &sync.RWMutex{},
+		funcKeyWithLabel:   funcKeyWithLabel,
+		currentSchedulerID: os.Getenv("POD_IP"),
+		sessionMap:         make(map[string]*sessionRecord, utils.DefaultMapSize),
+		currentNode:        currentNode,
+		instanceType:       instanceType,
+		coord:              session.NewCoordinator(store),
+		RWMutex:            &sync.RWMutex{},
 	}
 }
 
@@ -154,201 +178,175 @@ func (sm *sessionManager) getSession(sessionID string) (*sessionRecord, bool) {
 	return record, ok
 }
 
+// addSession 写入本地 map 后异步写外部存储。本地 map 写在 sm 锁内（快），外部 Save
+// 由 Coordinator 的 worker goroutine 锁外执行，不阻塞 bcs 锁。外部写入失败 fail-open。
 func (sm *sessionManager) addSession(sessionID string, sessionRecord *sessionRecord) {
 	sm.Lock()
 	sm.sessionMap[sessionID] = sessionRecord
 	sm.Unlock()
-	sm.triggerSaveSessionRecord()
+	sm.saveSessionToStore(sessionID, sessionRecord)
 }
 
+// delSession 删除本地 map 后异步删外部记录。本地删除在 sm 锁内（快），外部 Delete
+// 由 Coordinator 的 worker 异步执行。删除失败 fail-open。
 func (sm *sessionManager) delSession(sessionID string) {
-	isEmpty := false
 	sm.Lock()
-	_, exist := sm.sessionMap[sessionID]
 	delete(sm.sessionMap, sessionID)
-	if len(sm.sessionMap) == 0 {
-		isEmpty = true
-	}
 	sm.Unlock()
-	if isEmpty {
-		sm.triggerDeleteSessionRecord()
-		return
-	}
-	if exist {
-		sm.triggerSaveSessionRecord()
-		return
-	}
+	sm.deleteSessionFromStore(sessionID)
 }
 
-func (sm *sessionManager) stopAndClean() {
-	sm.cancel()
-	if sm.isFuncOwner && config.GlobalConfig.EnableSessionRecover {
-		sm.deleteSessionRecordToDataSystem()
+// getSessionFromStore 本地 miss 后按 session cache key 查询外部记录（singleflight 去重）。
+// 返回 (nil,nil) 表示外部 miss；返回 error 表示存储异常，调用方 fail-open 按新 session 处理。
+// 不在 bcs 锁内调用（存储 I/O）。
+//
+// 升级灰度期数据迁移：主后端干净 miss（无记录无错误）且处于灰度（rollout.IsUpdating）
+// 时，回退读取旧 scheduler 写入 DataSystem 的函数级 bulk-package，继承旧 session→instance
+// 绑定，不丢亲和性。命中后由恢复路径 addSession→saveSessionToStore 异步写入主后端（新
+// per-session key），完成 DataSystem-bulk→主后端 单向迁移。主后端无关 redis 还是 datasystem
+// 都是这套逻辑；主后端为 Noop（未配外存）时 Save 为 no-op，仅恢复本地 sessionMap 亲和性。
+// 读取次序：主后端先查（已迁移的 fresh 记录优先，避免旧 bulk 里的 stale instance 覆盖新
+// 绑定），miss 再查 bulk。
+func (sm *sessionManager) getSessionFromStore(sessionKey string) (*session.StoreRecord, error) {
+	rec, err := sm.coord.GetRecord(sessionKey)
+	if rec != nil || err != nil {
+		return rec, err
 	}
+	// Primary clean miss: during canary the new scheduler may inherit bindings
+	// the old scheduler left in the DataSystem function-level bulk-package. Same
+	// logic regardless of primary backend (Redis/DataSystem/Noop): Noop just
+	// means the async Save on recovery is a no-op, recovering local affinity only.
+	if rollout.GetGlobalRolloutConfig().IsUpdating() {
+		return sm.getRecordFromLegacyBulk(sessionKey)
+	}
+	return nil, nil
 }
 
-func (sm *sessionManager) loadSessionFromDataSystem() map[string][]SessionInDS {
-	sessionDSCache := map[string][]SessionInDS{}
-	resp, err := datasystemclient.KVGetWithRetry(string(sm.instanceType)+sm.funcKeyWithLabel,
-		&datasystemclient.Option{
-			TenantID: "0",
-			NodeIP:   sm.currentNode,
-			Cluster:  config.GlobalConfig.DataSystemConfig.CurrentCluster,
-		}, uuid.New().String())
-	if err != nil || resp == nil {
-		log.GetLogger().Warnf("recover sessionInstance from dataSystem failed, err is %s", err.Error())
-		return sessionDSCache
+// getRecordFromLegacyBulk reads the old scheduler's function-level DataSystem
+// bulk-package and extracts the binding for sessionKey. Returns (nil,nil) when
+// the session is absent (caller fail-opens as a fresh session). The parsed
+// bulk is cached for bulkCacheTTL so a burst of concurrent misses on one
+// function issues at most one DataSystem GET per window.
+func (sm *sessionManager) getRecordFromLegacyBulk(sessionKey string) (*session.StoreRecord, error) {
+	bulk, err := sm.loadLegacyBulk()
+	if err != nil || len(bulk) == 0 {
+		return nil, err
 	}
-	err = json.Unmarshal(resp, &sessionDSCache)
-	if err != nil {
-		log.GetLogger().Errorf("recover session failed, unmarshal sessCache failed, err is %s", err.Error())
-		return sessionDSCache
-	}
-	return sessionDSCache
-}
-
-func (sm *sessionManager) loadSessionWithFilter(filter func(SessionInDS) bool) map[string][]SessionInDS {
-	sessionDSCache := sm.loadSessionFromDataSystem()
-	for insId, originSessionInfo := range sessionDSCache {
-		var sessionInfos []SessionInDS
-		for _, info := range originSessionInfo {
-			if filter(info) {
-				sessionInfos = append(sessionInfos, info)
-			}
-		}
-		if len(sessionInfos) == 0 {
-			delete(sessionDSCache, insId)
-		} else {
-			sessionDSCache[insId] = sessionInfos
-		}
-	}
-	return sessionDSCache
-}
-
-func (sm *sessionManager) triggerSaveSessionRecord() {
-	if !sm.isFuncOwner {
-		return
-	}
-	select {
-	case <-sm.ctx.Done():
-	case sm.recordSaveTrigger <- struct{}{}:
-	default:
-	}
-}
-
-func (sm *sessionManager) triggerDeleteSessionRecord() {
-	if !sm.isFuncOwner {
-		return
-	}
-	select {
-	case <-sm.ctx.Done():
-	case sm.recordDeleteTrigger <- struct{}{}:
-	default:
-	}
-}
-
-func (sm *sessionManager) saveOrDeleteSessionRecordLoop() {
-	for {
-		select {
-		case _, ok := <-sm.recordSaveTrigger:
-			if !ok {
+	sessionID, sessionCtxID := splitSessionKey(sessionKey)
+	for instanceID, sessions := range bulk {
+		for i := range sessions {
+			s := &sessions[i]
+			if s.SessionID != sessionID {
 				continue
 			}
-			sm.saveSessionRecordToDataSystem()
-		case _, ok := <-sm.recordDeleteTrigger:
-			if !ok {
+			// When the session key carries a context id, require it to match too,
+			// so a ctx-scoped session does not recover against a sibling ctx.
+			if sessionCtxID != "" && s.SessionCtxID != sessionCtxID {
 				continue
 			}
-			sm.deleteSessionRecordToDataSystem()
-		case <-sm.ctx.Done():
-			return
+			return &session.StoreRecord{
+				InstanceID:   instanceID,
+				SchedulerID:  s.SchedulerID,
+				SessionID:    s.SessionID,
+				SessionCtxID: s.SessionCtxID,
+				SessionTTL:   s.SessionTTL,
+				Concurrency:  s.Concurrency,
+			}, nil
 		}
 	}
+	return nil, nil
 }
 
-func (sm *sessionManager) saveSessionRecordToDataSystem() {
-	sm.RLock()
-	sessionCache := map[string][]SessionInDS{}
-	for _, record := range sm.sessionMap {
-		if record.insElem == nil {
-			continue
-		}
-		sessionCache[record.insElem.instance.InstanceID] = append(sessionCache[record.insElem.instance.InstanceID],
-			SessionInDS{
-				SchedulerID:  sm.currentSchedulerID,
-				SessionCtxID: record.sessionCtxID,
-				InstanceSessionConfig: commonTypes.InstanceSessionConfig{
-					SessionID:   record.sessionID,
-					SessionTTL:  int(record.ttl.Seconds()),
-					Concurrency: record.concurrency,
-				},
-			},
-		)
+// loadLegacyBulk reads and parses the old scheduler's function-level
+// bulk-package from DataSystem, caching the result for bulkCacheTTL. The
+// legacy key is instanceType + funcKeyWithLabel — identical to what the old
+// scheduler wrote: funcKeyWithLabel holds makeSessionCacheKey's output, which
+// is unchanged across the reliability redesign (verified against the pre-
+// redesign sessionManager).
+func (sm *sessionManager) loadLegacyBulk() (map[string][]legacySessionInDS, error) {
+	sm.bulkMu.Lock()
+	defer sm.bulkMu.Unlock()
+	if sm.bulkCache != nil && time.Since(sm.bulkLoadedAt) < bulkCacheTTL {
+		return sm.bulkCache, nil
 	}
-	sm.RUnlock()
-	if sm.isGrayStatus() {
-		sessionDSCache := sm.loadSessionWithFilter(func(ds SessionInDS) bool {
-			return ds.SchedulerID != sm.currentSchedulerID
-		})
-		for insId, sessionInfo := range sessionCache {
-			sessionDSCache[insId] = sessionInfo
-		}
-		sessionCache = sessionDSCache
-	}
-	jsonByte, err := json.Marshal(sessionCache)
-	if err != nil {
-		log.GetLogger().Errorf("save session failed, marshal sessCache failed, err is %s", err.Error())
-		return
-	}
-	err = datasystemclient.KVPutWithRetry(string(sm.instanceType)+sm.funcKeyWithLabel, jsonByte,
-		&datasystemclient.Option{
-			TenantID:  "0",
-			NodeIP:    sm.currentNode,
-			Cluster:   config.GlobalConfig.DataSystemConfig.CurrentCluster,
-			WriteMode: api.WriteModeEnum(config.GlobalConfig.DataSystemConfig.UploadWriteMode),
-			TTLSecond: config.GlobalConfig.DataSystemConfig.UploadTTLSec,
-		}, uuid.New().String())
-	if err != nil {
-		log.GetLogger().Errorf("save session failed, put sessCache to datasystem failed, err is %s", err.Error())
-		return
-	}
-}
-
-func (sm *sessionManager) deleteSessionRecordToDataSystem() {
-	var err error
-	if sm.isGrayStatus() {
-		sm.Lock()
-		sm.sessionMap = map[string]*sessionRecord{}
-		sm.Unlock()
-		sm.saveSessionRecordToDataSystem()
-		return
-	}
-	err = datasystemclient.KVDelWithRetry(string(sm.instanceType)+sm.funcKeyWithLabel, &datasystemclient.Option{
+	key := string(sm.instanceType) + sm.funcKeyWithLabel
+	opt := &datasystemclient.Option{
 		TenantID: "0",
 		NodeIP:   sm.currentNode,
 		Cluster:  config.GlobalConfig.DataSystemConfig.CurrentCluster,
-	}, uuid.New().String())
+	}
+	resp, err := bulkKVGet(key, opt, uuid.New().String())
 	if err != nil {
-		log.GetLogger().Errorf("delete session failed, delete sessCache to datasystem failed, err is %s", err.Error())
+		log.GetLogger().Warnf("legacy bulk-package get failed, key=%s, err=%s", key, err.Error())
+		return nil, err
+	}
+	bulk := make(map[string][]legacySessionInDS)
+	if len(resp) == 0 {
+		sm.bulkCache = bulk
+		sm.bulkLoadedAt = time.Now()
+		return sm.bulkCache, nil
+	}
+	if err := json.Unmarshal(resp, &bulk); err != nil {
+		log.GetLogger().Warnf("legacy bulk-package unmarshal failed, key=%s, err=%s", key, err.Error())
+		return nil, err
+	}
+	sm.bulkCache = bulk
+	sm.bulkLoadedAt = time.Now()
+	return sm.bulkCache, nil
+}
+
+// splitSessionKey splits a session cache key ("sessionID" or
+// "sessionID\x00sessionCtxID") back into its parts, using the same NUL
+// separator as types.JoinKey. Used only to search the legacy bulk-package,
+// which is keyed by raw SessionID/SessionCtxID, not by the cache key.
+func splitSessionKey(sessionKey string) (sessionID, sessionCtxID string) {
+	if i := strings.IndexByte(sessionKey, 0x00); i >= 0 {
+		return sessionKey[:i], sessionKey[i+1:]
+	}
+	return sessionKey, ""
+}
+
+// deleteSessionFromStore 异步删除外部记录。
+func (sm *sessionManager) deleteSessionFromStore(sessionKey string) {
+	sm.coord.DeleteRecord(sessionKey)
+}
+
+// saveSessionToStore 从 sessionRecord 映射出 StoreRecord 快照并异步入队。record 快照是
+// 值拷贝，避免 insElem 后续被改。concurrencyscheduler 特有的线程级字段（concurrency）
+// 一并记录以便恢复原始绑定参数。
+func (sm *sessionManager) saveSessionToStore(sessionKey string, record *sessionRecord) {
+	if record == nil || record.insElem == nil || record.insElem.instance == nil {
 		return
 	}
-}
-
-func (sm *sessionManager) queryInsBySessionFromDS(sessionID, sessionCtxID string, enableSessionCtx bool) string {
-	sessionCache := sm.loadSessionFromDataSystem()
-	for insId, sessionInDS := range sessionCache {
-		for _, sessionInfo := range sessionInDS {
-			if sessionID == sessionInfo.SessionID &&
-				(!enableSessionCtx || sessionCtxID == sessionInfo.SessionCtxID) {
-				return insId
-			}
-		}
+	storeRecord := session.StoreRecord{
+		InstanceID:   record.insElem.instance.InstanceID,
+		SchedulerID:  sm.currentSchedulerID,
+		SessionID:    record.sessionID,
+		SessionCtxID: record.sessionCtxID,
+		SessionTTL:   int(record.ttl.Seconds()),
+		Concurrency:  record.concurrency,
 	}
-	return ""
+	sm.coord.SaveRecord(sessionKey, storeRecord)
 }
 
-func (sm *sessionManager) isGrayStatus() bool {
-	return rollout.GetGlobalRolloutConfig().IsUpdating()
+// stopAndClean 取消 Coordinator worker。不删 per-session 外部记录——清理由
+// CleanExternalSessionRecords（queue 销毁时）显式触发，scheduler 重建场景不调。
+func (sm *sessionManager) stopAndClean() {
+	sm.coord.Stop()
+}
+
+// cleanExternalRecords 删除本 scheduler 在外部存储的全部 per-session 记录。
+// 锁内拷贝 sessionKey 列表（避免迭代期间 map 被改），交由 Coordinator 同步 Delete。
+// 同步执行（Destroy 是 teardown 非热路径，不经过异步队列，避免 worker 停止后丢 op）。
+// 仅场景 1/2（函数删除 / resKey 下线，queue 彻底销毁）调用；场景 3（scheduler 重建）不调。
+func (sm *sessionManager) cleanExternalRecords() {
+	sm.RLock()
+	keys := make([]string, 0, len(sm.sessionMap))
+	for key := range sm.sessionMap {
+		keys = append(keys, key)
+	}
+	sm.RUnlock()
+	sm.coord.CleanRecords(keys)
 }
 
 func makeSessionCacheKey(funcName, funcKeyWithRes string) string {
