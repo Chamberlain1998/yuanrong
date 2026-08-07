@@ -185,25 +185,22 @@ void AsyncHttpsClient::OnRead(const std::shared_ptr<std::string> requestId, cons
 void AsyncHttpsClient::GracefulExit() noexcept
 {
     SetConnInActive();
-    boost::system::error_code ec = {};
-    if (stream_) {
-        YRLOG_DEBUG("start shutdown ssl stream.");
-        stream_->shutdown(ec);
-        if (ec) {
-            return;
-        }
-        auto &sock = stream_->next_layer().socket();
-        sock.shutdown(boost::asio::ip::tcp::socket::shutdown_both, ec);
-        if (ec) {
-            YRLOG_WARN("Socket shutdown failed: {}", ec.message().c_str());
-            return;
-        }
-        sock.close(ec);
-        if (ec) {
-            YRLOG_WARN("Socket close failed: {}", ec.message().c_str());
-            return;
-        }
+    if (!stream_) {
+        return;
     }
+    // ReInit() is invoked on ClientManager's strand. A synchronous SSL
+    // shutdown can block indefinitely when the peer/proxy has already dropped
+    // the TCP connection (no close_notify), stalling TryDispatch for every
+    // subsequent HTTP request (including in-flight cmd_poll retries / lease).
+    // For reconnect we only need to discard the old socket; skip SSL
+    // close_notify and force-close instead.
+    boost::system::error_code ec;
+    YRLOG_DEBUG("force close https stream (skip blocking ssl shutdown).");
+    auto &sock = stream_->next_layer().socket();
+    sock.cancel(ec);
+    sock.shutdown(boost::asio::ip::tcp::socket::shutdown_both, ec);
+    sock.close(ec);
+    stream_.reset();
 }
 
 void AsyncHttpsClient::Stop()
