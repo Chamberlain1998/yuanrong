@@ -1,4 +1,4 @@
-.PHONY: help frontend datasystem functionsystem runtime_launcher runtime runtime-ut yuanrong dashboard rust rust-ut sandbox-sdk pkg aio image all clean local-init local-release local-ut
+.PHONY: help frontend datasystem functionsystem runtime_launcher runtime runtime-ut yuanrong dashboard rust rust-ut sandbox-sdk pkg aio image all clean
 
 # Bazel remote cache server (optional, can be set via environment variable)
 # Example: REMOTE_CACHE=https://192.0.2.1:9090 make yuanrong
@@ -13,6 +13,7 @@ BUILD_VERSION_ARG := $(if $(BUILD_VERSION),-v $(BUILD_VERSION),)
 LOCAL_CACHE_ROOT ?=
 LOCAL_CACHE_PROFILE ?=
 LOCAL_BUILD_PROTOCOL ?= 2
+LOCAL_CACHE_WRAPPER ?= $(YR_LOCAL_BUILD_CACHE_WRAPPER)
 FUNCTIONSYSTEM_BUILDER ?=
 LOCAL_CACHE_RUN :=
 FUNCTIONSYSTEM_BUILDER_ARGS :=
@@ -34,7 +35,10 @@ ifneq ($(LOCAL_CACHE_PROFILE),ut)
 $(error LOCAL_CACHE_PROFILE must be release or ut)
 endif
 endif
-LOCAL_CACHE_RUN := bash "$(CURDIR)/scripts/with_local_build_cache.sh" --root "$(abspath $(LOCAL_CACHE_ROOT))" --profile "$(LOCAL_CACHE_PROFILE)" --
+ifeq ($(strip $(LOCAL_CACHE_WRAPPER)),)
+$(error LOCAL_CACHE_WRAPPER is required with local cache; run the yr-dev local-build skill)
+endif
+LOCAL_CACHE_RUN := bash "$(LOCAL_CACHE_WRAPPER)" --root "$(abspath $(LOCAL_CACHE_ROOT))" --profile "$(LOCAL_CACHE_PROFILE)" --
 endif
 
 ifeq ($(strip $(FUNCTIONSYSTEM_BUILDER)),)
@@ -89,7 +93,8 @@ help:
 	@echo "                      Example: make datasystem DATASYSTEM_JAVA=off"
 	@echo "  LOCAL_CACHE_ROOT   - Enable the opt-in local developer cache"
 	@echo "  LOCAL_CACHE_PROFILE - Cache profile: release or ut (required with root)"
-	@echo "                      Example: make yuanrong LOCAL_CACHE_ROOT=.yr-cache/local LOCAL_CACHE_PROFILE=release"
+	@echo "  LOCAL_CACHE_WRAPPER - Path to the wrapper supplied by the yr-dev skill"
+	@echo "                      Example: use yr-dev/scripts/local-build.sh"
 	@echo "  FUNCTIONSYSTEM_BUILDER - functionsystem builder: cmake by default, bazel with local cache"
 	@echo "  LOCAL_DATASYSTEM_BASELINE_ARCHIVE - approved prebuilt DataSystem archive for local builds"
 	@echo "  LOCAL_DATASYSTEM_BASELINE_VERSION - version of the approved DataSystem archive"
@@ -247,12 +252,3 @@ all: frontend datasystem functionsystem dashboard yuanrong sandbox-sdk
 # Define dependencies for parallel make
 functionsystem: datasystem
 yuanrong: datasystem
-
-local-init:
-	@bash scripts/local-build.sh init
-
-local-release:
-	@bash scripts/local-build.sh release
-
-local-ut:
-	@bash scripts/local-build.sh ut
