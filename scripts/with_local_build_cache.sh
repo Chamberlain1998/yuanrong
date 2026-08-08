@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-set -e
+set -euo pipefail
 
 usage() {
 	cat <<'EOF'
@@ -97,19 +97,25 @@ go_namespace="${platform}-${machine}-go${go_version}"
 common_dir="${CACHE_ROOT}/common"
 profile_dir="${CACHE_ROOT}/profiles/${CACHE_PROFILE}"
 
-export YR_LOCAL_CACHE_ROOT="${CACHE_ROOT}"
-export YR_LOCAL_CACHE_PROFILE="${CACHE_PROFILE}"
+export YR_LOCAL_CACHE_ROOT="$CACHE_ROOT"
+export YR_LOCAL_CACHE_PROFILE="$CACHE_PROFILE"
+# Local action reuse must not depend on the current branch or commit. Release
+# callers that need stamped metadata opt in explicitly.
+export FUNCTIONSYSTEM_BUILD_STAMP="${FUNCTIONSYSTEM_BUILD_STAMP:-0}"
 
 # Download/source caches are safe to share between release and UT builds.
 export BAZEL_REPOSITORY_CACHE="${common_dir}/bazel-repository/${bazel_namespace}"
 export CARGO_HOME="${common_dir}/cargo"
 export GOPATH="${common_dir}/go"
 export GOMODCACHE="${common_dir}/go-mod"
+export GOBIN="${common_dir}/go-bin"
 export PIP_CACHE_DIR="${common_dir}/pip"
 export npm_config_cache="${common_dir}/npm"
 export GRADLE_USER_HOME="${common_dir}/gradle"
 export CCACHE_DIR="${common_dir}/ccache"
 export SCCACHE_DIR="${common_dir}/sccache"
+export DS_OPENSOURCE_DIR="${common_dir}/datasystem-opensource"
+export FS_VENDOR_CACHE_DIR="${common_dir}/functionsystem-vendor-cache"
 
 # Compiled outputs and Bazel action results are deliberately profile-specific.
 export BAZEL_OUTPUT_USER_ROOT="${profile_dir}/bazel-output/${bazel_namespace}"
@@ -117,17 +123,21 @@ export BAZEL_OUTPUT_BASE="${BAZEL_OUTPUT_USER_ROOT}/output-base"
 export BAZEL_DISK_CACHE="${profile_dir}/bazel-action/${bazel_namespace}"
 export CARGO_TARGET_DIR="${profile_dir}/cargo-target/${rust_namespace}"
 export GOCACHE="${profile_dir}/go-build/${go_namespace}"
+export CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}"
 
 mkdir -p \
 	"${BAZEL_REPOSITORY_CACHE}" \
 	"${CARGO_HOME}" \
 	"${GOPATH}" \
 	"${GOMODCACHE}" \
+	"${GOBIN}" \
 	"${PIP_CACHE_DIR}" \
 	"${npm_config_cache}" \
 	"${GRADLE_USER_HOME}" \
 	"${CCACHE_DIR}" \
 	"${SCCACHE_DIR}" \
+	"${DS_OPENSOURCE_DIR}" \
+	"${FS_VENDOR_CACHE_DIR}" \
 	"${BAZEL_OUTPUT_USER_ROOT}" \
 	"${BAZEL_DISK_CACHE}" \
 	"${CARGO_TARGET_DIR}" \
