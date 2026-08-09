@@ -420,7 +420,6 @@ while getopts 'athr:l:v:S:DcCgPET:p:B:m:j:gGU' opt; do
 	t)
 		BAZEL_COMMAND="test"
 		BAZEL_TARGETS="//test/... //api/python/yr/tests/... //api/java:java_tests"
-		install_python_requirements
 		;;
 	T)
 		BAZEL_OPTIONS="$BAZEL_OPTIONS --test_arg=${OPTARG}"
@@ -557,6 +556,25 @@ if [ -n "${LOCAL_DISK_CACHE}" ]; then
 	BAZEL_OPTIONS="$BAZEL_OPTIONS --disk_cache=${LOCAL_DISK_CACHE}"
 fi
 
+if [ -n "${BAZEL_TARGETS_OVERRIDE:-}" ]; then
+	if [ "${BAZEL_COMMAND}" != "test" ]; then
+		log_fatal "BAZEL_TARGETS_OVERRIDE is only valid with -t"
+	fi
+	BAZEL_TARGETS="${BAZEL_TARGETS_OVERRIDE}"
+	log_info "use explicit test targets: ${BAZEL_TARGETS}"
+fi
+
+# Selective targets are an opt-in local workflow. The ordinary `build.sh -t`
+# target set and its dependency installation remain unchanged for CI.
+LOCAL_SELECTIVE_TESTS=0
+if [ -n "${BAZEL_TARGETS_OVERRIDE:-}" ] && [ -n "${YR_LOCAL_CACHE_ROOT:-}" ]; then
+	LOCAL_SELECTIVE_TESTS=1
+fi
+
+if [ "${BAZEL_COMMAND}" = "test" ] && [ "${YR_SKIP_PYTHON_REQUIREMENTS:-0}" != "1" ]; then
+	install_python_requirements
+fi
+
 if [ "$BAZEL_COMMAND" != "clean" ] && [ "${SKIP_RUNTIME_DEPENDENCY_DOWNLOAD:-0}" != "1" ]; then
 	bash ${BASE_DIR}/tools/download_dependency.sh
 fi
@@ -615,13 +633,33 @@ if [[ -n "${RUSTC_WRAPPER:-}" ]]; then
 fi
 BAZEL_OPTIONS="${BAZEL_OPTIONS} ${BAZEL_OPTIONS_CONFIG} ${BAZEL_OPTIONS_ENV}"
 
+if [ "${BAZEL_COMMAND}" = "test" ] && [ "${LOCAL_SELECTIVE_TESTS}" = "1" ]; then
+	TEST_LIBRARY_PATHS=(
+		"${BASE_DIR}/functionsystem/output/functionsystem/lib"
+		"${BASE_DIR}/functionsystem/output/wheel/build/lib/yr/functionsystem/lib"
+		"${BASE_DIR}/metrics/lib"
+	)
+	TEST_LIBRARY_PATH=""
+	for test_library_path in "${TEST_LIBRARY_PATHS[@]}"; do
+		if [ -d "${test_library_path}" ]; then
+			TEST_LIBRARY_PATH="${TEST_LIBRARY_PATH:+${TEST_LIBRARY_PATH}:}${test_library_path}"
+		fi
+	done
+	if [ -n "${TEST_LIBRARY_PATH}" ]; then
+		BAZEL_OPTIONS="${BAZEL_OPTIONS} --test_env=LD_LIBRARY_PATH=${TEST_LIBRARY_PATH}"
+	fi
+fi
+
 cd $BASE_DIR
 package_timer_start=$(date +%s)
 bazel ${BAZEL_PRE_OPTIONS} ${BAZEL_COMMAND} ${BAZEL_OPTIONS} -- ${BAZEL_TARGETS}
 echo "[PACKAGE_TIMER] bazel-build python=${PYTHON3_BIN_PATH} elapsed=$(($(date +%s)-package_timer_start))s"
 
 PYTHON3_SDK_BIN_PATH=$PYTHON3_BIN_PATH
-if [ "${BUILD_SDK_COMMON_ONLY}" != "1" ]; then
+if [ "${BUILD_SDK_COMMON_ONLY}" != "1" ] && {
+	[ "${BAZEL_COMMAND}" != "test" ] || [ "${LOCAL_SELECTIVE_TESTS}" != "1" ] || \
+	[ "${YR_BUILD_PYTHON_SDK_FOR_TEST:-0}" = "1" ];
+}; then
 	stage_python_bazel_outputs
 	build_python_sdk
 fi

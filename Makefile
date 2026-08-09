@@ -12,9 +12,16 @@ BUILD_VERSION ?=
 BUILD_VERSION_ARG := $(if $(BUILD_VERSION),-v $(BUILD_VERSION),)
 LOCAL_CACHE_ROOT ?=
 LOCAL_CACHE_PROFILE ?=
-FUNCTIONSYSTEM_BUILDER ?= cmake
+LOCAL_BUILD_PROTOCOL ?= 2
+LOCAL_CACHE_WRAPPER ?= $(YR_LOCAL_BUILD_CACHE_WRAPPER)
+FUNCTIONSYSTEM_BUILDER ?=
 LOCAL_CACHE_RUN :=
 FUNCTIONSYSTEM_BUILDER_ARGS :=
+LOCAL_DATASYSTEM_BASELINE_ARCHIVE ?=
+LOCAL_DATASYSTEM_BASELINE_VERSION ?=
+DATASYSTEM_NINJA ?= off
+DATASYSTEM_BUILD_DIR ?=
+DATASYSTEM_BUILD_DIR_ARG := $(if $(strip $(DATASYSTEM_BUILD_DIR)),-B "$(DATASYSTEM_BUILD_DIR)",)
 
 ifneq ($(strip $(LOCAL_CACHE_ROOT)$(LOCAL_CACHE_PROFILE)),)
 ifeq ($(strip $(LOCAL_CACHE_ROOT)),)
@@ -28,16 +35,32 @@ ifneq ($(LOCAL_CACHE_PROFILE),ut)
 $(error LOCAL_CACHE_PROFILE must be release or ut)
 endif
 endif
-LOCAL_CACHE_RUN := bash "$(CURDIR)/scripts/with_local_build_cache.sh" --root "$(abspath $(LOCAL_CACHE_ROOT))" --profile "$(LOCAL_CACHE_PROFILE)" --
+ifeq ($(strip $(LOCAL_CACHE_WRAPPER)),)
+$(error LOCAL_CACHE_WRAPPER is required with local cache; run the yr-dev local-build skill)
+endif
+LOCAL_CACHE_RUN := bash "$(LOCAL_CACHE_WRAPPER)" --root "$(abspath $(LOCAL_CACHE_ROOT))" --profile "$(LOCAL_CACHE_PROFILE)" --
+endif
+
+ifeq ($(strip $(FUNCTIONSYSTEM_BUILDER)),)
+ifeq ($(strip $(LOCAL_CACHE_ROOT)),)
+FUNCTIONSYSTEM_BUILDER := cmake
+else
+FUNCTIONSYSTEM_BUILDER := bazel
+endif
 endif
 
 ifeq ($(FUNCTIONSYSTEM_BUILDER),bazel)
 FUNCTIONSYSTEM_BUILDER_ARGS := --builder bazel
 ifneq ($(strip $(LOCAL_CACHE_ROOT)),)
-FUNCTIONSYSTEM_BUILDER_ARGS += --bazel_local_cache_root "$(abspath $(LOCAL_CACHE_ROOT))/functionsystem" --bazel_cache_profile "$(LOCAL_CACHE_PROFILE)"
+FUNCTIONSYSTEM_BUILDER_ARGS += --bazel_local_cache_root "$(abspath $(LOCAL_CACHE_ROOT))" --bazel_cache_profile "$(LOCAL_CACHE_PROFILE)"
 endif
 else ifneq ($(FUNCTIONSYSTEM_BUILDER),cmake)
 $(error FUNCTIONSYSTEM_BUILDER must be cmake or bazel)
+endif
+
+LOCAL_CACHE_ENABLED := 0
+ifneq ($(strip $(LOCAL_CACHE_ROOT)),)
+LOCAL_CACHE_ENABLED := 1
 endif
 
 help:
@@ -70,8 +93,11 @@ help:
 	@echo "                      Example: make datasystem DATASYSTEM_JAVA=off"
 	@echo "  LOCAL_CACHE_ROOT   - Enable the opt-in local developer cache"
 	@echo "  LOCAL_CACHE_PROFILE - Cache profile: release or ut (required with root)"
-	@echo "                      Example: make yuanrong LOCAL_CACHE_ROOT=.yr-cache/local LOCAL_CACHE_PROFILE=release"
-	@echo "  FUNCTIONSYSTEM_BUILDER - functionsystem builder: cmake (default) or bazel"
+	@echo "  LOCAL_CACHE_WRAPPER - Path to the wrapper supplied by the yr-dev skill"
+	@echo "                      Example: use yr-dev/scripts/local-build.sh"
+	@echo "  FUNCTIONSYSTEM_BUILDER - functionsystem builder: cmake by default, bazel with local cache"
+	@echo "  LOCAL_DATASYSTEM_BASELINE_ARCHIVE - approved prebuilt DataSystem archive for local builds"
+	@echo "  LOCAL_DATASYSTEM_BASELINE_VERSION - version of the approved DataSystem archive"
 
 clean:
 	@echo "Cleaning build outputs..."
@@ -116,13 +142,29 @@ frontend:
 	@cp frontend/output/yr-frontend*.tar.gz output/ 2>/dev/null || true
 
 datasystem:
-	@rm -rf datasystem/output/*
-	$(LOCAL_CACHE_RUN) bash datasystem/build.sh -X off -P $(DATASYSTEM_PYTHON) -J $(DATASYSTEM_JAVA) -G on -i on -j $(JOBS) $(BUILD_VERSION_ARG)
+ifeq ($(LOCAL_CACHE_ENABLED),1)
+ifneq ($(strip $(LOCAL_DATASYSTEM_BASELINE_ARCHIVE)),)
+		@test -f "$(LOCAL_DATASYSTEM_BASELINE_ARCHIVE)"
+		@test -n "$(LOCAL_DATASYSTEM_BASELINE_VERSION)"
+		@rm -rf datasystem/output
+		@mkdir -p datasystem/output
+		@cp "$(LOCAL_DATASYSTEM_BASELINE_ARCHIVE)" "datasystem/output/yr-datasystem-v$(LOCAL_DATASYSTEM_BASELINE_VERSION).tar.gz"
+		@tar --no-same-owner -zxf "datasystem/output/yr-datasystem-v$(LOCAL_DATASYSTEM_BASELINE_VERSION).tar.gz" --strip-components=1 -C datasystem/output
+
+else
+		@rm -rf datasystem/output/*
+		$(LOCAL_CACHE_RUN) bash datasystem/build.sh -X off -P $(DATASYSTEM_PYTHON) -J $(DATASYSTEM_JAVA) -G on -i on -n $(DATASYSTEM_NINJA) $(DATASYSTEM_BUILD_DIR_ARG) -j $(JOBS) $(BUILD_VERSION_ARG)
+
+endif
+else
+		@rm -rf datasystem/output/*
+		bash datasystem/build.sh -X off -P $(DATASYSTEM_PYTHON) -J $(DATASYSTEM_JAVA) -G on -i on -j $(JOBS) $(BUILD_VERSION_ARG)
+endif
 	@mkdir -p output
 	@cp datasystem/output/yr-datasystem-*.tar.gz output/
 	@mkdir -p functionsystem/vendor/src
 	@cp datasystem/output/yr-datasystem-*.tar.gz functionsystem/vendor/src/yr-datasystem.tar.gz
-	@tar --no-same-owner -zxf datasystem/output/yr-datasystem-*.tar.gz --strip-components=1 -C datasystem/output
+	@if [ ! -d datasystem/output/sdk ]; then tar --no-same-owner -zxf datasystem/output/yr-datasystem-*.tar.gz --strip-components=1 -C datasystem/output; fi
 	@cp datasystem/output/*.whl output/ 2>/dev/null || true
 	@true
 
