@@ -1,10 +1,10 @@
 [submodule "frontend"]
 	path = frontend
-	url = https://gitcode.com/openeuler/yuanrong-frontend.git
+	url = ../yuanrong-frontend.git
 	branch = master
 [submodule "datasystem"]
 	path = datasystem
-	url = https://gitcode.com/openeuler/yuanrong-datasystem.git
+	url = ../yuanrong-datasystem.git
 	branch = master
 [submodule "functionsystem"]
 	path = functionsystem
