@@ -357,8 +357,7 @@ func (ls *LiteScheduler) reacquireAllocation(req *LiteRequest, metrics *types.In
 		logger.Warnf("lite retain reacquire allocation ID is invalid")
 		return liteErrResp(statuscode.LeaseIDIllegalCode, statuscode.LeaseIDIllegalMsg, startTime)
 	}
-	sessionID, sessionTTL, _ := extractSessionConfig(metrics.ReacquireData)
-	sessionCtxID := extractSessionCtxID(metrics.ReacquireData)
+	sessionID, sessionCtxID, sessionTTL, _ := extractSessionDetails(metrics.ReacquireData)
 	if (sessionID == "" && sessionCtxID == "") || sessionTTL < 0 {
 		logger.Warnf("lite retain reacquire session config is invalid: session and context empty=%t, sessionTTL=%d",
 			sessionID == "" && sessionCtxID == "", sessionTTL)
@@ -480,11 +479,12 @@ func (ls *LiteScheduler) recordRetainSuccess(pool *LiteFunctionPool, alloc *Allo
 }
 
 func (ls *LiteScheduler) handleBatchRetain(req *LiteRequest, startTime time.Time) *commonTypes.BatchInstanceResponse {
-	logger := log.GetLogger().With(zap.String("traceID", req.TraceID))
+	logger := log.GetLogger()
+	traceField := zap.String("traceID", req.TraceID)
 	metricsByAllocation := make(map[string]*types.InstanceThreadMetrics)
 	if len(req.MetricsData) != 0 {
 		if err := json.Unmarshal(req.MetricsData, &metricsByAllocation); err != nil {
-			logger.Warnf("lite batchRetain metrics unmarshal failed: %v", err)
+			logger.Warn("lite batchRetain metrics unmarshal failed", traceField, zap.Error(err))
 		}
 	}
 	resp := &commonTypes.BatchInstanceResponse{
@@ -507,8 +507,9 @@ func (ls *LiteScheduler) handleBatchRetain(req *LiteRequest, startTime time.Time
 			}
 		}
 	}
-	logger.Infof("lite batchRetain done: %d succeed, %d failed (of %d)",
-		len(resp.InstanceAllocSucceed), len(resp.InstanceAllocFailed), len(req.AllocationIDs))
+	logger.Debug("lite batchRetain done", traceField,
+		zap.Int("succeeded", len(resp.InstanceAllocSucceed)), zap.Int("failed", len(resp.InstanceAllocFailed)),
+		zap.Int("total", len(req.AllocationIDs)))
 	resp.SchedulerTime = time.Since(startTime).Seconds()
 	return resp
 }

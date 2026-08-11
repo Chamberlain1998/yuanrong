@@ -359,18 +359,20 @@ func (fs *FaaSScheduler) ProcessInstanceRequestLibruntimeWithTraceParent(
 }
 
 func (fs *FaaSScheduler) processInstanceRequestLibruntime(args []api.Arg, traceID, traceParent string) ([]byte, error) {
-	logger := log.GetLogger().With(zap.Any("traceID", traceID))
+	logger := log.GetLogger()
 	insOp, targetName, extraData, eventData := parseInstanceOperation(args, traceID)
 	startTime := time.Now()
 	defer func() {
-		logger.Infof("process of instance operation %s target %s cost %dms", insOp, targetName,
-			time.Now().Sub(startTime).Milliseconds())
+		logger.Debug("processed instance operation", zap.String("traceID", traceID),
+			zap.String("operation", string(insOp)), zap.String("target", targetName),
+			zap.Int64("costMs", time.Since(startTime).Milliseconds()))
 	}()
 	// LiteScheduler bypass (session-based). Runs before the legacy switch.
 	if fs.liteScheduler != nil {
 		if liteReq, ok := fs.liteScheduler.ParseRequest(litescheduler.InstanceOperation(insOp),
 			targetName, extraData, traceID); ok {
-			logger.Debugf("lite branch taken: op %s target %s", insOp, targetName)
+			logger.Debug("lite branch taken", zap.String("traceID", traceID),
+				zap.String("operation", string(insOp)), zap.String("target", targetName))
 			return fs.liteScheduler.Process(liteReq, traceID, traceParent, extraData)
 		}
 	}
@@ -391,13 +393,15 @@ func (fs *FaaSScheduler) processInstanceRequestLibruntime(args []api.Arg, traceI
 	case insOpQuerySession:
 		response = fs.handleQuerySession(targetName, extraData, traceID)
 	default:
-		logger.Warnf("unknown instance operation %s", insOp)
+		logger.Warn("unknown instance operation", zap.String("traceID", traceID),
+			zap.String("operation", string(insOp)))
 		response = generateInstanceResponse(nil, snerror.New(constant.UnsupportedOperationErrorCode,
 			constant.UnsupportedOperationErrorMessage), startTime)
 	}
 	respData, err := json.Marshal(response)
 	if err != nil {
-		logger.Errorf("failed to marshal response of instance operation %s error %s", insOp, err.Error())
+		logger.Error("failed to marshal instance operation response", zap.String("traceID", traceID),
+			zap.String("operation", string(insOp)), zap.Error(err))
 		return nil, err
 	}
 	return respData, nil
@@ -1151,20 +1155,22 @@ func (fs *FaaSScheduler) buildMetrics(extraData *types.InstanceThreadMetrics) *t
 }
 
 func parseInstanceOperation(args []api.Arg, traceID string) (InstanceOperation, string, []byte, []byte) {
-	logger := log.GetLogger().With(zap.Any("traceID", traceID))
+	logger := log.GetLogger()
+	traceField := zap.String("traceID", traceID)
 	insOp := insOpUnknown
 	if len(args) < minArgsNum {
-		logger.Errorf("argument number is smaller than %d check args %+v", minArgsNum, args)
+		logger.Error("argument number is too small", traceField, zap.Int("minimum", minArgsNum),
+			zap.Int("actual", len(args)))
 		return insOp, "", nil, nil
 	}
 	operationArg := args[0]
 	if operationArg.Type != api.Value {
-		logger.Errorf("invalid argument type for args[0]")
+		logger.Error("invalid argument type for args[0]", traceField)
 		return insOp, "", nil, nil
 	}
 	items := strings.SplitN(string(operationArg.Data), insOpSeparator, validInsOpLen)
 	if len(items) != validInsOpLen {
-		logger.Errorf("failed to parse operation and target from %s", string(operationArg.Data))
+		logger.Error("failed to parse operation and target", traceField)
 		return insOp, "", nil, nil
 	}
 	insOp = InstanceOperation(items[0])
@@ -1174,7 +1180,7 @@ func parseInstanceOperation(args []api.Arg, traceID string) (InstanceOperation, 
 	}
 	extraDataArg := args[1]
 	if extraDataArg.Type != api.Value {
-		logger.Errorf("invalid argument type for args[1]")
+		logger.Error("invalid argument type for args[1]", traceField)
 		return insOp, target, nil, nil
 	}
 	eventDataArg := api.Arg{}

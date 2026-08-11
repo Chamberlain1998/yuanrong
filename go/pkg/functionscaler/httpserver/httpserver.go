@@ -215,7 +215,7 @@ func sessionContextForkHandler(ctx *fasthttp.RequestCtx) {
 	}
 	body, _ := json.Marshal(response)
 	ctx.SetStatusCode(http.StatusCreated)
-	ctx.Response.SetBody(body)
+	ctx.Response.SetBodyRaw(body)
 }
 
 func sessionContextDeleteHandler(ctx *fasthttp.RequestCtx) {
@@ -262,7 +262,7 @@ func writeManagerOperationError(ctx *fasthttp.RequestCtx, err error) {
 func writeSessionContextManagerError(ctx *fasthttp.RequestCtx, status int, code, message string) {
 	body, _ := json.Marshal(sessioncontextmanager.Error{Code: code, Message: message})
 	ctx.SetStatusCode(status)
-	ctx.Response.SetBody(body)
+	ctx.Response.SetBodyRaw(body)
 }
 
 func auth(ctx *fasthttp.RequestCtx) error {
@@ -278,35 +278,37 @@ func auth(ctx *fasthttp.RequestCtx) error {
 func invokeHandler(ctx *fasthttp.RequestCtx) {
 	traceID := string(ctx.Request.Header.Peek(constant.HeaderTraceID))
 	traceParent := string(ctx.Request.Header.Peek(constant.HeaderTraceParent))
-	logger := log.GetLogger().With(zap.Any("traceId", traceID))
+	logger := log.GetLogger()
+	traceField := zap.String("traceID", traceID)
 	if isShutDown.Load() {
 		ctx.SetStatusCode(http.StatusOK)
 		ctx.Response.Header.Set(constant.HeaderInnerCode, strconv.Itoa(statuscode.ErrFinalized))
-		logger.Errorf("scheduler is in shutdown pharse")
+		logger.Error("scheduler is in shutdown phase", traceField)
 		return
 	}
-	reqBody := ctx.Request.Body()
 	var args []api.Arg
-	err := json.Unmarshal(reqBody, &args)
+	err := json.Unmarshal(ctx.Request.Body(), &args)
 	if err != nil {
 		ctx.SetStatusCode(http.StatusInternalServerError)
-		logger.Errorf("unmarshl request body error, err %s", err.Error())
+		logger.Error("unmarshal request body failed", traceField, zap.Error(err))
 		return
 	}
 	if functionscaler.GetGlobalScheduler() == nil {
 		ctx.SetStatusCode(http.StatusInternalServerError)
-		logger.Errorf("scheduler is nil")
+		logger.Error("scheduler is nil", traceField)
 		return
 	}
 	respBody, err := functionscaler.GetGlobalScheduler().ProcessInstanceRequestLibruntimeWithTraceParent(
 		args, traceID, traceParent)
 	if err != nil {
 		ctx.SetStatusCode(http.StatusInternalServerError)
-		logger.Errorf("marshl response body, err %s", err.Error())
+		logger.Error("marshal response body failed", traceField, zap.Error(err))
 		return
 	}
 	ctx.SetStatusCode(http.StatusOK)
-	ctx.Response.SetBody(respBody)
+	// respBody is freshly allocated by json.Marshal and is not mutated after
+	// this point, so ownership can be handed to fasthttp without another copy.
+	ctx.Response.SetBodyRaw(respBody)
 }
 
 // scaleHintHandler receives cross-scheduler scale-up hints (LiteScheduler cold
@@ -353,5 +355,5 @@ func scaleHintHandler(ctx *fasthttp.RequestCtx) {
 		return
 	}
 	ctx.SetStatusCode(http.StatusOK)
-	ctx.Response.SetBody(respBody)
+	ctx.Response.SetBodyRaw(respBody)
 }
