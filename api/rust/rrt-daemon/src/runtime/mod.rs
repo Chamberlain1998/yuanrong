@@ -89,6 +89,69 @@ fn failed_runtime_receiver(message: String) -> watch::Receiver<RuntimeReadyState
     rx
 }
 
+fn combine_runtime_readiness(
+    mut services: Vec<watch::Receiver<RuntimeReadyState>>,
+) -> watch::Receiver<RuntimeReadyState> {
+    match services.len() {
+        0 => ready_runtime_receiver(),
+        1 => services.pop().expect("one readiness receiver"),
+        _ => {
+            let (ready_tx, ready_rx) = watch::channel(RuntimeReadyState::Starting);
+            let (update_tx, mut update_rx) = mpsc::unbounded_channel();
+            let service_count = services.len();
+            for (index, mut service) in services.into_iter().enumerate() {
+                let update_tx = update_tx.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let state = service.borrow_and_update().clone();
+                        if update_tx.send((index, state.clone())).is_err()
+                            || matches!(state, RuntimeReadyState::Failed(_))
+                        {
+                            return;
+                        }
+                        if service.changed().await.is_err() {
+                            let _ = update_tx.send((
+                                index,
+                                RuntimeReadyState::Failed(format!(
+                                    "RRT service readiness channel {index} closed"
+                                )),
+                            ));
+                            return;
+                        }
+                    }
+                });
+            }
+            drop(update_tx);
+            tokio::spawn(async move {
+                let mut states = vec![RuntimeReadyState::Starting; service_count];
+                while let Some((index, state)) = update_rx.recv().await {
+                    states[index] = state;
+                    if let Some(message) = states.iter().find_map(|state| match state {
+                        RuntimeReadyState::Failed(message) => Some(message.clone()),
+                        _ => None,
+                    }) {
+                        let _ = ready_tx.send(RuntimeReadyState::Failed(message));
+                        return;
+                    }
+                    if states
+                        .iter()
+                        .all(|state| *state == RuntimeReadyState::Ready)
+                    {
+                        let _ = ready_tx.send(RuntimeReadyState::Ready);
+                    }
+                }
+                if *ready_tx.borrow() == RuntimeReadyState::Starting {
+                    let _ = ready_tx.send(RuntimeReadyState::Failed(
+                        "RRT service readiness channels closed before startup completed"
+                            .to_string(),
+                    ));
+                }
+            });
+            ready_rx
+        }
+    }
+}
+
 async fn start_http_server(
     port: u16,
     token: Option<String>,
@@ -115,6 +178,29 @@ async fn start_http_server(
     Ok(ready_rx)
 }
 
+async fn start_tunnel_runtime_server(
+    ws_port: u16,
+    http_port: u16,
+) -> Result<watch::Receiver<RuntimeReadyState>, String> {
+    let bound = tunnel::BoundTunnelServers::bind(ws_port, http_port)
+        .await
+        .map_err(|message| {
+            rrt_error!("[rrt-tunnel] readiness failed: {message}");
+            message
+        })?;
+    let (ready_tx, ready_rx) = watch::channel(RuntimeReadyState::Starting);
+    let _ = ready_tx.send(RuntimeReadyState::Ready);
+    rrt_info!("[rrt-tunnel] readiness ready ws=0.0.0.0:{ws_port} http=127.0.0.1:{http_port}");
+    tokio::spawn(async move {
+        bound.serve().await;
+        let message =
+            format!("RRT tunnel server stopped on WS port {ws_port} and HTTP port {http_port}");
+        rrt_error!("[rrt-tunnel] {message}");
+        let _ = ready_tx.send(RuntimeReadyState::Failed(message));
+    });
+    Ok(ready_rx)
+}
+
 async fn wait_for_runtime_ready(
     mut ready: watch::Receiver<RuntimeReadyState>,
 ) -> Result<(), String> {
@@ -125,7 +211,9 @@ async fn wait_for_runtime_ready(
             RuntimeReadyState::Starting => {}
         }
         if ready.changed().await.is_err() {
-            return Err("RRT HTTP readiness channel closed before startup completed".to_string());
+            return Err(
+                "RRT service readiness channel closed before startup completed".to_string(),
+            );
         }
     }
 }
@@ -356,15 +444,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn init_call_waits_for_http_readiness_without_delaying_transport_ack() {
+    async fn init_call_waits_for_all_configured_services_without_delaying_transport_ack() {
         let args = Args {
             instance_id: "sandbox-instance".to_string(),
             ..Default::default()
         };
         let ctx = std::sync::Arc::new(dispatch::Ctx::new(args));
         let (tx, mut rx) = mpsc::channel(2);
-        let (ready_tx, ready_rx) = watch::channel(RuntimeReadyState::Starting);
-        let request_id = "create-waits-for-http@initcall";
+        let (http_ready_tx, http_ready_rx) = watch::channel(RuntimeReadyState::Starting);
+        let (tunnel_ready_tx, tunnel_ready_rx) = watch::channel(RuntimeReadyState::Starting);
+        let runtime_ready = combine_runtime_readiness(vec![http_ready_rx, tunnel_ready_rx]);
+        let request_id = "create-waits-for-runtime-services@initcall";
         let message_id = "transport-ready-message-id";
         let call = crate::posix::runtime_service::CallRequest {
             is_create: true,
@@ -379,7 +469,7 @@ mod tests {
         };
 
         assert!(
-            handle_inbound_message(inbound, "sandbox-instance", ctx, tx, ready_rx).await,
+            handle_inbound_message(inbound, "sandbox-instance", ctx, tx, runtime_ready).await,
             "the inbound stream should remain usable"
         );
 
@@ -395,10 +485,20 @@ mod tests {
             tokio::time::timeout(Duration::from_millis(50), rx.recv())
                 .await
                 .is_err(),
-            "init CallResult must not be sent before HTTP readiness"
+            "init CallResult must not be sent before runtime service readiness"
         );
 
-        ready_tx
+        http_ready_tx
+            .send(RuntimeReadyState::Ready)
+            .expect("readiness receiver should still be alive");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), rx.recv())
+                .await
+                .is_err(),
+            "init CallResult must still wait for configured tunnel readiness"
+        );
+
+        tunnel_ready_tx
             .send(RuntimeReadyState::Ready)
             .expect("readiness receiver should still be alive");
         let second = tokio::time::timeout(Duration::from_secs(1), rx.recv())
@@ -415,6 +515,59 @@ mod tests {
                 body.map(|body| body_kind(&body))
             ),
         }
+    }
+
+    #[tokio::test]
+    async fn combined_readiness_skips_an_unconfigured_tunnel() {
+        let (http_ready_tx, http_ready_rx) = watch::channel(RuntimeReadyState::Starting);
+        let runtime_ready = combine_runtime_readiness(vec![http_ready_rx]);
+        let mut waiter = Box::pin(wait_for_runtime_ready(runtime_ready));
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut waiter)
+                .await
+                .is_err(),
+            "the configured HTTP server must still gate readiness"
+        );
+        http_ready_tx
+            .send(RuntimeReadyState::Ready)
+            .expect("readiness receiver should still be alive");
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("HTTP readiness should release the barrier when tunnel is absent")
+            .expect("HTTP readiness should succeed");
+    }
+
+    #[tokio::test]
+    async fn combined_readiness_propagates_failure_after_initial_ready() {
+        let (http_ready_tx, http_ready_rx) = watch::channel(RuntimeReadyState::Starting);
+        let (tunnel_ready_tx, tunnel_ready_rx) = watch::channel(RuntimeReadyState::Starting);
+        let mut runtime_ready = combine_runtime_readiness(vec![http_ready_rx, tunnel_ready_rx]);
+
+        http_ready_tx
+            .send(RuntimeReadyState::Ready)
+            .expect("HTTP readiness receiver should still be alive");
+        tunnel_ready_tx
+            .send(RuntimeReadyState::Ready)
+            .expect("tunnel readiness receiver should still be alive");
+        wait_for_runtime_ready(runtime_ready.clone())
+            .await
+            .expect("both configured services should become ready");
+        assert_eq!(*runtime_ready.borrow_and_update(), RuntimeReadyState::Ready);
+
+        http_ready_tx
+            .send(RuntimeReadyState::Failed(
+                "RRT HTTP server stopped".to_string(),
+            ))
+            .expect("HTTP readiness receiver should still be alive");
+        tokio::time::timeout(Duration::from_secs(1), runtime_ready.changed())
+            .await
+            .expect("combined readiness should observe the service failure")
+            .expect("combined readiness channel should stay open for the failure");
+        assert_eq!(
+            *runtime_ready.borrow(),
+            RuntimeReadyState::Failed("RRT HTTP server stopped".to_string())
+        );
     }
 
     #[tokio::test]
@@ -513,6 +666,53 @@ mod tests {
             .await
             .expect_err("the returned server must already reserve its port");
         assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+    }
+
+    #[tokio::test]
+    async fn tunnel_server_ports_are_reserved_before_start_returns() {
+        let ws_probe = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("an ephemeral tunnel WS port should be available");
+        let ws_port = ws_probe.local_addr().expect("WS probe address").port();
+        drop(ws_probe);
+        let http_probe = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("an ephemeral tunnel HTTP port should be available");
+        let http_port = http_probe.local_addr().expect("HTTP probe address").port();
+        drop(http_probe);
+
+        let ready = start_tunnel_runtime_server(ws_port, http_port)
+            .await
+            .expect("both tunnel listeners should bind before start returns");
+
+        assert_eq!(*ready.borrow(), RuntimeReadyState::Ready);
+        let ws_error = tokio::net::TcpListener::bind(("127.0.0.1", ws_port))
+            .await
+            .expect_err("the tunnel server must already reserve its WS port");
+        assert_eq!(ws_error.kind(), std::io::ErrorKind::AddrInUse);
+        let http_error = tokio::net::TcpListener::bind(("127.0.0.1", http_port))
+            .await
+            .expect_err("the tunnel server must already reserve its HTTP port");
+        assert_eq!(http_error.kind(), std::io::ErrorKind::AddrInUse);
+    }
+
+    #[tokio::test]
+    async fn tunnel_bind_failure_is_exposed_as_readiness_failure() {
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("an ephemeral tunnel WS port should be available");
+        let ws_port = occupied.local_addr().expect("occupied address").port();
+        let http_probe = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("an ephemeral tunnel HTTP port should be available");
+        let http_port = http_probe.local_addr().expect("HTTP probe address").port();
+        drop(http_probe);
+
+        let error = start_tunnel_runtime_server(ws_port, http_port)
+            .await
+            .expect_err("occupied tunnel WS port must fail startup");
+
+        assert!(error.contains(&format!("tunnel WS port {ws_port}")));
     }
 }
 
@@ -663,6 +863,52 @@ fn shutdown_response_msg(
     }
 }
 
+fn parse_runtime_port(name: &str, raw_port: String) -> Result<u16, String> {
+    match raw_port.parse::<u16>() {
+        Ok(port) if port > 0 => Ok(port),
+        _ => Err(format!(
+            "invalid {name} '{raw_port}': expected an integer between 1 and 65535"
+        )),
+    }
+}
+
+async fn start_configured_http_server() -> Result<Option<watch::Receiver<RuntimeReadyState>>, String>
+{
+    let raw_port = match std::env::var("RRT_HTTP_PORT") {
+        Ok(raw_port) => raw_port,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(err) => return Err(format!("failed to read RRT_HTTP_PORT: {err}")),
+    };
+    let port = parse_runtime_port("RRT_HTTP_PORT", raw_port)?;
+    let token = std::env::var("RRT_HTTP_TOKEN").ok();
+    start_http_server(port, token)
+        .await
+        .map(Some)
+        .map_err(|err| err.to_string())
+}
+
+async fn start_configured_tunnel_server(
+) -> Result<Option<watch::Receiver<RuntimeReadyState>>, String> {
+    // RRT_TUNNEL_WS_PORT is the feature gate. Without it the tunnel is not part
+    // of runtime readiness, even if the optional HTTP-port variable is present.
+    let raw_ws_port = match std::env::var("RRT_TUNNEL_WS_PORT") {
+        Ok(raw_port) => raw_port,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(err) => return Err(format!("failed to read RRT_TUNNEL_WS_PORT: {err}")),
+    };
+    let ws_port = parse_runtime_port("RRT_TUNNEL_WS_PORT", raw_ws_port)?;
+    let http_port = match std::env::var("RRT_TUNNEL_HTTP_PORT") {
+        Ok(raw_port) => parse_runtime_port("RRT_TUNNEL_HTTP_PORT", raw_port)?,
+        Err(std::env::VarError::NotPresent) => ws_port.checked_add(1).ok_or_else(|| {
+            "RRT_TUNNEL_HTTP_PORT is required when RRT_TUNNEL_WS_PORT is 65535".to_string()
+        })?,
+        Err(err) => return Err(format!("failed to read RRT_TUNNEL_HTTP_PORT: {err}")),
+    };
+    start_tunnel_runtime_server(ws_port, http_port)
+        .await
+        .map(Some)
+}
+
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = load_args_from_env();
     let _ = LOG_DEBUG.set(args.log_level.eq_ignore_ascii_case("debug"));
@@ -681,38 +927,22 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     activity::init_reporter(instance_id.clone(), tx.clone());
     rrt_info!("[rrt-runtime] instance_id={}", instance_id);
 
-    // Optional: start the RRT atomic-operation HTTP server for sandboxRouter direct access when RRT_HTTP_PORT is set.
-    let runtime_ready = match std::env::var("RRT_HTTP_PORT") {
-        Ok(raw_port) => match raw_port.parse::<u16>() {
-            Ok(port) if port > 0 => {
-                let token = std::env::var("RRT_HTTP_TOKEN").ok();
-                // Reserve the fixed HTTP port before RuntimeRPC opens an outbound socket.
-                // The sandbox ephemeral range may include this port.
-                start_http_server(port, token).await?
-            }
-            _ => failed_runtime_receiver(format!(
-                "invalid RRT_HTTP_PORT '{raw_port}': expected an integer between 1 and 65535"
-            )),
-        },
-        Err(std::env::VarError::NotPresent) => ready_runtime_receiver(),
-        Err(err) => failed_runtime_receiver(format!("failed to read RRT_HTTP_PORT: {err}")),
-    };
-
-    // Optional: start the reverse-tunnel server (reverse_tunnel, Port A ws / Port B http) when RRT_TUNNEL_WS_PORT is set.
-    // Run it concurrently with the HTTP server so normal mode can provide both atomic-operation HTTP direct access and reverse tunnel.
-    // Previously these were mutually exclusive because tunnel ran only in RRT_TUNNEL_ONLY exclusive mode, disabling HTTP and RuntimeRPC.
-    if let Some(ws_port) = std::env::var("RRT_TUNNEL_WS_PORT")
-        .ok()
-        .and_then(|p| p.parse::<u16>().ok())
-    {
-        let http_port = std::env::var("RRT_TUNNEL_HTTP_PORT")
-            .ok()
-            .and_then(|p| p.parse::<u16>().ok())
-            .unwrap_or(ws_port.wrapping_add(1));
-        tokio::spawn(async move {
-            tunnel::run_standalone(ws_port, http_port).await;
-        });
+    // Reserve the direct HTTP listener and, when configured, both tunnel
+    // listeners concurrently. RuntimeRPC can open after the ports are reserved;
+    // InitCall success is gated on the combined readiness result below.
+    let (http_start, tunnel_start) = tokio::join!(
+        start_configured_http_server(),
+        start_configured_tunnel_server()
+    );
+    let mut configured_services = Vec::with_capacity(2);
+    for start in [http_start, tunnel_start] {
+        match start {
+            Ok(Some(ready)) => configured_services.push(ready),
+            Ok(None) => {}
+            Err(message) => configured_services.push(failed_runtime_receiver(message)),
+        }
     }
+    let runtime_ready = combine_runtime_readiness(configured_services);
 
     let ctx = std::sync::Arc::new(dispatch::Ctx::new(args.clone()));
 
@@ -979,7 +1209,7 @@ async fn handle_inbound_message(
                     {
                         Ok(result) => result,
                         Err(_) => Err(format!(
-                            "RRT HTTP readiness timed out after {} seconds",
+                            "RRT service readiness timed out after {} seconds",
                             RUNTIME_READY_TIMEOUT.as_secs()
                         )),
                     }

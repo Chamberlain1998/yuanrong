@@ -188,23 +188,58 @@ pub async fn run_standalone(ws_port: u16, http_port: u16) {
     run_servers(ws_port, http_port, Arc::new(State::default())).await;
 }
 
+/// Both tunnel listeners reserved as one startup unit. Binding happens before
+/// RuntimeRPC reports InitCall success, so a configured tunnel cannot be
+/// advertised ready with only one of its two ports available.
+pub(super) struct BoundTunnelServers {
+    porta: TcpListener,
+    portb: TcpListener,
+    ws_port: u16,
+    http_port: u16,
+}
+
+impl BoundTunnelServers {
+    pub(super) async fn bind(ws_port: u16, http_port: u16) -> Result<Self, String> {
+        let (porta, portb) = tokio::try_join!(
+            async {
+                TcpListener::bind(("0.0.0.0", ws_port))
+                    .await
+                    .map_err(|e| format!("failed to bind tunnel WS port {ws_port}: {e}"))
+            },
+            async {
+                TcpListener::bind(("127.0.0.1", http_port))
+                    .await
+                    .map_err(|e| format!("failed to bind tunnel HTTP port {http_port}: {e}"))
+            }
+        )?;
+        Ok(Self {
+            porta,
+            portb,
+            ws_port,
+            http_port,
+        })
+    }
+
+    pub(super) async fn serve(self) {
+        rrt_info!(
+            "[rrt-runtime] tunnel listening ws=0.0.0.0:{} http=127.0.0.1:{}",
+            self.ws_port,
+            self.http_port
+        );
+        serve(self.porta, self.portb, Arc::new(State::default())).await;
+    }
+}
+
 async fn run_servers(ws_port: u16, http_port: u16, state: Arc<State>) {
-    let porta = match TcpListener::bind(("0.0.0.0", ws_port)).await {
-        Ok(l) => l,
+    let bound = match BoundTunnelServers::bind(ws_port, http_port).await {
+        Ok(bound) => bound,
         Err(e) => {
-            rrt_error!("[rrt-runtime] tunnel port_a_bind_failed ws_port={ws_port} error={e}");
-            return;
-        }
-    };
-    let portb = match TcpListener::bind(("127.0.0.1", http_port)).await {
-        Ok(l) => l,
-        Err(e) => {
-            rrt_error!("[rrt-runtime] tunnel port_b_bind_failed http_port={http_port} error={e}");
+            rrt_error!("[rrt-runtime] tunnel readiness failed: {e}");
             return;
         }
     };
     rrt_info!("[rrt-runtime] tunnel listening ws=0.0.0.0:{ws_port} http=127.0.0.1:{http_port}");
-    serve(porta, portb, state).await;
+    serve(bound.porta, bound.portb, state).await;
 }
 
 /// Drive both accept loops over pre-bound listeners (split out for tests).
