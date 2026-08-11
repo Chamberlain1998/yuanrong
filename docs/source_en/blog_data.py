@@ -40,7 +40,7 @@ BLOG_DATA = [
         ),
         "date": "2026-05-25",
         "read_time": "12 min",
-        "link": "https://www.openeuler.openatom.cn/en/blog/20260525-openYuanrong_09/20260525-openYuanrong_09.html"
+        "link": "https://www.openeuler.openatom.cn/zh/blog/20260525-openYuanrong_09/20260525-openYuanrong_09.html"
     },
     {
         "title": "YuanRong: A Production General-purpose Serverless System for Distributed Applications in the Cloud",
