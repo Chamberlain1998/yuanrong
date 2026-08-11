@@ -202,6 +202,9 @@ func setupFunctionSchedulerLibruntime(fsClient api.LibruntimeAPI) error {
 		TimeoutMs: config.GlobalConfig.DataSystemConfig.InitTimeoutMs,
 		Clusters:  config.GlobalConfig.DataSystemConfig.InitClusters,
 	}, fsClient, stopCh)
+	if err := functionscaler.InitSessionStoreRedis(stopCh); err != nil {
+		return err
+	}
 	functionscaler.InitGlobalScheduler(stopCh)
 	registry.ProcessETCDList()
 	trafficlimit.SetFunctionLimitRate(config.GlobalConfig.FunctionLimitRate)

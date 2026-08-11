@@ -31,6 +31,7 @@ import (
 	"yuanrong.org/kernel/pkg/common/faas_common/crypto"
 	"yuanrong.org/kernel/pkg/common/faas_common/etcd3"
 	"yuanrong.org/kernel/pkg/common/faas_common/localauth"
+	"yuanrong.org/kernel/pkg/common/faas_common/redisclient"
 	"yuanrong.org/kernel/pkg/common/faas_common/resspeckey"
 	"yuanrong.org/kernel/pkg/common/faas_common/sts/raw"
 	"yuanrong.org/kernel/pkg/common/faas_common/tls"
@@ -94,6 +95,7 @@ type Configuration struct {
 	LiteScheduler                LiteSchedulerConfig              `json:"liteScheduler" valid:"optional"`
 	EnableSessionRecover         bool                             `json:"enableSessionRecover" valid:"optional"`
 	DataSystemConfig             DataSystemConfig                 `json:"dataSystemConfig" valid:"optional"`
+	SessionStoreConfig           SessionStoreConfig               `json:"sessionStore" valid:"optional"`
 	CustomContainerEnv           map[string]string                `json:"customContainerEnv" valid:"optional"`
 	HttpServerPort               string                           `json:"httpServerPort" valid:",optional"`
 }
@@ -112,6 +114,19 @@ type DataSystemConfig struct {
 	CurrentCluster  string   `json:"currentCluster" validate:"required"`
 	UploadWriteMode int      `json:"uploadWriteMode" validate:"required"`
 	UploadTTLSec    uint32   `json:"uploadTTLSec" validate:"required"`
+}
+
+// SessionStoreConfig 控制 faasscheduler session 绑定记录的外部存储后端。
+//
+// 生产环境仅支持两种后端：
+//   - backend=datasystem：普通场景，按 session key 读写 DataSystem
+//   - backend=redis：高性能场景，按 session key 读写 Redis，物理 TTL 默认 24h
+//
+// backend 留空时由 config 加载期校验函数兜底填为 datasystem。
+type SessionStoreConfig struct {
+	Backend           string             `json:"backend,omitempty" valid:",optional"`
+	RedisConfig       redisclient.Config `json:"redisConfig,omitempty" valid:",optional"`
+	BackendTTLSeconds int                `json:"backendTTLSeconds,omitempty" valid:",optional"`
 }
 
 // ScaleRetryConfig -

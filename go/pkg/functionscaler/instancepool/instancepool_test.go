@@ -55,7 +55,6 @@ import (
 	"yuanrong.org/kernel/pkg/functionscaler/selfregister"
 	"yuanrong.org/kernel/pkg/functionscaler/state"
 	"yuanrong.org/kernel/pkg/functionscaler/types"
-	"yuanrong.org/kernel/pkg/functionscaler/utils"
 )
 
 var (
@@ -1481,32 +1480,3 @@ func TestGenericInstancePool_notifyInfo(t *testing.T) {
 	})
 }
 
-func TestGenericInstancePool_handleInstanceSynced(t *testing.T) {
-	cnt := 0
-	defer ApplyFunc((*instancequeue.ScaledInstanceQueue).HandleInstanceSync,
-		func(_ *instancequeue.ScaledInstanceQueue, fn utils.RecoverSessionCallback) {
-			cnt++
-		}).Reset()
-
-	reservedQueue := map[resspeckey.ResSpecKey]*instancequeue.ScaledInstanceQueue{
-		resspeckey.ResSpecKey{}: CreateScaledInstanceQueue(types.InstanceTypeReserved),
-	}
-	scaledQueue := map[resspeckey.ResSpecKey]*instancequeue.ScaledInstanceQueue{
-		resspeckey.ResSpecKey{CPU: 300, Memory: 128}: CreateScaledInstanceQueue(types.InstanceTypeScaled),
-	}
-	gi := &GenericInstancePool{
-		faasManagerInfo: faasManagerInfo{
-			funcKey:    "faasManager-0123",
-			instanceID: "01234567",
-		},
-		FuncSpec: &types.FunctionSpecification{
-			FuncKey: "mock-funcKey-123",
-		},
-		reservedInstanceQueue: reservedQueue,
-		scaledInstanceQueue:   scaledQueue,
-		sessionRecordMap:      map[string]sessionRecord{},
-		instanceSessionMap:    make(map[string]map[string]struct{}),
-	}
-	gi.handleInstanceSynced()
-	assert.Equal(t, 2, cnt)
-}

@@ -28,6 +28,7 @@ import (
 	commonTypes "yuanrong.org/kernel/pkg/common/faas_common/types"
 	"yuanrong.org/kernel/pkg/functionscaler/config"
 	"yuanrong.org/kernel/pkg/functionscaler/selfregister"
+	"yuanrong.org/kernel/pkg/functionscaler/session"
 	"yuanrong.org/kernel/pkg/functionscaler/types"
 )
 
@@ -62,23 +63,57 @@ func (ls *LiteScheduler) handleAcquire(req *LiteRequest, startTime time.Time) *c
 		logger.Warnf("lite acquire pool not found, func not deployed or pool not synced yet")
 		return liteErrResp(statuscode.FuncMetaNotFoundErrCode, statuscode.FuncMetaNotFoundErrMsg, startTime)
 	}
+	// Phase 1 (pool.Lock): local sticky lookup. Hit => assign + return. A stale
+	// binding (instance gone/unhealthy/full) is cleaned by tryLocalStickyLocked.
 	pool.Lock()
 	bindingKey := sessionBindingKey(req.SessionID, req.SessionCtxID)
-	// 1. session sticky
-	if binding, ok := pool.sessions[bindingKey]; req.SessionID != "" && ok {
-		instanceID := binding.instanceID
-		if slot := pool.instances[instanceID]; slot != nil &&
+	if slot, hit := pool.tryLocalStickyLocked(bindingKey); hit {
+		logger.Debugf("lite acquire session sticky hit: instance %s (inUse %d/%d)",
+			slot.InstanceID, slot.InUse+1, slot.Capacity)
+		resp := ls.assignInstance(pool, req, slot, startTime)
+		pool.Unlock()
+		return resp
+	}
+	pool.Unlock()
+
+	// Phase 2 (no lock): local miss => query the external store OUTSIDE pool.Lock
+	// so storage I/O does not block other acquire/release/expiry. singleflight
+	// dedupes concurrent same-session lookups. Fail-open: miss/error leaves
+	// storeRec nil and we proceed as a fresh session.
+	var storeRec *session.StoreRecord
+	if pool.sessionStore != nil {
+		var err error
+		storeRec, err = pool.sessionStore.getSessionFromStore(bindingKey)
+		if err != nil {
+			logger.Debugf("lite acquire get session from store failed: %v", err)
+		}
+	}
+
+	// Phase 3 (pool.Lock): re-check local first (another acquire may have bound
+	// during Phase 2); then try the store-designated instance; else dispatch.
+	pool.Lock()
+	if slot, hit := pool.tryLocalStickyLocked(bindingKey); hit {
+		resp := ls.assignInstance(pool, req, slot, startTime)
+		pool.Unlock()
+		return resp
+	}
+	if storeRec != nil && storeRec.InstanceID != "" {
+		slot := pool.instances[storeRec.InstanceID]
+		if slot != nil &&
 			(slot.Status == InstanceStatusRunning || slot.Status == InstanceStatusSubHealth) &&
-			slot.InUse < slot.Capacity {
-			// Cancel any pending idle-unbind timer for this session.
-			pool.cancelSessionUnbind(bindingKey)
-			logger.Debugf("lite acquire session sticky hit: instance %s (inUse %d/%d)", instanceID, slot.InUse+1, slot.Capacity)
+			slot.InUse < slot.Capacity && slot.SessionCtxID == req.SessionCtxID {
+			logger.Debugf("lite acquire session recovered from store: instance %s", storeRec.InstanceID)
 			resp := ls.assignInstance(pool, req, slot, startTime)
 			pool.Unlock()
 			return resp
 		}
-		logger.Infof("lite acquire session sticky invalidated: instance %s absent/unhealthy/full, redispatch", instanceID)
-		pool.removeSessionBinding(bindingKey)
+		// Designated instance absent, unhealthy, full, or sessionCtx mismatch:
+		// delete the stale store record so a future acquire does not repeatedly
+		// try to recover against an invalid binding. If dispatch succeeds below,
+		// assignInstance's Save overwrites with the new binding.
+		pool.sessionStore.deleteSessionFromStore(bindingKey)
+		logger.Infof("lite acquire store designate instance %s absent/unhealthy/full/ctx-mismatch, redispatch",
+			storeRec.InstanceID)
 	}
 	// 2. dispatch
 	slots := pool.candidateSlotsLocked(req.SessionCtxID)
@@ -112,7 +147,12 @@ func (ls *LiteScheduler) assignInstance(pool *LiteFunctionPool, req *LiteRequest
 	allocID := genAllocationID(allocationSessionID(req.SessionID, req.SessionCtxID), slot.InstanceID, seq)
 	slot.InUse++
 	if req.SessionID != "" {
-		pool.bindSessionOnAcquire(sessionBindingKey(req.SessionID, req.SessionCtxID), slot.InstanceID)
+		bindingKey := sessionBindingKey(req.SessionID, req.SessionCtxID)
+		pool.bindSessionOnAcquire(bindingKey, slot.InstanceID)
+		// Persist the binding to the external store so a scheduler crash can be
+		// lazily recovered on the next acquire. Async, nil-safe, fail-open.
+		pool.sessionStore.saveSessionToStore(bindingKey, req.SessionID, req.SessionCtxID,
+			slot.InstanceID, req.SessionTTL)
 	}
 	alloc := &Allocation{
 		AllocationID: allocID, SessionID: req.SessionID, SessionCtxID: req.SessionCtxID,
@@ -226,10 +266,11 @@ func (ls *LiteScheduler) startSessionUnbindTimer(pool *LiteFunctionPool, session
 			pool.Unlock()
 			return
 		}
-		current.timer = nil
-		current.expiring = false
-		delete(pool.sessions, sessionID)
+		// removeSessionBinding stops the (already-fired) timer, deletes the map
+		// entry and enqueues an async Delete of the external store record so the
+		// binding is not lazily recovered after a legitimate idle unbind.
 		funcKey := pool.funcKey
+		pool.removeSessionBinding(sessionID)
 		pool.Unlock()
 		log.GetLogger().With(zap.String("sessionID", sessionID), zap.String("funcKey", funcKey)).
 			Infof("lite session idle-unbind: session %s unbound after TTL (func %s)", sessionID, funcKey)
@@ -444,6 +485,9 @@ func (ls *LiteScheduler) reacquireAllocation(req *LiteRequest, metrics *types.In
 	slot.InUse++
 	if sessionID != "" {
 		pool.bindSessionOnAcquire(bindingKey, instanceID)
+		// Persist the recovered binding so subsequent crashes can recover again.
+		pool.sessionStore.saveSessionToStore(bindingKey, sessionID, sessionCtxID,
+			instanceID, sessionTTL)
 	}
 	overCapacity := slot.InUse > slot.Capacity
 	newInUse := slot.InUse

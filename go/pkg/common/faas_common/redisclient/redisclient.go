@@ -72,6 +72,10 @@ const (
 
 	redisRetryTimes    = 3
 	redisRetryInterval = 100 * time.Millisecond
+
+	// Nil is the error returned by redis client when a key doesn't exist. It mirrors
+	// redis.Nil so callers can use errors.Is against it without importing go-redis.
+	Nil = redis.Nil
 )
 
 var (
@@ -97,7 +101,24 @@ var (
 	redisCmd *Client
 
 	newRedisClient = New
+
+	// paramMu 保护跨包共享的 *NewRedisClientParam 字段读写：
+	//   - sessionstore.BuildRedisClient 在原地更新共享 param 字段时持写锁（LockParam）
+	//   - initClient 重连读取 param 字段时持读锁（RLockParam）
+	paramMu sync.RWMutex
 )
+
+// LockParam  持共享 param 写锁。供外部写者（如 sessionstore.BuildRedisClient）在原地改 *NewRedisClientParam 字段时使用。
+func LockParam() { paramMu.Lock() }
+
+// UnlockParam 释放共享 param 写锁。
+func UnlockParam() { paramMu.Unlock() }
+
+// RLockParam / RUnlockParam 持/释放共享 param 读锁。initClient 内部读取时使用。
+func RLockParam() { paramMu.RLock() }
+
+// RUnlockParam 释放共享 param 读锁。
+func RUnlockParam() { paramMu.RUnlock() }
 
 // Option -
 type Option func(*redisClientOption)
@@ -162,9 +183,9 @@ type NewRedisClientParam struct {
 
 // GetRedisCmd -
 func GetRedisCmd() *Client {
-	mu.Lock()
+	mu.RLock()
 	client := redisCmd
-	mu.Unlock()
+	mu.RUnlock()
 	return client
 }
 
@@ -236,6 +257,15 @@ func (c *Client) Get(ctx context.Context, key string) *redis.StringCmd {
 	cli := c.client
 	c.RUnlock()
 	return cli.Get(ctx, key)
+}
+
+// SetEX sets key value with an expiration. Kept as SetEX for backward-compatible
+// semantics (overwrites unconditionally, applies physical TTL).
+func (c *Client) SetEX(ctx context.Context, key string, value interface{}, expiration time.Duration) *redis.StatusCmd {
+	c.RLock()
+	cli := c.client
+	c.RUnlock()
+	return cli.Set(ctx, key, value, expiration)
 }
 
 // Del -
@@ -490,13 +520,18 @@ func checkAndReconnectRedis(clientRedisConfig *NewRedisClientParam, client *Clie
 }
 
 func initClient(clientRedisConfig *NewRedisClientParam, stopCh <-chan struct{}) (*Client, error) {
-	c, err := newRedisClient(NewRedisClientParam{
-		ServerMode: clientRedisConfig.ServerMode,
-		ServerAddr: clientRedisConfig.ServerAddr,
-		Password:   clientRedisConfig.Password,
-		Timeout:    clientRedisConfig.Timeout,
-	}, stopCh, SetEnableTLS(clientRedisConfig.EnableTLS),
-		SetGetRealTimeServerAddrFunc(clientRedisConfig.HotloadConfFunc))
+	paramMu.RLock()
+	param := NewRedisClientParam{
+		ServerMode:      clientRedisConfig.ServerMode,
+		ServerAddr:      clientRedisConfig.ServerAddr,
+		Password:        clientRedisConfig.Password,
+		Timeout:         clientRedisConfig.Timeout,
+		EnableTLS:       clientRedisConfig.EnableTLS,
+		HotloadConfFunc: clientRedisConfig.HotloadConfFunc,
+	}
+	paramMu.RUnlock()
+	c, err := newRedisClient(param, stopCh, SetEnableTLS(param.EnableTLS),
+		SetGetRealTimeServerAddrFunc(param.HotloadConfFunc))
 	if err != nil {
 		log.GetLogger().Errorf("failed to new a redis Client, %s", err.Error())
 		return nil, err

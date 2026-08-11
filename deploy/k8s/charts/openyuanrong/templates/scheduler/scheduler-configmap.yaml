@@ -114,5 +114,22 @@ data:
         "keyContent": "${KEY_CONTENT}",
         "certContent": "${CERT_CONTENT}"
       },
-      "liteScheduler": {{ .Values.global.functionScheduler.liteScheduler | toJson }}
+      "liteScheduler": {{ .Values.global.functionScheduler.liteScheduler | toJson }},
+      "sessionStore": {
+        "backend": {{ quote .Values.global.functionScheduler.sessionStore.backend }},
+        "backendTTLSeconds": {{ .Values.global.functionScheduler.sessionStore.backendTTLSeconds }},
+        "redisConfig": {
+          "clusterID": {{ quote .Values.global.functionScheduler.sessionStore.redisConfig.clusterID }},
+          "serverAddr": {{ quote .Values.global.functionScheduler.sessionStore.redisConfig.serverAddr }},
+          "serverMode": {{ quote .Values.global.functionScheduler.sessionStore.redisConfig.serverMode }},
+          "password": {{ quote .Values.global.functionScheduler.sessionStore.redisConfig.password }},
+          "enableTLS": {{ .Values.global.functionScheduler.sessionStore.redisConfig.enableTLS }},
+          "timeoutConf": {
+            "dialTimeout": {{ .Values.global.functionScheduler.sessionStore.redisConfig.timeoutConf.dialTimeout }},
+            "readTimeout": {{ .Values.global.functionScheduler.sessionStore.redisConfig.timeoutConf.readTimeout }},
+            "writeTimeout": {{ .Values.global.functionScheduler.sessionStore.redisConfig.timeoutConf.writeTimeout }},
+            "idleTimeout": {{ .Values.global.functionScheduler.sessionStore.redisConfig.timeoutConf.idleTimeout }}
+          }
+        }
+      }
     }

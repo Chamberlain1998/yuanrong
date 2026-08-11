@@ -224,6 +224,10 @@ func (ms *MicroServiceScheduler) HandleCreateError(createErr error) {
 func (ms *MicroServiceScheduler) SignalAllInstances(signalFunc scheduler.SignalInstanceFunc) {
 }
 
+// CleanExternalSessionRecords no-op：microservice scheduler 不维护 session 绑定外部记录。
+func (ms *MicroServiceScheduler) CleanExternalSessionRecords() {
+}
+
 // Destroy destroys instanceScheduler
 func (ms *MicroServiceScheduler) Destroy() {
 }

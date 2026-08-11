@@ -53,6 +53,7 @@ import (
 	"yuanrong.org/kernel/pkg/functionscaler/metrics"
 	"yuanrong.org/kernel/pkg/functionscaler/registry"
 	"yuanrong.org/kernel/pkg/functionscaler/selfregister"
+	"yuanrong.org/kernel/pkg/functionscaler/session"
 	"yuanrong.org/kernel/pkg/functionscaler/sessioncontextmanager"
 	"yuanrong.org/kernel/pkg/functionscaler/sessioncontextregistry"
 	"yuanrong.org/kernel/pkg/functionscaler/types"
@@ -1317,4 +1318,29 @@ func generateInstanceResponse(insAlloc *types.InstanceAllocation, snErr snerror.
 
 func printInputLog() {
 	log.GetLogger().Infof("%s is alive.", logFileName)
+}
+
+// InitSessionStoreRedis 在配置 sessionStore.backend=redis 时初始化全局 Redis 客户端。
+// 失败直接返回错误，遵循"高性能模式下 Redis 不可用即启动失败"策略，避免静默降级掩盖性能问题。
+// backend=datasystem 时跳过 redis 初始化。
+//
+// 两个启动入口（libruntime handler 与 module main）都在构造 scheduler 前调用本函数，
+// 确保 concurrencyscheduler.makeSessionStore 取到已初始化的全局 client（否则
+// redisclient.GetRedisCmd() 返回 nil，redis 后端会因 RedisClient 为空初始化失败）。
+func InitSessionStoreRedis(stopCh <-chan struct{}) error {
+	cfg := config.GlobalConfig.SessionStoreConfig
+	ok, err := session.IsRedisBackend(cfg.Backend)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		log.GetLogger().Debugf("session store backend is %s, skip init redis", cfg.Backend)
+		return nil
+	}
+	if _, err := session.BuildRedisClient(cfg.RedisConfig, stopCh); err != nil {
+		log.GetLogger().Errorf("init session store redis client failed, err: %s", err.Error())
+		return fmt.Errorf("init session store redis client failed: %w", err)
+	}
+	log.GetLogger().Infof("session store redis client initialized, ttl=%ds", cfg.BackendTTLSeconds)
+	return nil
 }

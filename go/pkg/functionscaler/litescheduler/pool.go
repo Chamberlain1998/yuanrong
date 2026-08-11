@@ -73,11 +73,12 @@ type sessionBinding struct {
 
 // LiteFunctionPool holds local instances, session bindings and dispatcher for one funcKey.
 type LiteFunctionPool struct {
-	funcKey    string
-	funcSpec   *types.FunctionSpecification
-	instances  map[string]*LiteInstance
-	sessions   map[string]*sessionBinding // sessionID -> binding
-	dispatcher Dispatcher
+	funcKey      string
+	funcSpec     *types.FunctionSpecification
+	instances    map[string]*LiteInstance
+	sessions     map[string]*sessionBinding // sessionID -> binding
+	dispatcher   Dispatcher
+	sessionStore *liteSessionStore // external store coordinator; nil => all ops no-op (tests)
 	sync.RWMutex
 	seqCounter uint64 // for allocationID seq; protected by pool.Lock (writer-serialized)
 }
@@ -233,6 +234,31 @@ func sessionTTLFor(reqTTL int) time.Duration {
 	return time.Duration(reqTTL) * time.Second
 }
 
+// tryLocalStickyLocked checks the local session binding and returns the matching
+// schedulable slot. Returns (slot, true) on sticky hit (and cancels any pending
+// idle-unbind timer). Returns (nil, false) on miss or on an invalidated binding
+// (instance absent/unhealthy/full); in the latter case the stale binding is
+// removed so the caller can dispatch or lazily recover from the external store.
+// Shared by handleAcquire Phase 1 (first lookup) and Phase 3 (re-check after the
+// out-of-lock store.Get). Caller must hold pool.Lock.
+func (p *LiteFunctionPool) tryLocalStickyLocked(bindingKey string) (*LiteInstance, bool) {
+	binding, ok := p.sessions[bindingKey]
+	if !ok {
+		return nil, false
+	}
+	slot := p.instances[binding.instanceID]
+	if slot != nil &&
+		(slot.Status == InstanceStatusRunning || slot.Status == InstanceStatusSubHealth) &&
+		slot.InUse < slot.Capacity {
+		p.cancelSessionUnbind(bindingKey)
+		return slot, true
+	}
+	// Binding exists but its instance is absent/unhealthy/full: clean the stale
+	// binding so dispatch/recovery start from a clean slate.
+	p.removeSessionBinding(bindingKey)
+	return nil, false
+}
+
 // bindSessionOnAcquire creates or refreshes a sessionBinding for the given
 // sessionID, incrementing activeAllocs. If the session was in the idle-unbind
 // pending state (expiring), the timer is cancelled. Caller must hold pool.Lock.
@@ -282,14 +308,18 @@ func (p *LiteFunctionPool) cancelSessionUnbind(sessionID string) {
 	binding.expiring = false
 }
 
-// removeSessionBinding deletes the session binding entry entirely.
-// Used by the timer callback and by instance deletion cleanup.
-// Caller must hold pool.Lock.
+// removeSessionBinding deletes the session binding entry entirely and enqueues
+// an async Delete of the external store record so a subsequent acquire on the same
+// session does not recover a stale binding. Used by the timer callback, instance
+// deletion cleanup and sticky-invalidated re-dispatch. Caller must hold pool.Lock;
+// the async enqueue does not block on I/O. nil-safe when sessionStore is unset.
+// deletePool does NOT call this (it bulk-syncs via cleanExternalRecords instead).
 func (p *LiteFunctionPool) removeSessionBinding(sessionID string) {
 	if binding, ok := p.sessions[sessionID]; ok {
 		binding.stopTimer()
 	}
 	delete(p.sessions, sessionID)
+	p.sessionStore.deleteSessionFromStore(sessionID)
 }
 
 // stopTimer stops the timer if set; safe to call when timer is nil.
