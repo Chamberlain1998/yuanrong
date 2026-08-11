@@ -1297,7 +1297,7 @@ func (gi *GenericInstancePool) GetFuncSpec() *types.FunctionSpecification {
 	return funcSpec
 }
 
-func (gi *GenericInstancePool) getCurrentInstanceNum(resKey resspeckey.ResSpecKey) (int, int, snerror.SNError) {
+func (gi *GenericInstancePool) getRunningInstanceNum(resKey resspeckey.ResSpecKey) (int, int, snerror.SNError) {
 	// insConfig is stored with default resource, labeled instances have their individual limit, all types of instances
 	// are subject to the limit with default resource and no label
 	if _, exist := gi.insConfig[resKey]; !exist {
@@ -1305,7 +1305,7 @@ func (gi *GenericInstancePool) getCurrentInstanceNum(resKey resspeckey.ResSpecKe
 		return 0, 0, snerror.New(statuscode.FunctionIsDisabled, fmt.Sprintf("function is disabled"))
 	}
 	var scaledNum, reservedNum int
-	var scaledNumGlobal, reservedNumGlobal, pendingNumGlobal int
+	var scaledNumGlobal, reservedNumGlobal int
 
 	for res, queue := range gi.reservedInstanceQueue {
 		reservedNumGlobal += queue.GetInstanceNumber(true)
@@ -1321,12 +1321,20 @@ func (gi *GenericInstancePool) getCurrentInstanceNum(resKey resspeckey.ResSpecKe
 			scaledNum += queue.GetInstanceNumber(true)
 		}
 	}
-	for _, v := range gi.pendingInstanceNum {
-		pendingNumGlobal += v
+	return scaledNum + reservedNum, scaledNumGlobal + reservedNumGlobal, nil
+}
+
+func (gi *GenericInstancePool) getCurrentInstanceNum(resKey resspeckey.ResSpecKey) (int, int, snerror.SNError) {
+	runningForCurrentLabel, runningForGlobal, err := gi.getRunningInstanceNum(resKey)
+	if err != nil {
+		return 0, 0, err
 	}
-	sumForCurrentLabel := scaledNum + reservedNum + gi.pendingInstanceNum[resKey.InvokeLabel]
-	sumForGlobal := scaledNumGlobal + reservedNumGlobal + pendingNumGlobal
-	return sumForCurrentLabel, sumForGlobal, nil
+	pendingNumGlobal := 0
+	for _, pendingNum := range gi.pendingInstanceNum {
+		pendingNumGlobal += pendingNum
+	}
+	return runningForCurrentLabel + gi.pendingInstanceNum[resKey.InvokeLabel],
+		runningForGlobal + pendingNumGlobal, nil
 }
 
 // 判断实例是否可以继续扩容，需要判断同一个label的实例数之和是否超出label级的
@@ -1588,7 +1596,7 @@ func (gi *GenericInstancePool) judgeExceedInstance(resKey resspeckey.ResSpecKey,
 		logger.Errorf("instance config not exist, skip")
 		return
 	}
-	sumForCurrentLabel, sumForGlobal, err := gi.getCurrentInstanceNum(insConfResKey)
+	sumForCurrentLabel, sumForGlobal, err := gi.getRunningInstanceNum(insConfResKey)
 	if err != nil {
 		return
 	}

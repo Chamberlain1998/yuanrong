@@ -138,7 +138,13 @@ FSIntfImpl::FSIntfImpl(const std::string &ipAddr, int port, FSIntfHandlers handl
         {StreamingMessage::kCallResultAck, std::bind(&FSIntfImpl::RecvResponse, this, _1, _2)}
     };
     eventMsgHdlrs = {
-        {StreamingMessage::kEventReq, std::bind(&FSIntfImpl::RecvEventRequest, this, _1, _2)}
+        {StreamingMessage::kEventReq, std::bind(&FSIntfImpl::RecvEventRequest, this, _1, _2)},
+        // FunctionProxy acknowledges every outbound EventRequest after it has
+        // handed the event to the frontend stream. EventAsync completes on a
+        // successful write, so the acknowledgement carries no additional
+        // state for the runtime.
+        {StreamingMessage::kCallResultAck,
+         [](const std::string &, const std::shared_ptr<StreamingMessage> &) {}}
     };
 }
 
@@ -975,6 +981,9 @@ void FSIntfImpl::NewRTIntfClient(const std::string &dstInstanceID, const NotifyR
 
 std::shared_ptr<FSIntfReaderWriter> FSIntfImpl::NewOrGetEventIntfClient(const std::string &dstInstanceID)
 {
+    if (dstInstanceID == FUNCTION_PROXY) {
+        return NewOrGetProxyEventIntfClient();
+    }
     auto eventIntf = fsInrfMgr->TryGetEventIntfs(dstInstanceID);
     if (eventIntf != nullptr && eventIntf->Available()) {
         return eventIntf;
@@ -987,22 +996,46 @@ std::shared_ptr<FSIntfReaderWriter> FSIntfImpl::NewOrGetEventIntfClient(const st
     }
     auto eventServerInfo = it->second;
     lock.unlock();
-    if (eventIntf != nullptr && eventIntf->IsSameDstAddr(eventServerInfo->eventServerIp,
-                                                         eventServerInfo->eventServerPort)) {
-        YRLOG_DEBUG("EventIntfClient is not avaliable but no need to create new client, dstInstance ip: {}, port:{}",
-                    eventServerInfo->eventServerIp,
-                    eventServerInfo->eventServerPort);
-        return eventIntf;
-    }
     std::unique_lock<std::mutex> dstInstanceLock(eventServerInfo->dstMu);
     YRLOG_DEBUG("Begin to NewEventIntfClient, ip: {}, port:{}", eventServerInfo->eventServerIp,
                 eventServerInfo->eventServerPort);
 
-    auto weakSelf = weak_from_this();
     eventIntf = fsInrfMgr->NewEventIntfClient(
         instanceID, dstInstanceID, runtimeID,
         ReaderWriterClientOption{.ip = eventServerInfo->eventServerIp,
                                  .port = eventServerInfo->eventServerPort,
+                                 .disconnectedTimeout = RT_DISCONNECT_TIMEOUT_MS,
+                                 .security = security,
+                                 .isKeepAlive = false},
+        ProtocolType::GRPC);
+    eventIntf->RegisterMessageHandler(eventMsgHdlrs);
+    auto error = eventIntf->Start();
+    if (error.OK()) {
+        fsInrfMgr->EmplaceEventIntfs(dstInstanceID, eventIntf);
+    }
+    return eventIntf;
+}
+
+std::shared_ptr<FSIntfReaderWriter> FSIntfImpl::NewOrGetProxyEventIntfClient()
+{
+    constexpr const char *EVENT_STREAM_ROLE = "event";
+    const std::string dstInstanceID = FUNCTION_PROXY;
+    auto eventIntf = fsInrfMgr->TryGetEventIntfs(dstInstanceID);
+    if (eventIntf != nullptr && eventIntf->Available()) {
+        return eventIntf;
+    }
+    std::lock_guard<std::mutex> eventLock(eventMu_);
+    eventIntf = fsInrfMgr->TryGetEventIntfs(dstInstanceID);
+    if (eventIntf != nullptr && eventIntf->Available()) {
+        return eventIntf;
+    }
+    YRLOG_DEBUG("Begin to NewEventIntfClient, ip: {}, port:{}", fsIp, fsPort);
+
+    auto weakSelf = weak_from_this();
+    eventIntf = fsInrfMgr->NewEventIntfClient(
+        instanceID, dstInstanceID, runtimeID,
+        ReaderWriterClientOption{.ip = fsIp,
+                                 .port = fsPort,
                                  .disconnectedTimeout = RT_DISCONNECT_TIMEOUT_MS,
                                  .security = security,
                                  .resendCb = [weakSelf](const std::string &dstInstanceID) {
@@ -1015,7 +1048,8 @@ std::shared_ptr<FSIntfReaderWriter> FSIntfImpl::NewOrGetEventIntfClient(const st
                                          self->NotifyDisconnected(dstInstanceID);
                                      }
                                  },
-                                 .isKeepAlive = false},
+                                 .isKeepAlive = false,
+                                 .streamRole = EVENT_STREAM_ROLE},
         ProtocolType::GRPC);
     eventIntf->RegisterMessageHandler(eventMsgHdlrs);
     auto error = eventIntf->Start();

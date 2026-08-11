@@ -153,6 +153,10 @@ public:
         callback(notifyReq, ErrorInfo());
     };
     void CallResultAsync(const std::shared_ptr<CallResultMessageSpec> req, CallResultCallBack callback) override{};
+    void EventAsync(const std::shared_ptr<EventMessageSpec> &req, int timeoutSec = -1) override
+    {
+        lastEventRequest = req->Immutable();
+    }
     void KillAsync(const KillRequest &req, KillCallBack callback, int timeout) override
     {
         KillResponse resp;
@@ -190,7 +194,6 @@ public:
         eventServerInstanceId = instanceId;
         eventServerInfoUpdated = true;
     }
-    
     MOCK_METHOD(void, ReturnCallResult,
                 (const std::shared_ptr<CallResultMessageSpec> result, bool isCreate, CallResultCallBack callback),
                 (override));
@@ -205,6 +208,7 @@ public:
     int eventServerPort = 0;
     std::string eventServerInstanceId;
     std::string lastInstanceRequirement;
+    EventRequest lastEventRequest;
     std::promise<int> callbackPromise = std::promise<int>();
     std::promise<int> killCallbackPromise = std::promise<int>();
     std::shared_future<int> callbackFuture = callbackPromise.get_future();

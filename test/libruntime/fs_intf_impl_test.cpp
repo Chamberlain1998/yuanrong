@@ -32,6 +32,8 @@ using namespace YR::Libruntime;
 namespace YR {
 namespace test {
 
+constexpr const char *FUNCTION_PROXY_ID = "function-proxy";
+
 bool SetEnv(const std::string &k, const std::string &v)
 {
     const char *name = k.c_str();
@@ -540,9 +542,14 @@ TEST_F(FSIntfImplTest, EventAsyncWithRetry)
     fsIntfImpl_->fsInrfMgr = mockFsIntfMgr;
     auto mockFsIntfRW = std::make_shared<MockFSIntfReaderWriter>();
     auto mockNewFsIntfRW = std::make_shared<MockFSIntfReaderWriter>();
-    EXPECT_CALL(*mockFsIntfMgr, GetEventIntfs).WillRepeatedly(Return(mockFsIntfRW));
     EXPECT_CALL(*mockFsIntfMgr, TryGetEventIntfs).WillRepeatedly(Return(mockFsIntfRW));
-    EXPECT_CALL(*mockFsIntfMgr, NewEventIntfClient).WillRepeatedly(Return(mockNewFsIntfRW));
+    EXPECT_CALL(*mockFsIntfMgr, NewEventIntfClient)
+        .WillRepeatedly(Invoke([mockNewFsIntfRW](const std::string &, const std::string &,
+                                                const std::string &, const ReaderWriterClientOption &option,
+                                                ProtocolType) {
+            EXPECT_TRUE(option.streamRole.empty());
+            return mockNewFsIntfRW;
+        }));
     EXPECT_CALL(*mockFsIntfMgr, EmplaceEventIntfs).WillRepeatedly(Return(true));
     EXPECT_CALL(*mockFsIntfRW, Available).WillRepeatedly(Return(false));
     EXPECT_CALL(*mockNewFsIntfRW, Available).WillRepeatedly(Return(true));
@@ -564,6 +571,104 @@ TEST_F(FSIntfImplTest, EventAsyncWithRetry)
     fsIntfImpl_->EventAsync(req);
     auto wr = fsIntfImpl_->GetWiredRequest(reqId, true);
     EXPECT_EQ(wr, nullptr);
+}
+
+TEST_F(FSIntfImplTest, FunctionProxyEventRouteUsesLocalProxyEventStream)
+{
+    auto mockFsIntfMgr = std::make_shared<MockFSIntfManager>();
+    auto mockEventIntf = std::make_shared<MockFSIntfReaderWriter>();
+    fsIntfImpl_->fsInrfMgr = mockFsIntfMgr;
+    fsIntfImpl_->fsIp = "127.0.0.9";
+    fsIntfImpl_->fsPort = 19090;
+
+    EXPECT_CALL(*mockFsIntfMgr, TryGetEventIntfs(FUNCTION_PROXY_ID)).WillRepeatedly(Return(nullptr));
+    EXPECT_CALL(*mockFsIntfMgr, NewEventIntfClient)
+        .WillOnce(Invoke([mockEventIntf](const std::string &, const std::string &dstInstance,
+                                        const std::string &, const ReaderWriterClientOption &option,
+                                        ProtocolType) {
+            EXPECT_EQ(dstInstance, FUNCTION_PROXY_ID);
+            EXPECT_EQ(option.ip, "127.0.0.9");
+            EXPECT_EQ(option.port, 19090);
+            EXPECT_EQ(option.streamRole, "event");
+            return mockEventIntf;
+        }));
+    EXPECT_CALL(*mockEventIntf, Start()).WillOnce(Return(ErrorInfo()));
+    EXPECT_CALL(*mockFsIntfMgr,
+                EmplaceEventIntfs(FUNCTION_PROXY_ID, std::static_pointer_cast<FSIntfReaderWriter>(mockEventIntf)))
+        .WillOnce(Return(true));
+
+    EXPECT_EQ(fsIntfImpl_->NewOrGetEventIntfClient(FUNCTION_PROXY_ID), mockEventIntf);
+}
+
+TEST_F(FSIntfImplTest, LegacyEventRouteReplacesUnavailableClientAtSameAddress)
+{
+    const std::string instanceID = "legacy-frontend";
+    auto mockFsIntfMgr = std::make_shared<MockFSIntfManager>();
+    auto unavailableIntf = std::make_shared<MockFSIntfReaderWriter>();
+    auto replacementIntf = std::make_shared<MockFSIntfReaderWriter>();
+    fsIntfImpl_->fsInrfMgr = mockFsIntfMgr;
+    fsIntfImpl_->UpdateEventServerInfo("127.0.0.8", 18080, instanceID);
+
+    EXPECT_CALL(*mockFsIntfMgr, TryGetEventIntfs(instanceID)).WillOnce(Return(unavailableIntf));
+    EXPECT_CALL(*unavailableIntf, Available()).WillOnce(Return(false));
+    EXPECT_CALL(*unavailableIntf, IsSameDstAddr).Times(0);
+    EXPECT_CALL(*mockFsIntfMgr, NewEventIntfClient)
+        .WillOnce(Invoke([replacementIntf, &instanceID](const std::string &, const std::string &dstInstance,
+                                                        const std::string &, const ReaderWriterClientOption &option,
+                                                        ProtocolType) {
+            EXPECT_EQ(dstInstance, instanceID);
+            EXPECT_EQ(option.ip, "127.0.0.8");
+            EXPECT_EQ(option.port, 18080);
+            return replacementIntf;
+        }));
+    EXPECT_CALL(*replacementIntf, Start()).WillOnce(Return(ErrorInfo()));
+    EXPECT_CALL(*mockFsIntfMgr,
+                EmplaceEventIntfs(instanceID, std::static_pointer_cast<FSIntfReaderWriter>(replacementIntf)))
+        .WillOnce(Return(true));
+
+    EXPECT_EQ(fsIntfImpl_->NewOrGetEventIntfClient(instanceID), replacementIntf);
+}
+
+TEST_F(FSIntfImplTest, FunctionProxyEventRouteReplacesUnavailableClientAtSameAddress)
+{
+    auto mockFsIntfMgr = std::make_shared<MockFSIntfManager>();
+    auto unavailableIntf = std::make_shared<MockFSIntfReaderWriter>();
+    auto replacementIntf = std::make_shared<MockFSIntfReaderWriter>();
+    fsIntfImpl_->fsInrfMgr = mockFsIntfMgr;
+    fsIntfImpl_->fsIp = "127.0.0.9";
+    fsIntfImpl_->fsPort = 19090;
+
+    EXPECT_CALL(*mockFsIntfMgr, TryGetEventIntfs(FUNCTION_PROXY_ID))
+        .WillRepeatedly(Return(unavailableIntf));
+    EXPECT_CALL(*unavailableIntf, Available()).WillRepeatedly(Return(false));
+    EXPECT_CALL(*unavailableIntf, IsSameDstAddr).Times(0);
+    EXPECT_CALL(*mockFsIntfMgr, NewEventIntfClient)
+        .WillOnce(Invoke([replacementIntf](const std::string &, const std::string &dstInstance,
+                                           const std::string &, const ReaderWriterClientOption &option,
+                                           ProtocolType) {
+            EXPECT_EQ(dstInstance, FUNCTION_PROXY_ID);
+            EXPECT_EQ(option.ip, "127.0.0.9");
+            EXPECT_EQ(option.port, 19090);
+            EXPECT_EQ(option.streamRole, "event");
+            return replacementIntf;
+        }));
+    EXPECT_CALL(*replacementIntf, Start()).WillOnce(Return(ErrorInfo()));
+    EXPECT_CALL(
+        *mockFsIntfMgr,
+        EmplaceEventIntfs(FUNCTION_PROXY_ID, std::static_pointer_cast<FSIntfReaderWriter>(replacementIntf)))
+        .WillOnce(Return(true));
+
+    EXPECT_EQ(fsIntfImpl_->NewOrGetEventIntfClient(FUNCTION_PROXY_ID), replacementIntf);
+}
+
+TEST_F(FSIntfImplTest, EventChannelConsumesCallResultAck)
+{
+    auto handler = fsIntfImpl_->eventMsgHdlrs.find(StreamingMessage::kCallResultAck);
+    ASSERT_NE(handler, fsIntfImpl_->eventMsgHdlrs.end());
+
+    auto ack = std::make_shared<StreamingMessage>();
+    ack->mutable_callresultack()->set_code(common::ERR_NONE);
+    EXPECT_NO_THROW(handler->second(FUNCTION_PROXY_ID, ack));
 }
 
 }  // namespace test

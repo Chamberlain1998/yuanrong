@@ -1666,6 +1666,7 @@ TEST_F(InvokeAdaptorTest, StreamWriteEventTest)
     std::string streamMessage = "This is a stream message.";
     ErrorInfo result = invokeAdaptor->StreamWriteEvent(streamMessage, threadLocalRequestId, threadLocalInstanceId);
     ASSERT_EQ(result.OK(), true);
+    ASSERT_EQ(gwClient->lastEventRequest.message(), std::string(MetaDataLen, '\0') + streamMessage);
 
     threadLocalRequestId.clear();
     result = invokeAdaptor->StreamWriteEvent(streamMessage, threadLocalRequestId, threadLocalInstanceId);

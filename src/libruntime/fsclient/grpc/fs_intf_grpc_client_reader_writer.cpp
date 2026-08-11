@@ -290,6 +290,9 @@ ErrorInfo FSIntfGrpcClientReaderWriter::BuildStreamWithRetry(std::shared_ptr<grp
     }
     context->AddMetadata(SOURCE_ID_META, srcInstance);
     context->AddMetadata(DST_ID_META, dstInstance);
+    if (!streamRole.empty()) {
+        context->AddMetadata(STREAM_ROLE_META, streamRole);
+    }
     ErrorInfo err;
     for (int32_t retry = 0; retry < retryTimes; ++retry) {
         if (channel == nullptr) {

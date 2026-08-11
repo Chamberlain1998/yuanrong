@@ -1427,7 +1427,7 @@ func TestGenericInstancePool_judgeExceedInstance(t *testing.T) {
 		}},
 		scaledInstanceQueue: map[resspeckey.ResSpecKey]*instancequeue.ScaledInstanceQueue{resKey: {}},
 	}
-	defer ApplyFunc((*GenericInstancePool).getCurrentInstanceNum, func(_ *GenericInstancePool, resKey resspeckey.ResSpecKey) (int, int, snerror.SNError) {
+	defer ApplyFunc((*GenericInstancePool).getRunningInstanceNum, func(_ *GenericInstancePool, resKey resspeckey.ResSpecKey) (int, int, snerror.SNError) {
 		return 2, 2, nil
 	}).Reset()
 	i := 0
@@ -1445,6 +1445,35 @@ func TestGenericInstancePool_judgeExceedInstance(t *testing.T) {
 		InvokeLabel:         "",
 	}, logger)
 	assert.Equal(t, i, 1)
+}
+
+func TestGenericInstancePoolJudgeExceedInstanceDoesNotDoubleCountPending(t *testing.T) {
+	funcCtx, _ := context.WithCancel(context.TODO())
+	resKey := resspeckey.ResSpecKey{CPU: 500, Memory: 600}
+	gi := &GenericInstancePool{
+		FuncSpec:      &types.FunctionSpecification{FuncKey: "mock-funcKey-123", FuncCtx: funcCtx},
+		defaultResKey: resKey,
+		insConfig: map[resspeckey.ResSpecKey]*instanceconfig.Configuration{
+			resKey: {InstanceMetaData: commonTypes.InstanceMetaData{MaxInstance: 1}},
+		},
+		pendingInstanceNum: map[string]int{"": 1},
+		scaledInstanceQueue: map[resspeckey.ResSpecKey]*instancequeue.ScaledInstanceQueue{
+			resKey: {},
+		},
+	}
+	defer ApplyFunc((*GenericInstancePool).getRunningInstanceNum,
+		func(_ *GenericInstancePool, _ resspeckey.ResSpecKey) (int, int, snerror.SNError) {
+			return 1, 1, nil
+		}).Reset()
+	scaleDownCalls := 0
+	defer ApplyFunc((*instancequeue.ScaledInstanceQueue).ScaleDownHandler,
+		func(_ *instancequeue.ScaledInstanceQueue, _ int, _ scaler.ScaleDownCallback) {
+			scaleDownCalls++
+		}).Reset()
+
+	gi.judgeExceedInstance(resKey, log.GetLogger())
+
+	assert.Zero(t, scaleDownCalls)
 }
 
 func TestGenericInstancePool_ResetInstanceScheduler(t *testing.T) {
