@@ -40,6 +40,12 @@ logger = logging.getLogger(__name__)
 print_logger = logging.getLogger("print")
 
 
+def render_toml_bool(value: Any, setting: str) -> str:
+    if not isinstance(value, bool):
+        raise ValueError(f"{setting} must be a boolean")
+    return str(value).lower()
+
+
 def create_jinja_environment(port_policy: str = "RANDOM") -> Environment:
     env = Environment(
         undefined=StrictUndefined,
@@ -49,6 +55,7 @@ def create_jinja_environment(port_policy: str = "RANDOM") -> Environment:
         newline_sequence="\n",
     )
     env.filters["check_port"] = partial(check_port, port_policy=port_policy)
+    env.filters["toml_bool"] = render_toml_bool
     return env
 
 

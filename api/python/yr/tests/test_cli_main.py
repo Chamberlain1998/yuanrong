@@ -177,6 +177,50 @@ class TestCliMain(unittest.TestCase):
                         expected_policy,
                     )
 
+    def test_start_data_system_enable_option(self):
+        cases = [
+            ([], ()),
+            (
+                ["--data-system-enable", "false"],
+                ("values.function_agent.data_system_enable=false",),
+            ),
+            (
+                ["--data_system_enable", "true"],
+                ("values.function_agent.data_system_enable=true",),
+            ),
+        ]
+        for args, expected_overrides in cases:
+            with self.subTest(args=args):
+                main = self.load_cli_main_with_stubbed_deps()
+                result = CliRunner().invoke(main.cli, ["start", *args], obj={})
+
+                self.assertEqual(result.exit_code, 0, result.output)
+                self.assertEqual(
+                    main.FakeSystemLauncher.calls[-1][1]["overrides"],
+                    expected_overrides,
+                )
+
+    def test_named_data_system_enable_option_wins_over_set_override(self):
+        main = self.load_cli_main_with_stubbed_deps()
+
+        result = CliRunner().invoke(
+            main.cli,
+            [
+                "start",
+                "-s",
+                "values.function_agent.data_system_enable=true",
+                "--data-system-enable",
+                "false",
+            ],
+            obj={},
+        )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(
+            main.FakeSystemLauncher.calls[-1][1]["overrides"],
+            ("values.function_agent.data_system_enable=false",),
+        )
+
     def test_config_render_outputs_stdout_or_file(self):
         main = self.load_cli_main_with_stubbed_deps()
         runner = CliRunner()

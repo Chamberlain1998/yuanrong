@@ -22,6 +22,7 @@
 | `--master` | 以主节点模式启动。未指定时以从节点（agent）模式启动。主节点默认启动：`etcd`、`ds_master`、`ds_worker`、`function_master`、`function_proxy`、`function_agent`；从节点默认启动：`ds_worker`、`function_proxy`、`function_agent`。 | 从节点模式 |
 | `-s, --set KEY=VALUE` | 命令行覆盖配置值，可重复指定。`VALUE` 必须是合法 TOML 字面量。 | — |
 | `--master_address http(s)://HOST:PORT` | 仅 agent 模式可用。启动前从指定 `function_master` 拉取服务发现信息，自动生成 `-s` 覆盖项。与 `--master` 同时使用时报错退出。使用 `https://` 时还需通过 `--config` 或 `-s` 提供 TLS 证书路径。 | — |
+| `--data-system-enable BOOL`, `--data_system_enable BOOL` | 启用 FunctionAgent 的 DataSystem KV Client。此开关不会停用 ds-worker 或其他 DataSystem 使用方。 | `false` |
 
 ### yr launch
 
@@ -146,6 +147,7 @@
 | `[values.function_proxy]` | `grpc_listen_port` | `{{ 22773\|check_port() }}` | function_proxy gRPC 端口。 |
 | `[values.function_agent]` | `ip` | `{{ values.host_ip }}` | function_agent 地址。 |
 | `[values.function_agent]` | `port` | `{{ 58866\|check_port() }}` | function_agent 端口。 |
+| `[values.function_agent]` | `data_system_enable` | `false` | 启用 FunctionAgent 的 DataSystem KV Client。函数需要 DataSystem KV Client（例如使用 `ds://` 工作目录）时，请显式设置为 `true`。 |
 
 ### [values.dashboard] Dashboard
 
