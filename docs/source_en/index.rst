@@ -7,6 +7,7 @@
   deploy/index.md
   use_cases/index
   multi_language_function_programming_interface/index.md
+  agent_distributed_executor/index.md
   more_usage/index.md
   observability/index.md
   FAQ/index.md
