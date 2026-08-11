@@ -50,10 +50,11 @@ type LiteRequest struct {
 // ParseRequest is stateless: decides whether to enter the lite branch (ok=false -> legacy).
 func (ls *LiteScheduler) ParseRequest(op InstanceOperation, targetName string,
 	extraData []byte, traceID string) (req *LiteRequest, ok bool) {
-	logger := log.GetLogger().With(zap.Any("traceID", traceID))
+	logger := log.GetLogger()
+	traceField := zap.String("traceID", traceID)
 	defer func() {
 		if r := recover(); r != nil {
-			logger.Errorf("lite parseRequest panic: %v, fallback to legacy path", r)
+			logger.Error("lite parseRequest panic, fallback to legacy path", traceField, zap.Any("panic", r))
 			req = nil
 			ok = false
 		}
@@ -71,12 +72,11 @@ func (ls *LiteScheduler) ParseRequest(op InstanceOperation, targetName string,
 
 	switch op {
 	case "acquire":
-		sessionID, sessionTTL, concurrency := extractSessionConfig(extraData)
+		sessionID, sessionCtxID, sessionTTL, concurrency := extractSessionDetails(extraData)
 		funcKey := targetName
 		if !ls.isFuncEnabled(funcKey) {
 			return nil, false // 3: whitelist
 		}
-		sessionCtxID := extractSessionCtxID(extraData)
 		sessionCtxEnabled := false
 		if sessionCtxID != "" && ls.funcSpecGetter != nil {
 			funcSpec := ls.funcSpecGetter(funcKey)
@@ -85,7 +85,7 @@ func (ls *LiteScheduler) ParseRequest(op InstanceOperation, targetName string,
 		if sessionID == "" && !sessionCtxEnabled {
 			return nil, false // non-session call chain -> legacy
 		}
-		logger.Debugf("lite parseRequest acquire enters lite branch: funcKey %s", funcKey)
+		logger.Debug("lite parseRequest acquire enters lite branch", traceField, zap.String("funcKey", funcKey))
 		return &LiteRequest{
 			Op: op, FuncKey: funcKey, SessionID: sessionID, SessionCtxID: sessionCtxID,
 			SessionTTL:  sessionTTL,
@@ -97,7 +97,8 @@ func (ls *LiteScheduler) ParseRequest(op InstanceOperation, targetName string,
 		if !IsLiteAllocationID(targetName) {
 			return nil, false // 4e: non-lite prefix -> legacy
 		}
-		logger.Debugf("lite parseRequest %s enters lite branch: allocID %s", op, targetName)
+		logger.Debug("lite parseRequest enters lite branch", traceField, zap.String("operation", string(op)),
+			zap.String("allocationID", targetName))
 		return &LiteRequest{
 			Op: op, AllocationIDs: []string{targetName},
 			ExtraData: extraData, MetricsData: extraData,
@@ -115,10 +116,12 @@ func (ls *LiteScheduler) ParseRequest(op InstanceOperation, targetName string,
 			return nil, false // all non-lite -> legacy
 		}
 		if liteCount != len(ids) {
-			logger.Warnf("batchRetain mixed lite/non-lite prefix, fallback to legacy: %s", targetName)
+			logger.Warn("batchRetain mixed lite/non-lite prefix, fallback to legacy", traceField,
+				zap.String("target", targetName))
 			return nil, false // 4f: mixed -> legacy
 		}
-		logger.Debugf("lite parseRequest batchRetain enters lite branch: %d allocIDs", len(ids))
+		logger.Debug("lite parseRequest batchRetain enters lite branch", traceField,
+			zap.Int("allocationCount", len(ids)))
 		return &LiteRequest{
 			Op: op, AllocationIDs: ids,
 			MetricsData: extraData, TraceID: traceID,
@@ -129,35 +132,38 @@ func (ls *LiteScheduler) ParseRequest(op InstanceOperation, targetName string,
 }
 
 func extractSessionCtxID(extraData []byte) string {
-	if len(extraData) == 0 {
-		return ""
-	}
-	m := map[string][]byte{}
-	if err := json.Unmarshal(extraData, &m); err != nil {
-		return ""
-	}
-	return string(m[constant.SessionCtxID])
+	_, sessionCtxID, _, _ := extractSessionDetails(extraData)
+	return sessionCtxID
 }
 
 // extractSessionConfig parses extraData for InstanceSessionConfig (key constant.InstanceSessionConfig).
 // Returns sessionID, sessionTTL (seconds) and concurrency. sessionID is "" if absent.
 func extractSessionConfig(extraData []byte) (sessionID string, sessionTTL int, concurrency int) {
+	sessionID, _, sessionTTL, concurrency = extractSessionDetails(extraData)
+	return
+}
+
+// extractSessionDetails decodes the outer extraData map once. Acquire and
+// reacquire need both session and session-context fields; decoding them in two
+// helpers doubled the transient JSON maps on these high-frequency paths.
+func extractSessionDetails(extraData []byte) (sessionID, sessionCtxID string, sessionTTL, concurrency int) {
 	if len(extraData) == 0 {
-		return "", 0, 0
+		return "", "", 0, 0
 	}
 	m := map[string][]byte{}
 	if err := json.Unmarshal(extraData, &m); err != nil {
 		log.GetLogger().Debugf("lite extractSessionConfig: extraData unmarshal failed: %v", err)
-		return "", 0, 0
+		return "", "", 0, 0
 	}
+	sessionCtxID = string(m[constant.SessionCtxID])
 	raw, exists := m[constant.InstanceSessionConfig]
 	if !exists {
-		return "", 0, 0
+		return "", sessionCtxID, 0, 0
 	}
 	sess := commonTypes.InstanceSessionConfig{}
 	if err := json.Unmarshal(raw, &sess); err != nil {
 		log.GetLogger().Debugf("lite extractSessionConfig: InstanceSessionConfig unmarshal failed: %v", err)
-		return "", 0, 0
+		return "", sessionCtxID, 0, 0
 	}
-	return sess.SessionID, sess.SessionTTL, sess.Concurrency
+	return sess.SessionID, sessionCtxID, sess.SessionTTL, sess.Concurrency
 }
