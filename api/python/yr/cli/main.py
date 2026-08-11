@@ -179,6 +179,14 @@ Common patterns:\n
     help="Start runtime-launcher for sandbox container backend.",
 )
 @click.option(
+    "--data-system-enable",
+    "--data_system_enable",
+    "data_system_enable",
+    type=bool,
+    default=None,
+    help="Enable the FunctionAgent DataSystem KV client. Defaults to false.",
+)
+@click.option(
     "--port-policy",
     "--port_policy",
     "port_policy",
@@ -202,6 +210,7 @@ def start(ctx: click.Context, **kwargs) -> None:
     function_master_addr = kwargs["function_master_addr"]
     function_proxy_merge_process_enable = kwargs["function_proxy_merge_process_enable"]
     enable_runtime_launcher = kwargs["enable_runtime_launcher"]
+    data_system_enable = kwargs["data_system_enable"]
     port_policy = kwargs["port_policy"]
     block = kwargs["block"]
     config_path: Path = ctx.obj["config_path"]
@@ -226,6 +235,14 @@ def start(ctx: click.Context, **kwargs) -> None:
             ctx.exit(1)
 
     effective_overrides = list(overrides)
+    if data_system_enable is not None:
+        setting = "values.function_agent.data_system_enable"
+        effective_overrides = [
+            override
+            for override in effective_overrides
+            if override.partition("=")[0].strip() != setting
+        ]
+        effective_overrides.append(f"{setting}={str(data_system_enable).lower()}")
     if function_proxy_merge_process_enable:
         effective_overrides.extend(
             [

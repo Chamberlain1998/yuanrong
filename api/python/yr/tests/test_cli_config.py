@@ -171,6 +171,35 @@ class TestCliConfig(unittest.TestCase):
                     value,
                 )
 
+    def test_function_agent_data_system_enable_defaults_to_false(self):
+        config = self._resolve_real_config("")
+
+        self.assertIs(config["function_proxy"]["args"]["data_system_enable"], False)
+        self.assertIs(config["function_agent"]["args"]["data_system_enable"], False)
+
+    def test_function_agent_data_system_enable_override_reaches_both_modes(self):
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                value = str(enabled).lower()
+                config = self._resolve_real_config(
+                    f"[values.function_agent]\ndata_system_enable = {value}\n"
+                )
+
+                self.assertIs(
+                    config["function_proxy"]["args"]["data_system_enable"], enabled
+                )
+                self.assertIs(
+                    config["function_agent"]["args"]["data_system_enable"], enabled
+                )
+
+    def test_function_agent_data_system_enable_rejects_non_boolean(self):
+        with self.assertRaisesRegex(
+            ValueError, "values.function_agent.data_system_enable must be a boolean"
+        ):
+            self._resolve_real_config(
+                '[values.function_agent]\ndata_system_enable = "false"\n'
+            )
+
     def test_local_ip_defaults_to_host_ip_for_backward_compatibility(self):
         config = self._resolve_real_config('[values]\nhost_ip = "192.0.2.10"\n')
 

@@ -48,7 +48,7 @@ enable_faas_frontend:,faas_frontend_http_port:,faas_frontend_grpc_port:,enable_f
 lite_scheduler_enable:,lite_scheduler_enable_all_tenants:,lite_scheduler_enabled_tenants:,lite_scheduler_enabled_functions:,lite_scheduler_acquire_wait_timeout_ms:,\
 enable_meta_service:,meta_service_port:,\
 enable_iam_server:,iam_server_port:,iam_token_expired_time_span:,iam_credential_type:,\
-function_agent_port:,function_proxy_port:,ssh_enable:,enable_tcp_tunnel:,ssh_backend_public_key_dir:,frontend_ssh_auth_enable:,frontend_ssh_address:,\
+function_agent_port:,function_proxy_port:,data_system_enable:,ssh_enable:,enable_tcp_tunnel:,ssh_backend_public_key_dir:,frontend_ssh_auth_enable:,frontend_ssh_address:,\
 frontend_ssh_host_key:,frontend_ssh_authorized_keys:,frontend_ssh_backend_key:,frontend_ssh_max_connections:,\
 tcp_tunnel_port:,tcp_tunnel_max_connections:,\
 function_proxy_grpc_port:,global_scheduler_port:,runtime_init_port:,\
@@ -251,6 +251,7 @@ DASHBOARD_SSL_KEY_FILE="server.key"
 METRICS_COLLECTOR_TYPE="proc"
 MERGE_PROCESS_ENABLE="true"
 FUNCTION_PROXY_MERGE_PROCESS_ENABLE="false"
+DATA_SYSTEM_ENABLE="false"
 SSH_ENABLE="false"
 ENABLE_TCP_TUNNEL="false"
 YR_SSH_BACKEND_PUBLIC_KEY_DIR=""
@@ -586,6 +587,7 @@ function usage() {
   echo -e "     --function_proxy_litebus_thread                     function proxy litebus thread count(default 20)"
   echo -e "     --function_agent_alias                              function agent alias(default empty)"
   echo -e "     --function_proxy_merge_process_enable               enable function proxy merge process mode(default false)"
+  echo -e "     --data_system_enable                                enable FunctionAgent DataSystem KV client (default false)"
   echo -e "     --enable_print_perf                                 function proxy enable to print perf info"
   echo -e "     --enable_dashboard                                  for to enable dashboard(default false)"
   echo -e "     --enable_collector                                  for to enable collector(default false)"
@@ -731,6 +733,7 @@ function parse_opt() {
     -w|--ds_worker_unique_enable) DS_WORKER_UNIQUE_ENABLE=true && shift 1 ;;
     -f|--function_proxy_unique_enable) FUNCTION_PROXY_UNIQUE_ENABLE=true && shift 1 ;;
     --function_proxy_merge_process_enable) FUNCTION_PROXY_MERGE_PROCESS_ENABLE=true && shift 2 ;;
+    --data_system_enable) DATA_SYSTEM_ENABLE=$2 && shift 2 ;;
     -e|--enable_multi_master) ENABLE_MULTI_MASTER=true && shift 1 ;;
     -h|--help) usage && exit 0 ;;
     --master) ENABLE_MASTER="true" && shift 1 ;;
@@ -1280,6 +1283,10 @@ function check_runtime_oom_kill_config() {
 }
 
 function check_input() {
+  if [ "X${DATA_SYSTEM_ENABLE}" != "Xtrue" ] && [ "X${DATA_SYSTEM_ENABLE}" != "Xfalse" ]; then
+    log_error "data_system_enable can only be 'true' or 'false'"
+    return 1
+  fi
   if ! [[ "${LITE_SCHEDULER_ACQUIRE_WAIT_TIMEOUT_MS}" =~ ^[1-9][0-9]*$ ]]; then
     log_error "lite_scheduler_acquire_wait_timeout_ms should be a positive integer, please check your input"
     return 1
@@ -1808,7 +1815,7 @@ function export_config() {
   export RUNTIME_INIT_PORT DS_WORKER_PORT RUNTIME_CONN_TIMEOUT_S
   export ENABLE_RUNTIME_LAUNCHER RUNTIME_LAUNCHER_SOCK
   export RUNTIME_INIT_CALL_TIMEOUT_SECONDS IS_SCHEDULE_TOLERATE_ABNORMAL STATE_STORAGE_TYPE
-  export MERGE_PROCESS_ENABLE FUNCTION_PROXY_MERGE_PROCESS_ENABLE DRIVER_GATEWAY_ENABLE SSH_ENABLE ENABLE_TCP_TUNNEL
+  export MERGE_PROCESS_ENABLE FUNCTION_PROXY_MERGE_PROCESS_ENABLE DATA_SYSTEM_ENABLE DRIVER_GATEWAY_ENABLE SSH_ENABLE ENABLE_TCP_TUNNEL
   export FRONTEND_SSH_AUTH_ENABLE FRONTEND_SSH_ADDRESS FRONTEND_SSH_HOST_KEY FRONTEND_SSH_AUTHORIZED_KEYS
   export FRONTEND_SSH_BACKEND_KEY FRONTEND_SSH_MAX_CONNECTIONS TCP_TUNNEL_PORT TCP_TUNNEL_MAX_CONNECTIONS
   export YR_SSH_BACKEND_PUBLIC_KEY_DIR

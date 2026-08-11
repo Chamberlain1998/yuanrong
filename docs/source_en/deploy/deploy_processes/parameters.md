@@ -22,6 +22,7 @@ For configuration method, refer to the **Configuration** chapter in [Deployment 
 | `--master` | Start in master node mode. When not specified, starts in worker node (agent) mode. Master node starts by default: `etcd`, `ds_master`, `ds_worker`, `function_master`, `function_proxy`, `function_agent`; worker node starts by default: `ds_worker`, `function_proxy`, `function_agent`. | Worker node mode |
 | `-s, --set KEY=VALUE` | Override configuration value from command line, can be specified repeatedly. `VALUE` must be a valid TOML literal. | None |
 | `--master_address http(s)://HOST:PORT` | Only available in agent mode. Pulls service discovery information from specified `function_master` before startup, automatically generates `-s` overrides. Exits with error when used together with `--master`. When using `https://`, also need to provide TLS certificate path via `--config` or `-s`. | None |
+| `--data-system-enable BOOL`, `--data_system_enable BOOL` | Enable the FunctionAgent DataSystem KV client. This does not disable ds-worker or other DataSystem consumers. | `false` |
 
 ### yr launch
 
@@ -146,6 +147,7 @@ The following fields can be overridden in user's `config.toml` under `[values]` 
 | `[values.function_proxy]` | `grpc_listen_port` | `{{ 22773\|check_port() }}` | function_proxy gRPC port. |
 | `[values.function_agent]` | `ip` | `{{ values.host_ip }}` | function_agent address. |
 | `[values.function_agent]` | `port` | `{{ 58866\|check_port() }}` | function_agent port. |
+| `[values.function_agent]` | `data_system_enable` | `false` | Enable the FunctionAgent DataSystem KV client. Set this field to `true` when functions require the DataSystem KV client, such as a `ds://` working directory. |
 
 ### [values.dashboard] Dashboard
 
