@@ -268,9 +268,14 @@ class TunnelClient:
 
     async def _connect_loop(self) -> None:
         attempt = 0
+        # Loading CA certificates is expensive; reuse both contexts across reconnects.
+        ws_kwargs = self._build_ws_kwargs()
+        http_ssl_context = httpx.create_ssl_context(
+            verify=self._ssl_verify,
+            trust_env=False,
+        )
         while not self._stop_event.is_set():
             try:
-                ws_kwargs = self._build_ws_kwargs()
                 async with websockets.connect(self._tunnel_url, **ws_kwargs) as ws:
                     self._current_ws = ws
                     logger.info("Connected to tunnel: %s", self._tunnel_url)
@@ -283,7 +288,7 @@ class TunnelClient:
                     try:
                         async with httpx.AsyncClient(
                             base_url=self._upstream,
-                            verify=self._ssl_verify,
+                            verify=http_ssl_context,
                             timeout=httpx.Timeout(_http_timeout()),
                             trust_env=False,
                             cookies=_NoCookieJar(),
@@ -292,6 +297,7 @@ class TunnelClient:
                     finally:
                         if self._current_ws is ws:
                             self._current_ws = None
+                        self._connected_event.clear()
             except Exception as e:
                 self._connected_event.clear()  # Clear on disconnect
                 self._connect_failure_count += 1
@@ -322,7 +328,7 @@ class TunnelClient:
                 await asyncio.sleep(delay)
 
     def _cleanup_ws_channels(self) -> None:
-        """Cancel in-flight WS proxy tasks and clear channels."""
+        """Clear stale channel routing state after proxy tasks stop."""
         self._ws_channels.clear()
 
     def _cleanup_expired_responses(self) -> None:
@@ -339,15 +345,14 @@ class TunnelClient:
 
     def _make_ssl_context(self) -> Optional[ssl.SSLContext]:
         if self._tunnel_url and self._tunnel_url.startswith("wss://"):
-            if self._ssl_verify:
-                return None  # use websockets default SSL verification
             ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            logger.warning(
-                "TunnelClient: SSL certificate verification disabled "
-                "via TUNNEL_SSL_VERIFY=0."
-            )
+            if not self._ssl_verify:
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                logger.warning(
+                    "TunnelClient: SSL certificate verification disabled "
+                    "via TUNNEL_SSL_VERIFY=0."
+                )
             return ctx
         return None
 
@@ -393,8 +398,12 @@ class TunnelClient:
 
     async def _recv_frames(self, ws, http: httpx.AsyncClient) -> None:
         """Receive frames and dispatch them."""
-        http_tasks = set()
+        forwarding_tasks = set()
         http_semaphore = asyncio.Semaphore(self._max_http_concurrency)
+
+        def track(task):
+            forwarding_tasks.add(task)
+            task.add_done_callback(forwarding_tasks.discard)
 
         async def handle_http(frame):
             async with http_semaphore:
@@ -411,10 +420,10 @@ class TunnelClient:
                     self._pong_event.set()
                 elif isinstance(frame, HttpReqFrame):
                     task = asyncio.create_task(handle_http(frame))
-                    http_tasks.add(task)
-                    task.add_done_callback(http_tasks.discard)
+                    track(task)
                 elif isinstance(frame, WsConnectFrame):
-                    asyncio.create_task(self._handle_ws_connect(ws, frame))
+                    task = asyncio.create_task(self._handle_ws_connect(ws, frame))
+                    track(task)
                 elif isinstance(frame, (WsMessageFrame, WsCloseFrame)):
                     q = self._ws_channels.get(frame.id)
                     if q is not None:
@@ -424,10 +433,11 @@ class TunnelClient:
         except websockets.ConnectionClosedOK:
             logger.debug("Connection closed normally during recv")
         finally:
-            for task in http_tasks:
+            for task in forwarding_tasks:
                 task.cancel()
-            if http_tasks:
-                await asyncio.gather(*http_tasks, return_exceptions=True)
+            if forwarding_tasks:
+                await asyncio.gather(*forwarding_tasks, return_exceptions=True)
+            self._ws_channels.clear()
 
     async def _heartbeat_loop(self, ws) -> None:
         """Send PingFrame periodically. Close ws on pong timeout."""
