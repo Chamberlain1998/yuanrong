@@ -497,7 +497,8 @@ ${node_selector}
                         optional: true
             volumes:
               - name: docker-graph
-                emptyDir: {}
+                emptyDir:
+                  sizeLimit: 80Gi
     timeout_in_minutes: 90
 YAML
 }
@@ -548,7 +549,8 @@ cat << YAML
                           secretKeyRef: { name: swr-pull-secret, key: .dockerconfigjson, optional: true }
                 volumes:
                   - name: docker-graph
-                    emptyDir: {}
+                    emptyDir:
+                      sizeLimit: 80Gi
         timeout_in_minutes: 120
 
       - label: ":docker: Build Python 3.14 builder arm64"
@@ -594,7 +596,8 @@ cat << YAML
                           secretKeyRef: { name: swr-pull-secret, key: .dockerconfigjson, optional: true }
                 volumes:
                   - name: docker-graph
-                    emptyDir: {}
+                    emptyDir:
+                      sizeLimit: 80Gi
         timeout_in_minutes: 120
 
       - label: ":docker: Publish Python 3.14 builder manifest"
@@ -666,7 +669,8 @@ cat << YAML
                           secretKeyRef: { name: swr-pull-secret, key: .dockerconfigjson, optional: true }
                 volumes:
                   - name: docker-graph
-                    emptyDir: {}
+                    emptyDir:
+                      sizeLimit: 80Gi
         timeout_in_minutes: 30
 YAML
 }
@@ -718,7 +722,7 @@ cat << YAML
       mkdir -p \$\$CACHE_BASE/ccache \$\$CACHE_BASE/go-mod \$\$CACHE_BASE/go-cache \
         \$\$CACHE_BASE/opensource \$\$CACHE_BASE/pip \$\$CACHE_BASE/functionsystem-vendor-cache
       export CCACHE_DIR=\$\$CACHE_BASE/ccache
-      export CCACHE_MAXSIZE="\$\${CCACHE_MAXSIZE:-100G}"
+      export CCACHE_MAXSIZE="\$\${CCACHE_MAXSIZE:-50G}"
       ccache -M "\$\$CCACHE_MAXSIZE"
       export GOMODCACHE=\$\$CACHE_BASE/go-mod
       export PIP_CACHE_DIR=\$\$CACHE_BASE/pip
@@ -925,8 +929,8 @@ cat << YAML
                   - name: build-cache
                     mountPath: /mnt/paas
                 resources:
-                  requests: { cpu: "16", memory: "32Gi" }
-                  limits: { cpu: "16", memory: "32Gi" }
+                  requests: { cpu: "16", memory: "32Gi", ephemeral-storage: "20Gi" }
+                  limits: { cpu: "16", memory: "32Gi", ephemeral-storage: "80Gi" }
                 env:
                   - name: GO111MODULE
                     value: "on"
@@ -1093,8 +1097,8 @@ cat << YAML
                   - name: build-cache
                     mountPath: /mnt/paas
                 resources:
-                  requests: { cpu: "8", memory: "16Gi" }
-                  limits: { cpu: "16", memory: "32Gi" }
+                  requests: { cpu: "8", memory: "16Gi", ephemeral-storage: "5Gi" }
+                  limits: { cpu: "16", memory: "32Gi", ephemeral-storage: "20Gi" }
             volumes:
               - name: build-cache
                 hostPath:
@@ -1177,8 +1181,8 @@ cat << YAML
                   - name: build-cache
                     mountPath: /mnt/paas
                 resources:
-                  requests: { cpu: "4", memory: "8Gi" }
-                  limits: { cpu: "8", memory: "16Gi" }
+                  requests: { cpu: "4", memory: "8Gi", ephemeral-storage: "5Gi" }
+                  limits: { cpu: "8", memory: "16Gi", ephemeral-storage: "20Gi" }
                 env:
                   - name: GO111MODULE
                     value: "on"
@@ -1291,7 +1295,8 @@ cat << YAML
                         optional: true
             volumes:
               - name: docker-graph
-                emptyDir: {}
+                emptyDir:
+                  sizeLimit: 80Gi
     timeout_in_minutes: 120
 YAML
 for SDK_PYTHON_VERSION in ${SANDBOX_RUNTIME_IMAGE_PYTHON_VERSIONS}; do
@@ -1340,7 +1345,7 @@ cat << YAML
       mkdir -p \$\$CACHE_BASE/ccache \$\$CACHE_BASE/go-mod \$\$CACHE_BASE/go-cache \
         \$\$CACHE_BASE/opensource \$\$CACHE_BASE/pip \$\$CACHE_BASE/functionsystem-vendor-cache
       export CCACHE_DIR=\$\$CACHE_BASE/ccache
-      export CCACHE_MAXSIZE="\$\${CCACHE_MAXSIZE:-100G}"
+      export CCACHE_MAXSIZE="\$\${CCACHE_MAXSIZE:-50G}"
       ccache -M "\$\$CCACHE_MAXSIZE"
       export GOMODCACHE=\$\$CACHE_BASE/go-mod
       export PIP_CACHE_DIR=\$\$CACHE_BASE/pip
@@ -1519,8 +1524,8 @@ cat << YAML
                   - name: build-cache
                     mountPath: /mnt/paas
                 resources:
-                  requests: { cpu: "16", memory: "32Gi" }
-                  limits: { cpu: "16", memory: "32Gi" }
+                  requests: { cpu: "16", memory: "32Gi", ephemeral-storage: "20Gi" }
+                  limits: { cpu: "16", memory: "32Gi", ephemeral-storage: "80Gi" }
                 env:
                   - name: GO111MODULE
                     value: "on"
@@ -1695,8 +1700,8 @@ cat << YAML
                   - name: build-cache
                     mountPath: /mnt/paas
                 resources:
-                  requests: { cpu: "8", memory: "16Gi" }
-                  limits: { cpu: "16", memory: "32Gi" }
+                  requests: { cpu: "8", memory: "16Gi", ephemeral-storage: "5Gi" }
+                  limits: { cpu: "16", memory: "32Gi", ephemeral-storage: "20Gi" }
             volumes:
               - name: build-cache
                 hostPath:
@@ -1781,8 +1786,8 @@ cat << YAML
                   - name: build-cache
                     mountPath: /mnt/paas
                 resources:
-                  requests: { cpu: "4", memory: "8Gi" }
-                  limits: { cpu: "8", memory: "16Gi" }
+                  requests: { cpu: "4", memory: "8Gi", ephemeral-storage: "5Gi" }
+                  limits: { cpu: "8", memory: "16Gi", ephemeral-storage: "20Gi" }
                 env:
                   - name: GO111MODULE
                     value: "on"
@@ -1893,7 +1898,8 @@ cat << YAML
                         optional: true
             volumes:
               - name: docker-graph
-                emptyDir: {}
+                emptyDir:
+                  sizeLimit: 80Gi
     timeout_in_minutes: 120
 YAML
 for SDK_PYTHON_VERSION in ${SANDBOX_RUNTIME_IMAGE_PYTHON_VERSIONS}; do

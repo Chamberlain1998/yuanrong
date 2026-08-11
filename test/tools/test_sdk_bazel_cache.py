@@ -78,10 +78,14 @@ class SdkBazelCacheTest(unittest.TestCase):
             common_end = pipeline.index("timeout_in_minutes:", common_start)
             common_block = pipeline[common_start:common_end]
             self.assertIn(
-                'requests: { cpu: "8", memory: "16Gi" }', common_block
+                'requests: { cpu: "8", memory: "16Gi", '
+                'ephemeral-storage: "5Gi" }',
+                common_block,
             )
             self.assertIn(
-                'limits: { cpu: "16", memory: "32Gi" }', common_block
+                'limits: { cpu: "16", memory: "32Gi", '
+                'ephemeral-storage: "20Gi" }',
+                common_block,
             )
         self.assertGreaterEqual(
             pipeline.count(". .buildkite/configure_bazel_remote_cache.sh"), 4

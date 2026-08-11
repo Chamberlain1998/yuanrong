@@ -59,7 +59,7 @@ helm upgrade --install agent-stack-k8s-arm64 oci://ghcr.io/buildkite/helm/agent-
 | Key | Default | Description |
 |-----|---------|-------------|
 | `global.buildNode` | `""` | Optional node name for pinning bazel-remote |
-| `bazelRemote.maxSizeGb` | `200` | Max cache size |
+| `bazelRemote.maxSizeGb` | `150` | Max cache size |
 | `bazelRemote.hostPath` | `/mnt/paas` | Host directory for cache |
 | `bazelRemote.image` | SWR mirror | Must be accessible without Docker Hub |
 | `cacheAging.enabled` | `true` | Run one cache-aging pod on each node |
