@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
 # coding=UTF-8
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Regression tests for package_yuanrong.sh layout contracts."""
 
@@ -519,10 +532,11 @@ class PackageYuanrongLayoutTest(unittest.TestCase):
             package_root = pathlib.Path(temp_dir) / "openyuanrong"
             cpp_lib_dir = package_root / "runtime" / "service" / "cpp" / "lib"
             go_bin_dir = package_root / "runtime" / "service" / "go" / "bin"
+            python_service_dir = package_root / "runtime" / "service" / "python" / "yr"
             python_ds_lib_dir = package_root / "runtime" / "service" / "python" / "yr" / "datasystem" / "lib"
             functionsystem_lib_dir = package_root / "functionsystem" / "lib"
             datasystem_lib_dir = package_root / "datasystem" / "sdk" / "cpp" / "lib"
-            for target_dir in (cpp_lib_dir, go_bin_dir, python_ds_lib_dir):
+            for target_dir in (cpp_lib_dir, go_bin_dir, python_service_dir, python_ds_lib_dir):
                 target_dir.mkdir(parents=True)
             functionsystem_lib_dir.mkdir(parents=True)
             datasystem_lib_dir.mkdir(parents=True)
@@ -546,7 +560,7 @@ class PackageYuanrongLayoutTest(unittest.TestCase):
                     set -euo pipefail
                     source "{functions_file}"
                     restore_runtime_service_native_libs "{package_root}"
-                    for target_dir in "{cpp_lib_dir}" "{go_bin_dir}" "{python_ds_lib_dir}"; do
+                    for target_dir in "{cpp_lib_dir}" "{go_bin_dir}" "{python_service_dir}" "{python_ds_lib_dir}"; do
                         test "$(readlink "$target_dir/libshared_dep.so")" = "libshared_dep.so.1"
                         test "$(readlink "$target_dir/libshared_dep.so.1")" = "libshared_dep.so.1.0.0"
                         test "$(cat "$target_dir/libshared_dep.so.1.0.0")" = "shared"

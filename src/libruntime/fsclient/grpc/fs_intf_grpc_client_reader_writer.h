@@ -36,6 +36,7 @@ public:
     const std::string TENANT_ID = "tenant_id";
     const std::string SOURCE_ID_META = "source_id";
     const std::string DST_ID_META = "dst_id";
+    const std::string STREAM_ROLE_META = "stream_role";
     const std::string JOB_ID_META = "job_id";
     const std::string RPC_IP_NAME = "HOST_IP";
     const std::string RPC_PORT_NAME = "PROXY_GRPC_SERVER_PORT";
@@ -51,7 +52,8 @@ public:
           resendCb(option.resendCb),
           disconnectedCb(option.disconnectedCb),
           disconnectedTimeout(option.disconnectedTimeout),
-          isKeepAlive(option.isKeepAlive)
+          isKeepAlive(option.isKeepAlive),
+          streamRole(option.streamRole)
     {
         disconnTime = std::chrono::steady_clock::now();
     }
@@ -98,6 +100,7 @@ private:
     std::function<void(const std::string &)> disconnectedCb;
     int disconnectedTimeout;
     bool isKeepAlive = false;
+    std::string streamRole;
 };
 }  // namespace Libruntime
 }  // namespace YR

@@ -38,6 +38,7 @@ struct ReaderWriterClientOption {
     std::function<void(const std::string &)> resendCb;
     std::function<void(const std::string &)> disconnectedCb;
     bool isKeepAlive = true;
+    std::string streamRole;
 };
 class FSIntfReaderWriter {
 public:

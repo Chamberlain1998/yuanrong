@@ -414,6 +414,10 @@ function restore_runtime_service_native_libs() {
 
     restore_runtime_native_dir \
         "${package_root}" \
+        "${package_root}/runtime/service/python/yr" \
+        "runtime Python service"
+    restore_runtime_native_dir \
+        "${package_root}" \
         "${package_root}/runtime/service/cpp/lib" \
         "runtime C++ service"
     restore_runtime_native_dir \
