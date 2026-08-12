@@ -454,6 +454,7 @@ class YrK8sLayoutTests(unittest.TestCase):
                 "/usr/local/bin/yr start",
                 "--block true",
                 "--function-proxy-merge-process-enable",
+                "--data-system-enable true",
                 "--enable-runtime-launcher",
                 "RUNTIME_LAUNCHER_SOCK",
                 "CONTAINER_EP",

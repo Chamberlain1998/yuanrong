@@ -48,6 +48,7 @@ master_scheduler_ip="$(resolve_host "${master_ip}")"
 exec /usr/local/bin/yr start \
   --block true \
   --function-proxy-merge-process-enable \
+  --data-system-enable true \
   --enable-runtime-launcher \
   -s "values.host_ip=\"${node_ip}\"" \
   -s "values.function_master.ip=\"${master_scheduler_ip}\"" \
