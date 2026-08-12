@@ -279,6 +279,9 @@ func TestStickyInvalidatedDeletesStaleExternalRecord(t *testing.T) {
 		ls := &LiteScheduler{pools: map[string]*LiteFunctionPool{}, allocations: map[string]*Allocation{}}
 		pool, mock := poolWithMockStore(t)
 		ls.pools["t1/fA/v1"] = pool
+		// Make ins1 the deterministic first choice. Both test instances otherwise
+		// have the same concurrency score, so map iteration can select either one.
+		pool.instances["ins2"].InUse = 1
 
 		// Bind sess1 to ins1.
 		acq := &LiteRequest{Op: "acquire", FuncKey: "t1/fA/v1", SessionID: "sess1",
