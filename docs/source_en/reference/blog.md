@@ -167,7 +167,7 @@ In the recent 0.8.0 and 0.9.0 major releases, openYuanrong has significantly enh
 
 <div class="blog-card" style="background: var(--color-canvas-default, white); border: 1px solid var(--color-border-default, #e1e4e8); border-radius: 8px; padding: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); transition: transform 0.2s, box-shadow 0.2s; margin: 20px 0;" data-theme-light-bg="white" data-theme-dark-bg="#1e1e1e" data-theme-light-border="#e1e4e8" data-theme-dark-border="#404040">
 <div style="font-size: 1.3em; font-weight: bold; margin-bottom: 10px; color: var(--color-accent-fg, #0366d6);">
-📖 <a href="https://www.openeuler.openatom.cn/en/blog/20260525-openYuanrong_09/20260525-openYuanrong_09.html" style="color: inherit; text-decoration: none;">Enterprise-grade JiuwenSwarm Practice Exploration Based on openYuanrong</a>
+📖 <a href="https://www.openeuler.openatom.cn/zh/blog/20260525-openYuanrong_09/20260525-openYuanrong_09.html" style="color: inherit; text-decoration: none;">Enterprise-grade JiuwenSwarm Practice Exploration Based on openYuanrong</a>
 </div>
 <p style="color: var(--color-fg-muted, #586069); margin: 10px 0; line-height: 1.6;">
 As AI Agent applications move from personal assistants to enterprise-grade production deployment, how to enable JiuwenSwarm to break through single-machine limitations and achieve enterprise-grade elasticity and reliability while maintaining the existing programming experience is the core engineering problem that openYuanrong aims to solve. This article explores how to perform distributed transformation of JiuwenSwarm based on openYuanrong, achieving a smooth evolution from single-machine deployment to cluster-based operation for AI Agents.
