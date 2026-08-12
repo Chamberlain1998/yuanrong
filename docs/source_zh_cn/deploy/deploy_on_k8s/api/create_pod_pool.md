@@ -11,7 +11,7 @@ pool 池的亲和基于 K8s 调度能力实现，详见[将 Pod 指派给节点]
 - 多个 pool 池之间默认反亲和部署，如果您需要修改，可通过配置 [PoolInfo 结构](api-data-struct-poolinfo)中的 `affinities` 参数实现。
 - 配置 pool 池的亲和属性时，[PoolInfo 结构](api-data-struct-poolinfo)中 `node_selector` 与 `affinities` 参数会同时生效。配置冲突时可能导致 pool 池处于 `pending` 状态而无法拉起，建议您配置一项即可。
 
-pool 池的自动扩缩通过 [PoolInfo 结构](api-data-struct-poolinfo)中的 `size` 和 `max_size` 参数控制，原理详见 [Pod 水平自动扩缩](https://kubernetes.io/zh-cn/docs/tasks/run-application/horizontal-pod-autoscale/){target="_blank"}，使用约束如下。
+pool 池的自动扩缩通过 [PoolInfo 结构](api-data-struct-poolinfo)中的 `size` 和 `max_size` 参数控制，原理详见 [Pod 水平自动扩缩](https://kubernetes.io/zh-cn/docs/concepts/workloads/autoscaling/horizontal-pod-autoscale/){target="_blank"}，使用约束如下。
 
 - 开启自动扩缩时: 每个实例创建请求最多触发一次 Pod 扩容，但扩容出来的 Pod 并不与该实例绑定。可能存在扩容的 Pod 被其他实例占用的情况，这时无法获得可用 Pod 的实例将在 2 分钟超时后返回创建失败。
 - 固定资源池大小时：可以在 [PoolInfo 结构](api-data-struct-poolinfo)中的 `labels` 参数增加键值对 `{"yr-idle-to-recycle":5}` 配置 Pod 回收时间, 值的单位是秒。如果永不回收，配置为 `{"yr-idle-to-recycle":"unlimited"}` 即可。

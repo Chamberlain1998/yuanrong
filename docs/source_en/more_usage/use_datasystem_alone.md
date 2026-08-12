@@ -6,7 +6,7 @@ openYuanrong data system provides Python/C++ language interfaces, encapsulating 
 - KV: Implements copy-free KV data read and write based on shared memory, achieves high-performance data caching, supports data reliability semantics by docking with external components.
 - object: Abstracts data objects based on host-side shared memory, implements reference counting-based lifecycle management, encapsulates shared memory as buffer, provides direct pointer read and write.
 
-For more information and examples, please refer to openYuanrong data system [code repository](https://atomgit.com/openeuler/yuanrong-datasystem){target="_blank"} and [documentation](https://pages.openeuler.openatom.cn/openyuanrong-datasystem/docs/en/latest/index.html){target="_blank"}.
+For more information and examples, please refer to openYuanrong data system [code repository](https://atomgit.com/openeuler/yuanrong-datasystem){target="_blank"} and [documentation](https://pages.openeuler.openatom.cn/openyuanrong-datasystem/docs/zh-cn/latest/index.html){target="_blank"}.
 
 ## Getting Started
 
