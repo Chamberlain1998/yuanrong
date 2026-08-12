@@ -43,6 +43,8 @@ public:
     void Run();
     void Close();
     void SetSslContext(std::shared_ptr<ssl::context> ctx);
+    bool IsOpen() const;
+    unsigned short GetListeningPort() const;
 
 private:
     void DoAccept();
@@ -63,6 +65,7 @@ public:
     virtual bool Start(const std::string &ip, unsigned short port, int threadNum,
                              std::shared_ptr<ssl::context> ctx = nullptr);
     virtual bool StopServer();
+    unsigned short GetListeningPort() const;
 
 private:
     std::shared_ptr<Listener> listener_;

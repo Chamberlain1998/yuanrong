@@ -395,7 +395,6 @@ etcd_target_name_override = ""
 address = "{{ values.function_proxy.ip }}:{{ values.function_proxy.port }}"
 grpc_listen_port = {{ values.function_proxy.grpc_listen_port }}
 session_grpc_port = {{ values.function_proxy.exec_grpc_port }}
-enable_frontend_proxy_service = true
 enable_driver = false
 enable_trace = false
 runtime_heartbeat_enable = true

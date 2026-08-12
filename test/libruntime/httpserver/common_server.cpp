@@ -315,6 +315,18 @@ void Listener::SetSslContext(std::shared_ptr<ssl::context> ctx)
     ctx_ = ctx;
 }
 
+bool Listener::IsOpen() const
+{
+    return acceptor_.is_open();
+}
+
+unsigned short Listener::GetListeningPort() const
+{
+    beast::error_code ec;
+    const auto endpoint = acceptor_.local_endpoint(ec);
+    return ec ? 0 : endpoint.port();
+}
+
 void Listener::DoAccept()
 {
     acceptor_.async_accept(net::make_strand(ioc_), beast::bind_front_handler(&Listener::OnAccept, shared_from_this()));
@@ -324,20 +336,22 @@ void Listener::OnAccept(beast::error_code ec, tcp::socket socket)
 {
     std::cout << "http server has accepted one connection" << std::endl;
     if (ec) {
-        Fail(ec, "accept");
-    } else {
-        std::shared_ptr<Session> session;
-        if (ctx_) {
-            session = std::make_shared<HttpsSession>(std::move(socket), ctx_);
-        } else {
-            session = std::make_shared<HttpSession>(std::move(socket));
+        if (ec != net::error::operation_aborted) {
+            Fail(ec, "accept");
         }
-        {
-            std::lock_guard<std::mutex> lockGuard(mtx);
-            sessions.emplace_back(session);
-        }
-        session->Run();
+        return;
     }
+    std::shared_ptr<Session> session;
+    if (ctx_) {
+        session = std::make_shared<HttpsSession>(std::move(socket), ctx_);
+    } else {
+        session = std::make_shared<HttpSession>(std::move(socket));
+    }
+    {
+        std::lock_guard<std::mutex> lockGuard(mtx);
+        sessions.emplace_back(session);
+    }
+    session->Run();
     // Accept another connection
     DoAccept();
 }
@@ -347,6 +361,11 @@ bool CommonServer::Start(const std::string &ip, unsigned short port, int threadN
     const auto address = net::ip::make_address(ip);
     ioc_ = std::make_shared<net::io_context>(threadNum);
     listener_ = std::make_shared<Listener>(*ioc_, tcp::endpoint{address, port});
+    if (!listener_->IsOpen() || listener_->GetListeningPort() == 0) {
+        listener_.reset();
+        ioc_.reset();
+        return false;
+    }
     listener_->SetSslContext(ctx);
     listener_->Run();
     threads_.reserve(threadNum);
@@ -360,11 +379,13 @@ bool CommonServer::Start(const std::string &ip, unsigned short port, int threadN
     return true;
 }
 
+unsigned short CommonServer::GetListeningPort() const
+{
+    return listener_ ? listener_->GetListeningPort() : 0;
+}
+
 bool CommonServer::StopServer()
 {
-    std::promise<bool> waitPromise;
-    auto waitFuture = waitPromise.get_future();
-    waitFuture.wait_for(std::chrono::milliseconds(100));
     std::cout << "start to stop http server" << std::endl;
     if (stopped_) {
         return stopped_;

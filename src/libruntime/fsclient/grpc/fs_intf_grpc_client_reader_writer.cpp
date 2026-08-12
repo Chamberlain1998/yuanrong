@@ -118,6 +118,9 @@ void FSIntfGrpcClientReaderWriter::Reset()
 void FSIntfGrpcClientReaderWriter::ReconnectHandler()
 {
     FSIntfGrpcReaderWriter::Stop();
+    if (stopped.load()) {
+        return;
+    }
     if (!StreamEmpty()) {
         WritesDone();
         auto status = Finish();
@@ -135,7 +138,10 @@ void FSIntfGrpcClientReaderWriter::ReconnectHandler()
         }
         Reset();
     }
-    if (Reconnect().OK() && resendCb != nullptr) {
+    if (stopped.load()) {
+        return;
+    }
+    if (Reconnect().OK() && !stopped.load() && resendCb != nullptr) {
         FSIntfGrpcReaderWriter::Init();
         resendCb(dstInstance);
     }
@@ -199,13 +205,19 @@ void FSIntfGrpcClientReaderWriter::Stop()
     }
     YRLOG_DEBUG("begin to close connection of {}, ip={}, port={}", dstInstance, ip, port);
     abnormal_.store(true);
-    // before finish, receiver_ & writer should be stopped to avoid race condition
-    FSIntfGrpcReaderWriter::Stop();
     try {
         if (context != nullptr) {
             context->TryCancel();
         }
+        // Wait for ReceiveHandler to finish before stopping the writer. Otherwise
+        // an in-flight ReconnectHandler may restart the writer after it has been
+        // joined, leaving a joinable thread behind during destruction.
         receiver_.Shutdown();
+    } catch (std::exception &e) {
+        YRLOG_ERROR("failed to stop grpc receiver, exception: {}", e.what());
+    }
+    FSIntfGrpcReaderWriter::Stop();
+    try {
         if (!StreamEmpty()) {
             WritesDone();
             (void)Finish();
