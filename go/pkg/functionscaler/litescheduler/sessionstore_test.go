@@ -24,8 +24,11 @@ import (
 	"time"
 
 	"github.com/smartystreets/goconvey/convey"
+
 	"yuanrong.org/kernel/pkg/common/faas_common/constant"
+	commontypes "yuanrong.org/kernel/pkg/common/faas_common/types"
 	"yuanrong.org/kernel/pkg/functionscaler/session"
+	"yuanrong.org/kernel/pkg/functionscaler/types"
 )
 
 // mockSessionStore is an in-memory session.Store for testing. It records every
@@ -158,6 +161,11 @@ func TestAcquireStoreDesignateSessionCtxMismatch(t *testing.T) {
 	convey.Convey("store designate instance sessionCtx mismatch -> delete stale record and redispatch", t, func() {
 		ls := &LiteScheduler{pools: map[string]*LiteFunctionPool{}, allocations: map[string]*Allocation{}}
 		pool, mock := poolWithMockStore(t)
+		pool.funcSpec = &types.FunctionSpecification{
+			ExtendedMetaData: commontypes.ExtendedMetaData{
+				EnableSessionCtx: true,
+			},
+		}
 		ls.pools["t1/fA/v1"] = pool
 		// Override test pool instances to carry SessionCtxID: ins1 has ctx-A,
 		// ins2 has ctx-B. The store record points at ins1 but the request carries
@@ -166,7 +174,7 @@ func TestAcquireStoreDesignateSessionCtxMismatch(t *testing.T) {
 		pool.instances["ins1"].SessionCtxID = "ctx-A"
 		pool.instances["ins2"].SessionCtxID = "ctx-B"
 		pool.Unlock()
-		bindingKey := sessionBindingKey("sess1", "ctx-B")
+		bindingKey := pool.sessionBindingKey("sess1", "ctx-B")
 		mock.saves[bindingKey] = session.StoreRecord{
 			InstanceID: "ins1", SessionID: "sess1", SessionCtxID: "ctx-B", SessionTTL: 30,
 		}
@@ -343,7 +351,10 @@ func TestNilSessionStoreAllOpsNoop(t *testing.T) {
 	convey.Convey("nil sessionStore does not panic and all ops are no-op", t, func() {
 		pool := newTestPool(t)
 		// pool.sessionStore is nil (default newTestPool)
-		convey.So(func() { pool.sessionStore.saveSessionToStore("s", "s", "", "i", 1) }, convey.ShouldNotPanic)
+		convey.So(func() {
+			pool.sessionStore.saveSessionToStore("s", "i",
+				&LiteRequest{SessionID: "s", SessionCtxID: "", SessionTTL: 1})
+		}, convey.ShouldNotPanic)
 		convey.So(func() { pool.sessionStore.deleteSessionFromStore("s") }, convey.ShouldNotPanic)
 		rec, err := pool.sessionStore.getSessionFromStore("s")
 		convey.So(rec, convey.ShouldBeNil)

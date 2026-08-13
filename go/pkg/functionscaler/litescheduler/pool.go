@@ -156,8 +156,8 @@ func instanceSessionCtxID(ins *types.Instance) string {
 	return *ins.SessionCtxID
 }
 
-func sessionBindingKey(sessionID, sessionCtxID string) string {
-	if sessionCtxID == "" {
+func (p *LiteFunctionPool) sessionBindingKey(sessionID, sessionCtxID string) string {
+	if p == nil || p.funcSpec == nil || !p.funcSpec.ExtendedMetaData.EnableSessionCtx {
 		return sessionID
 	}
 	return types.JoinKey(sessionID, sessionCtxID)

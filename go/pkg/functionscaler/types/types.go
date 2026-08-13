@@ -93,7 +93,6 @@ type Configuration struct {
 	PprofAddr                    string                           `json:"pprofAddr" valid:"optional"`
 	SchedulerDiscovery           *SchedulerDiscovery              `json:"schedulerDiscovery" valid:"optional"`
 	LiteScheduler                LiteSchedulerConfig              `json:"liteScheduler" valid:"optional"`
-	EnableSessionRecover         bool                             `json:"enableSessionRecover" valid:"optional"`
 	DataSystemConfig             DataSystemConfig                 `json:"dataSystemConfig" valid:"optional"`
 	SessionStoreConfig           SessionStoreConfig               `json:"sessionStore" valid:"optional"`
 	CustomContainerEnv           map[string]string                `json:"customContainerEnv" valid:"optional"`

@@ -197,9 +197,12 @@ func IsRedisBackend(backend string) (bool, error) {
 // BuildRedisClient 是 Init/Reload 的公共实现：校验配置、创建 client、SetRedisCmd 换全局、
 // 更新共享 param。健康检查 goroutine 由 sync.Once 保证全进程只启一次（首次成功调用）。
 //
-// clobber 修复：redisClientParam 首次分配后指针稳定，后续 Reload 在 redisclient.LockParam
-// 下原地改字段；redisclient.initClient 重连时在 RLockParam 下读字段。两者用同一把 paramMu
-// 互斥，checker 重连永远读到最新配置，不会用旧配置重建并 SetRedisCmd 覆盖 Reload 的新 client。
+// clobber 修复（乐观校验）：redisClientParam 首次分配后指针稳定，后续 Reload 在
+// redisclient.LockParam 下原地改字段；paramMu 仅保证 param 字段读写不撕裂，无法保证
+// checker 重连用最新配置创建 client（initClient 在 RLock 拷出 param 后即 RUnlock，New
+// 期间无锁，最长 ~8s dialTimeout）。故 redisclient.checkAndReconnectRedis 在创建前后各
+// 做一次 param 快照比对，不一致则丢弃 stale client 不 SetRedisCmd，避免 checker 用旧
+// 配置 client 覆盖 Reload 的新 client。
 //
 // 状态一致性：redisClientParam 的更新移到 New 成功之后——New 失败时不碰共享 param，
 // 避免"param 已刷新为新配置但全局 client 仍是旧"的不一致。
@@ -229,7 +232,7 @@ func BuildRedisClient(cfg redisclient.Config, stopCh <-chan struct{}) (*rediscli
 	redisclient.UnlockParam()
 	redisclient.SetRedisCmd(cli)
 	checkerOnce.Do(func() {
-		go redisclient.CheckRedisConnectivity(redisClientParam, cli, stopCh)
+		go redisclient.CheckRedisConnectivity(redisClientParam, stopCh)
 	})
 	return cli, nil
 }

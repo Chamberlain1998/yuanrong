@@ -135,7 +135,7 @@ func (ls *LiteScheduler) reapExpiredAllocation(allocID string) {
 		bindingKey := ""
 		needTimer := false
 		if alloc.SessionID != "" {
-			bindingKey = sessionBindingKey(alloc.SessionID, alloc.SessionCtxID)
+			bindingKey = pool.sessionBindingKey(alloc.SessionID, alloc.SessionCtxID)
 			needTimer, _ = pool.unbindSessionOnRelease(bindingKey)
 		}
 		sessionTTL := alloc.SessionTTL

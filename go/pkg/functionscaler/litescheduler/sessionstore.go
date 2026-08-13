@@ -18,6 +18,7 @@
 package litescheduler
 
 import (
+	"os"
 	"time"
 
 	"yuanrong.org/kernel/pkg/functionscaler/session"
@@ -40,14 +41,19 @@ import (
 // "lite" 做 instanceType 隔离——该维度与路由层重复，去掉后两 scheduler 对同一函数的
 // session 记录可互相懒恢复。
 type liteSessionStore struct {
-	coord *session.Coordinator
+	coord       *session.Coordinator
+	schedulerID string
 }
 
 // newLiteSessionStore builds a store + Coordinator for one pool. store falls
 // back to NoopStore only when New() fails (init failure fail-open); backend
 // 合法性由 config 加载期校验兜底，正常路径不会为空。
+// schedulerID 在创建时缓存 POD_IP，避免每次 Save 都调 os.Getenv（内部有锁）。
 func newLiteSessionStore(funcKey string) *liteSessionStore {
-	return &liteSessionStore{coord: session.NewCoordinator(session.MakeStore(funcKey))}
+	return &liteSessionStore{
+		coord:       session.NewCoordinator(session.MakeStore(funcKey)),
+		schedulerID: os.Getenv("POD_IP"),
+	}
 }
 
 // saveSessionToStore maps litescheduler's binding fields to a StoreRecord and
@@ -57,16 +63,17 @@ func newLiteSessionStore(funcKey string) *liteSessionStore {
 // recorded for idle-unbind; it is restored on lazy recovery so the recovered
 // binding reuses the original TTL rather than the new request's TTL.
 // nil-safe: no-op when the pool has no sessionStore (e.g. tests).
-func (s *liteSessionStore) saveSessionToStore(sessionKey, sessionID, sessionCtxID,
-	instanceID string, sessionTTL int) {
+func (s *liteSessionStore) saveSessionToStore(sessionKey, instanceID string, req *LiteRequest) {
 	if s == nil {
 		return
 	}
 	s.coord.SaveRecord(sessionKey, session.StoreRecord{
 		InstanceID:   instanceID,
-		SessionID:    sessionID,
-		SessionCtxID: sessionCtxID,
-		SessionTTL:   sessionTTL,
+		SchedulerID:  s.schedulerID,
+		SessionID:    req.SessionID,
+		SessionCtxID: req.SessionCtxID,
+		SessionTTL:   req.SessionTTL,
+		Concurrency:  req.Concurrency,
 	})
 }
 
@@ -89,8 +96,8 @@ func (s *liteSessionStore) getSessionFromStore(sessionID string) (*session.Store
 }
 
 // cleanExternalRecords synchronously deletes a list of session records. Used on
-// pool destroy (deletePool) AFTER stop so no ops remain in the async queue.
-// nil-safe.
+// pool destroy (deletePool) AFTER stop so no in-flight or queued ops remain to
+// race the sync cleanup. nil-safe.
 func (s *liteSessionStore) cleanExternalRecords(sessionIDs []string) {
 	if s == nil {
 		return
@@ -98,8 +105,10 @@ func (s *liteSessionStore) cleanExternalRecords(sessionIDs []string) {
 	s.coord.CleanRecords(sessionIDs)
 }
 
-// stop cancels the async worker. Called on pool destroy before
-// cleanExternalRecords. nil-safe.
+// stop synchronously shuts down the async worker: cancels ctx, drains queued
+// ops, and blocks until the worker goroutine has fully exited. Called on pool
+// destroy before cleanExternalRecords so no in-flight Save can outlive stop
+// and re-write a record that cleanExternalRecords just deleted. nil-safe.
 func (s *liteSessionStore) stop() {
 	if s == nil {
 		return
