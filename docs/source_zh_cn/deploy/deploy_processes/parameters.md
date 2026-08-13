@@ -67,6 +67,12 @@
 | `node_id` | `{{ node_id }}` | 节点唯一 ID，格式为 `<hostname>-<pid>`，若手动配置请保证全局唯一。 |
 | `log_level` | `INFO` | 全局日志级别，取值：`DEBUG`、`INFO`、`WARN`、`ERROR`。 |
 
+### [values.runtime] Runtime 配置
+
+| 字段 | 默认值 | 说明 |
+|------|--------|------|
+| `default_write_mode` | ``NONE_L2_CACHE`` | Agent Session 内部状态写入 DataSystem 时使用的默认写入模式。支持 ``NONE_L2_CACHE``、``WRITE_THROUGH_L2_CACHE``、``WRITE_BACK_L2_CACHE``、``NONE_L2_CACHE_EVICT``，也支持对应的数字值 ``0``、``1``、``2``、``3``；非法值回退为 ``NONE_L2_CACHE``。该值会通过 `YR_DATASYSTEM_DEFAULT_WRITE_MODE` 传递给 runtime。 |
+
 ### [values.fs.log] 函数系统日志
 
 | 字段 | 默认值 | 说明 |
@@ -145,9 +151,29 @@
 | `[values.function_proxy]` | `ip` | `{{ values.host_ip }}` | function_proxy 地址。 |
 | `[values.function_proxy]` | `port` | `{{ 22772\|check_port() }}` | function_proxy HTTP 端口。 |
 | `[values.function_proxy]` | `grpc_listen_port` | `{{ 22773\|check_port() }}` | function_proxy gRPC 端口。 |
+| `[values.function_proxy]` | `tcp_tunnel_port` | ``{{ 22775\|check_port() }}`` | 通用 TCP tunnel 监听端口，供 Frontend SSH 和 wsproxy WebSocket 透传使用。 |
+| `[values.function_proxy]` | `tcp_tunnel_max_connections` | ``1024`` | TCP tunnel 最大并发连接数。 |
 | `[values.function_agent]` | `ip` | `{{ values.host_ip }}` | function_agent 地址。 |
 | `[values.function_agent]` | `port` | `{{ 58866\|check_port() }}` | function_agent 端口。 |
 | `[values.function_agent]` | `data_system_enable` | `false` | 启用 FunctionAgent 的 DataSystem KV Client。函数需要 DataSystem KV Client（例如使用 `ds://` 工作目录）时，请显式设置为 `true`。 |
+
+### [values.frontend] Frontend SSH
+
+| 字段 | 默认值 | 说明 |
+|------|--------|------|
+| `ssh_enable` | ``false`` | 是否启用 frontend SSH 服务。启用时会同时启用 function proxy TCP tunnel。 |
+| `enable_tcp_tunnel` | ``false`` | 是否在不启用 SSH 的情况下独立开启 TCP tunnel，可用于 wsproxy WebSocket 透传；开启此项不要求配置 SSH 密钥。 |
+| `ssh_auth_enable` | ``true`` | 是否使用 `ssh_authorized_keys` 对外部 SSH 客户端执行公钥认证。仅建议在隔离的测试环境中关闭；关闭后也不会启用密码登录。 |
+| `ssh_address` | ``:2222`` | frontend SSH 监听地址。默认监听所有网卡，应通过防火墙或反向代理限制访问范围。 |
+| `ssh_host_key` | ``""`` | frontend SSH 服务端私钥文件。启用 SSH 时必须是可读文件。 |
+| `ssh_authorized_keys` | ``""`` | 外部 SSH 客户端的 authorized keys 文件。启用 SSH 公钥认证时必须是可读文件。 |
+| `ssh_backend_key` | ``""`` | frontend 访问实例 sshd 使用的私钥文件。启用 SSH 时必须是可读文件。 |
+| `ssh_max_connections` | ``1024`` | frontend SSH 最大并发连接数。 |
+| `ssh_backend_public_key_dir` | ``""`` | 主机上的公钥目录，必须包含可读的 `authorized_keys`。启用 SSH 后，该目录会以只读方式挂载到 Agent Sandbox 的 ``/run/openyuanrong/ssh``。 |
+
+:::{note}
+``ssh_enable=true`` 时，即使 ``enable_tcp_tunnel=false``，SSH 链路依赖的 TCP tunnel 仍会启用。
+:::
 
 ### [values.dashboard] Dashboard
 
