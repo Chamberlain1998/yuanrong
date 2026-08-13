@@ -37,5 +37,5 @@ yr.get
         >>> print(result)
         >>> yr.finalize()
 
-.. _ObjectRef: ../../zh_cn/Python/yr.object_ref.ObjectRef.html#yr.object_ref.ObjectRef
-.. _YRInvokeError: ../../zh_cn/Python/yr.exception.YRInvokeError.html#yr.exception.YRInvokeError
+.. _ObjectRef: yr.object_ref.ObjectRef.html#yr.object_ref.ObjectRef
+.. _YRInvokeError: yr.exception.YRInvokeError.html#yr.exception.YRInvokeError

@@ -15,4 +15,4 @@ yr.fnruntime.Producer.send
         - **RuntimeError** – 如果发送操作失败。
         
 
-.. _Element: ../../zh_cn/Python/yr.Element.html#yr.Element
+.. _Element: yr.Element.html#yr.Element
