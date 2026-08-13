@@ -28,5 +28,5 @@ yr.create_stream_producer
         ...     # 处理异常
         ...     pass
 
-.. _ProducerConfig: ../../zh_cn/Python/yr.ProducerConfig.html#yr.ProducerConfig
-.. _Producer: ../../zh_cn/Python/yr.ProducerConfig.html#yr.ProducerConfig
+.. _ProducerConfig: yr.ProducerConfig.html#yr.ProducerConfig
+.. _Producer: yr.ProducerConfig.html#yr.ProducerConfig

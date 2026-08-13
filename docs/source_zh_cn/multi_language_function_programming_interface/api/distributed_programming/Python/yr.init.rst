@@ -23,5 +23,5 @@ yr.init
         >>> conf = yr.Config()
         >>> yr.init(conf)
 
-.. _Config: ../../zh_cn/Python/yr.Config.html#yr.Config
-.. _ClientInfo: ../../zh_cn/Python/yr.config.ClientInfo.html#yr.config.ClientInfo
+.. _Config: yr.Config.html#yr.Config
+.. _ClientInfo: yr.config.ClientInfo.html#yr.config.ClientInfo
