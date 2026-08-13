@@ -143,6 +143,36 @@ TEST_F(FSIntfImplTest, Test_CreateAsync)
     EXPECT_NO_THROW(fsIntfImpl_->ClearAllWiredRequests());
 }
 
+TEST_F(FSIntfImplTest, InterruptedCallResultUsesMessageWithoutReturnObjectIDs)
+{
+    auto req = std::make_shared<CallMessageSpec>();
+    req->Mutable().set_requestid("interrupt-request");
+    req->Mutable().set_senderid("function-proxy");
+
+    const std::string response = R"({"body":{"message":"Interrupted Success"}})";
+    auto result = fsIntfImpl_->BuildInterruptedCallResult(req, response);
+
+    EXPECT_EQ(result->Immutable().code(), common::ERR_NONE);
+    EXPECT_EQ(result->Immutable().message(), response);
+    EXPECT_EQ(result->Immutable().smallobjects_size(), 0);
+}
+
+TEST_F(FSIntfImplTest, InterruptedCallResultUsesSmallObjectWithReturnObjectIDs)
+{
+    auto req = std::make_shared<CallMessageSpec>();
+    req->Mutable().set_requestid("interrupt-request");
+    req->Mutable().set_senderid("function-proxy");
+    req->Mutable().add_returnobjectids("return-object");
+
+    const std::string response = R"({"body":{"message":"Interrupted Success"}})";
+    auto result = fsIntfImpl_->BuildInterruptedCallResult(req, response);
+
+    ASSERT_EQ(result->Immutable().smallobjects_size(), 1);
+    EXPECT_TRUE(result->Immutable().message().empty());
+    EXPECT_EQ(result->Immutable().smallobjects(0).id(), "return-object");
+    EXPECT_EQ(result->Immutable().smallobjects(0).value().substr(MetaDataLen), response);
+}
+
 TEST_F(FSIntfImplTest, Test_NeedResendReq)
 {
     auto streamMsg1 = std::make_shared<StreamingMessage>();
