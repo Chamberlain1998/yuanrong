@@ -294,6 +294,7 @@ function copy_native_shared_libs_to_dir() {
     local target_dir=$2
     local overwrite_existing=${3:-false}
     local dereference_symlinks=${4:-false}
+    local skip_metrics_exporters=${5:-false}
     local source_path
     local lib_file
 
@@ -306,6 +307,11 @@ function copy_native_shared_libs_to_dir() {
         case "${lib_file}" in
             libyr-api.so*|libfunctionsdk.so*)
                 continue
+                ;;
+            libobservability-*-exporter.so*)
+                if [ "${skip_metrics_exporters}" = true ]; then
+                    continue
+                fi
                 ;;
         esac
         if [ -e "${target_dir}/${lib_file}" ] || [ -L "${target_dir}/${lib_file}" ]; then
@@ -363,6 +369,7 @@ function restore_runtime_native_dir() {
     local package_root=$1
     local target_dir=$2
     local label=$3
+    local skip_metrics_exporters=${4:-false}
     local native_source_dirs=()
     local source_dir
 
@@ -377,7 +384,12 @@ function restore_runtime_native_dir() {
 
     for source_dir in "${native_source_dirs[@]}"; do
         if [ "${source_dir}" = "${package_root}/functionsystem/lib" ]; then
-            copy_native_shared_libs_to_dir "${source_dir}" "${target_dir}" true
+            copy_native_shared_libs_to_dir \
+                "${source_dir}" \
+                "${target_dir}" \
+                true \
+                false \
+                "${skip_metrics_exporters}"
         else
             copy_native_shared_libs_to_dir "${source_dir}" "${target_dir}"
         fi
@@ -415,7 +427,8 @@ function restore_runtime_service_native_libs() {
     restore_runtime_native_dir \
         "${package_root}" \
         "${package_root}/runtime/service/python/yr" \
-        "runtime Python service"
+        "runtime Python service" \
+        true
     restore_runtime_native_dir \
         "${package_root}" \
         "${package_root}/runtime/service/cpp/lib" \
