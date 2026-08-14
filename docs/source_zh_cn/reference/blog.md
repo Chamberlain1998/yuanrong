@@ -153,7 +153,7 @@ openYuanrong 作为一个通用的 Serverless 分布式计算引擎，在构建�
 
 <div class="blog-card" style="background: var(--color-canvas-default, white); border: 1px solid var(--color-border-default, #e1e4e8); border-radius: 8px; padding: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); transition: transform 0.2s, box-shadow 0.2s; margin: 20px 0;" data-theme-light-bg="white" data-theme-dark-bg="#1e1e1e" data-theme-light-border="#e1e4e8" data-theme-dark-border="#404040">
 <div style="font-size: 1.3em; font-weight: bold; margin-bottom: 10px; color: var(--color-accent-fg, #0366d6);">
-📖 <a href="https://mp.weixin.qq.com/s/Ww2G56OKMPY_hiON3Ipu9Q" style="color: inherit; text-decoration: none;">openYuanrong 打造 Agent 时代的企业级分布式底座</a>
+📖 <a href="https://www.openeuler.openatom.cn/zh/blog/20260803-openYuanrong-Agent/20260803-openYuanrong-Agent.html" style="color: inherit; text-decoration: none;">openYuanrong 打造 Agent 时代的企业级分布式底座</a>
 </div>
 <p style="color: var(--color-fg-muted, #586069); margin: 10px 0; line-height: 1.6;">
 在 openYuanrong 最近发布的 0.8.0 和 0.9.0 两个大版本中，openYuanrong 大幅增强了面向 Agent 企业级应用的分布式能力，连同此前已具备的分布式内核基础能力，致力于打造 Agent 时代的企业级分布式底座。
