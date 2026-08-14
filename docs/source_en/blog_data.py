@@ -24,7 +24,7 @@ BLOG_DATA = [
         ),
         "date": "2026-07-31",
         "read_time": "15 min",
-        "link": "https://mp.weixin.qq.com/s/Ww2G56OKMPY_hiON3Ipu9Q"
+        "link": "https://www.openeuler.openatom.cn/zh/blog/20260803-openYuanrong-Agent/20260803-openYuanrong-Agent.html"
     },
     {
         "title": "Enterprise-grade JiuwenSwarm Practice Exploration Based on openYuanrong",
