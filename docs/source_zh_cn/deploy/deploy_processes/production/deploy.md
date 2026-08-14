@@ -68,6 +68,35 @@ client_cert_file = "client.crt"
 client_key_file = "client.key"
 ```
 
+#### 配置 Frontend SSH 与 TCP tunnel
+
+Frontend SSH 依赖 function proxy 的 TCP tunnel。启用 SSH 时需分别准备 frontend 服务端私钥、外部客户端 authorized keys、frontend 访问实例 sshd 的私钥，以及包含实例侧 `authorized_keys` 的目录：
+
+```toml
+[values.frontend]
+ssh_enable = true
+ssh_auth_enable = true
+ssh_address = ":2222"
+ssh_host_key = "/etc/yuanrong/ssh/frontend_host_key"
+ssh_authorized_keys = "/etc/yuanrong/ssh/frontend_authorized_keys"
+ssh_backend_key = "/etc/yuanrong/ssh/backend_key"
+ssh_backend_public_key_dir = "/etc/yuanrong/ssh/backend"
+ssh_max_connections = 1024
+
+[values.function_proxy]
+tcp_tunnel_port = 22775
+tcp_tunnel_max_connections = 1024
+```
+
+`ssh_backend_public_key_dir` 目录必须包含可读的 `authorized_keys`。默认 SSH 地址 ``:2222`` 监听所有网卡，生产环境应通过防火墙或反向代理限制访问。
+
+如果只需要 wsproxy WebSocket 透传，可独立开启 TCP tunnel，无需配置 SSH 密钥：
+
+```toml
+[values.frontend]
+enable_tcp_tunnel = true
+```
+
 #### 配置 [component.*] 覆盖组件启动参数
 
 除 `mode.*` 和 `values.*` 外，还可直接覆盖组件级配置（例如 `etcd`、`ds_master`、`function_master`、`function_proxy`）。这些配置会直接影响组件进程启动参数、环境变量和健康检查行为。

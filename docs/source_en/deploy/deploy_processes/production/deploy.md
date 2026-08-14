@@ -68,6 +68,35 @@ client_cert_file = "client.crt"
 client_key_file = "client.key"
 ```
 
+#### Configure Frontend SSH and the TCP Tunnel
+
+Frontend SSH depends on the function proxy TCP tunnel. Enabling SSH requires a frontend server private key, an authorized keys file for external clients, a private key for frontend-to-instance access, and a directory containing the instance-side `authorized_keys`:
+
+```toml
+[values.frontend]
+ssh_enable = true
+ssh_auth_enable = true
+ssh_address = ":2222"
+ssh_host_key = "/etc/yuanrong/ssh/frontend_host_key"
+ssh_authorized_keys = "/etc/yuanrong/ssh/frontend_authorized_keys"
+ssh_backend_key = "/etc/yuanrong/ssh/backend_key"
+ssh_backend_public_key_dir = "/etc/yuanrong/ssh/backend"
+ssh_max_connections = 1024
+
+[values.function_proxy]
+tcp_tunnel_port = 22775
+tcp_tunnel_max_connections = 1024
+```
+
+The `ssh_backend_public_key_dir` directory must contain a readable `authorized_keys`. The default SSH address, ``:2222``, binds all interfaces; restrict it with a firewall or reverse proxy in production.
+
+If only wsproxy WebSocket passthrough is required, enable the TCP tunnel independently without configuring SSH keys:
+
+```toml
+[values.frontend]
+enable_tcp_tunnel = true
+```
+
 #### Configure [component.*] to Override Component Startup Parameters
 
 In addition to `mode.*` and `values.*`, component-level configurations can also be directly overridden (such as `etcd`, `ds_master`, `function_master`, `function_proxy`). These configurations will directly affect component process startup parameters, environment variables and health check behaviors.

@@ -67,6 +67,12 @@ The following fields can be overridden in user's `config.toml` under `[values]` 
 | `node_id` | `{{ node_id }}` | Node unique ID, format is `<hostname>-<pid>`, if manually configured please ensure global uniqueness. |
 | `log_level` | `INFO` | Global log level, values: `DEBUG`, `INFO`, `WARN`, `ERROR`. |
 
+### [values.runtime] Runtime Configuration
+
+| Field | Default Value | Description |
+|------|--------|------|
+| `default_write_mode` | ``NONE_L2_CACHE`` | Default DataSystem write mode for Agent Session internal state. Supported values are ``NONE_L2_CACHE``, ``WRITE_THROUGH_L2_CACHE``, ``WRITE_BACK_L2_CACHE``, and ``NONE_L2_CACHE_EVICT``, or their numeric forms ``0``, ``1``, ``2``, and ``3``. An invalid value falls back to ``NONE_L2_CACHE``. The value is passed to runtimes as `YR_DATASYSTEM_DEFAULT_WRITE_MODE`. |
+
 ### [values.fs.log] Function System Logs
 
 | Field | Default Value | Description |
@@ -145,9 +151,29 @@ The following fields can be overridden in user's `config.toml` under `[values]` 
 | `[values.function_proxy]` | `ip` | `{{ values.host_ip }}` | function_proxy address. |
 | `[values.function_proxy]` | `port` | `{{ 22772\|check_port() }}` | function_proxy HTTP port. |
 | `[values.function_proxy]` | `grpc_listen_port` | `{{ 22773\|check_port() }}` | function_proxy gRPC port. |
+| `[values.function_proxy]` | `tcp_tunnel_port` | ``{{ 22775\|check_port() }}`` | Generic TCP tunnel listen port used by Frontend SSH and wsproxy WebSocket passthrough. |
+| `[values.function_proxy]` | `tcp_tunnel_max_connections` | ``1024`` | Maximum number of concurrent TCP tunnel connections. |
 | `[values.function_agent]` | `ip` | `{{ values.host_ip }}` | function_agent address. |
 | `[values.function_agent]` | `port` | `{{ 58866\|check_port() }}` | function_agent port. |
 | `[values.function_agent]` | `data_system_enable` | `false` | Enable the FunctionAgent DataSystem KV client. Set this field to `true` when functions require the DataSystem KV client, such as a `ds://` working directory. |
+
+### [values.frontend] Frontend SSH
+
+| Field | Default Value | Description |
+|------|--------|------|
+| `ssh_enable` | ``false`` | Enable the frontend SSH service. Enabling SSH also enables the function proxy TCP tunnel. |
+| `enable_tcp_tunnel` | ``false`` | Enable the TCP tunnel without enabling SSH, for example for wsproxy WebSocket passthrough. This setting does not require SSH keys. |
+| `ssh_auth_enable` | ``true`` | Authenticate external SSH clients with `ssh_authorized_keys`. Disable this only in isolated test environments; disabling it does not enable password login. |
+| `ssh_address` | ``:2222`` | Frontend SSH listen address. The default binds all interfaces; restrict exposure with a firewall or reverse proxy. |
+| `ssh_host_key` | ``""`` | Frontend SSH server private key file. It must be readable when SSH is enabled. |
+| `ssh_authorized_keys` | ``""`` | Authorized keys file for external SSH clients. It must be readable when SSH public-key authentication is enabled. |
+| `ssh_backend_key` | ``""`` | Private key used by frontend to access the instance sshd. It must be readable when SSH is enabled. |
+| `ssh_max_connections` | ``1024`` | Maximum number of concurrent frontend SSH connections. |
+| `ssh_backend_public_key_dir` | ``""`` | Host directory containing a readable `authorized_keys`. When SSH is enabled, the directory is mounted read-only at ``/run/openyuanrong/ssh`` in Agent Sandboxes. |
+
+:::{note}
+When ``ssh_enable=true``, the TCP tunnel required by SSH is enabled even if ``enable_tcp_tunnel=false``.
+:::
 
 ### [values.dashboard] Dashboard
 
