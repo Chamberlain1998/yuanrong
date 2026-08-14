@@ -109,11 +109,14 @@ func (ls *LiteScheduler) processInstanceEvents() {
 				logger.Warnf("lite instance event: pool %s not found (funcSpec event not yet synced), skip", funcKey)
 				continue
 			}
-			// Snapshot pool.funcSpec under RLock to avoid a data race with upsertPool
-			// (which replaces the pointer under Lock). BuildInstanceFromInsSpec may be
-			// long-running and must not hold the lock; reading the snapshotted pointer
-			// is safe because upsertPool only swaps the pointer, it never mutates the
-			// old *FunctionSpecification in place.
+			// Snapshot pool.funcSpec under poolsMu.RLock to avoid a data race with
+			// upsertPool: the writer holds both poolsMu.Lock and pool.Lock when
+			// swapping the pointer, so this RLock is excluded from the swap.
+			// Readers that already hold pool.Lock (e.g. sessionBindingKey call
+			// sites in operation.go/expiry.go) are excluded by pool.Lock too.
+			// BuildInstanceFromInsSpec may be long-running and must not hold the
+			// lock; reading the snapshotted pointer is safe because upsertPool
+			// only swaps the pointer, never mutates the old *FunctionSpecification.
 			ls.poolsMu.RLock()
 			funcSpec := pool.funcSpec
 			ls.poolsMu.RUnlock()
@@ -178,7 +181,14 @@ func (ls *LiteScheduler) upsertPool(funcSpec *types.FunctionSpecification) {
 		logger.Infof("lite pool created: dispatcher %s", pool.dispatcher.Policy())
 		return
 	}
+	// Swap pool.funcSpec under pool.Lock so readers holding pool.Lock/RLock
+	// (sessionBindingKey call sites in operation.go/expiry.go) and the
+	// poolsMu.RLock snapshot in processInstanceEvents are all excluded from
+	// the swap. Lock order poolsMu.Lock -> pool.Lock matches deletePool, no
+	// inversion.
+	pool.Lock()
 	pool.funcSpec = funcSpec
+	pool.Unlock()
 	logger.Debug("lite pool funcSpec updated")
 }
 
@@ -187,25 +197,24 @@ func (ls *LiteScheduler) deletePool(funcKey string) {
 	ls.poolsMu.Lock()
 	pool, ok := ls.pools[funcKey]
 	if ok {
-		// Stop all session idle-unbind timers and snapshot the sessionID list under
-		// pool.Lock, then clear the map. We do NOT call removeSessionBinding here:
-		// it would enqueue async Deletes that the about-to-stop worker would drop.
-		// Instead cleanExternalRecords deletes them synchronously below.
-		pool.Lock()
-		sessionIDs := make([]string, 0, len(pool.sessions))
-		for sid, binding := range pool.sessions {
-			binding.stopTimer()
-			sessionIDs = append(sessionIDs, sid)
-		}
-		pool.sessions = make(map[string]*sessionBinding)
-		pool.Unlock()
-		// Stop the async worker first so no in-flight op races the sync cleanup,
-		// then synchronously delete all external records (cold path, blocking OK).
-		pool.sessionStore.stop()
-		pool.sessionStore.cleanExternalRecords(sessionIDs)
+		delete(ls.pools, funcKey)
 	}
-	delete(ls.pools, funcKey)
 	ls.poolsMu.Unlock()
+	if !ok {
+		return
+	}
+	pool.Lock()
+	sessionIDs := make([]string, 0, len(pool.sessions))
+	for sid, binding := range pool.sessions {
+		binding.stopTimer()
+		sessionIDs = append(sessionIDs, sid)
+	}
+	pool.sessions = make(map[string]*sessionBinding)
+	pool.Unlock()
+	// Stop the async worker first so no in-flight op races the sync cleanup,
+	// then synchronously delete all external records.
+	pool.sessionStore.stop()
+	pool.sessionStore.cleanExternalRecords(sessionIDs)
 	ls.allocMu.Lock()
 	for id, alloc := range ls.allocations {
 		if alloc.FuncKey == funcKey {

@@ -1534,15 +1534,17 @@ func (bcs *basicConcurrencyScheduler) selectInstanceQueue(isSelfInstance bool) (
 }
 
 // CleanExternalSessionRecords 删除本 scheduler 在外部存储的 per-session 记录。
-// 仅 queue 彻底销毁时（函数删除/resKey 下线）由 ScaledInstanceQueue.Destroy 调用。
-// scheduler 重建场景（oldInstanceScheduler.Destroy 直接调，不经过 queue.Destroy）不会触发，
-// 保留旧记录供新 scheduler 懒恢复。
+// 仅 queue 彻底销毁时（函数删除/resKey 下线）由 ScaledInstanceQueue.Destroy 调用，且
+// 必须在 Destroy（停 worker）之后调——Stop 已排空队列并退出 worker，同步 Delete 不会
+// 与 in-flight Save 竞争。scheduler 重建场景（oldInstanceScheduler.Destroy 直接调，不经过
+// queue.Destroy）不会触发，保留旧记录供新 scheduler 懒恢复。
 func (bcs *basicConcurrencyScheduler) CleanExternalSessionRecords() {
 	bcs.sessionManager.cleanExternalRecords()
 }
 
 // Destroy destroys instanceScheduler。不清理外部存储记录——清理由
-// CleanExternalSessionRecords 在 queue 销毁路径显式触发，Destroy 本身只停 worker + 清租约。
+// CleanExternalSessionRecords 在 queue 销毁路径显式触发（且必须在本调用之后）。
+// Destroy 本身只同步停 worker（排空 + 等待退出）+ 清租约。
 func (bcs *basicConcurrencyScheduler) Destroy() {
 	bcs.Lock()
 	bcs.stopped = true

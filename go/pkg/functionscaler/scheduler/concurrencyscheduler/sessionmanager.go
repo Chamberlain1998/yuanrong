@@ -329,16 +329,24 @@ func (sm *sessionManager) saveSessionToStore(sessionKey string, record *sessionR
 	sm.coord.SaveRecord(sessionKey, storeRecord)
 }
 
-// stopAndClean 取消 Coordinator worker。不删 per-session 外部记录——清理由
-// CleanExternalSessionRecords（queue 销毁时）显式触发，scheduler 重建场景不调。
+// stopAndClean 同步停止 Coordinator worker：取消 ctx → 排空队列中已入队的 op →
+// 等待 worker 退出。返回后无 in-flight/queued Save 可与后续 CleanRecords 竞争。
+// 不删 per-session 外部记录——清理由 CleanExternalSessionRecords（queue 销毁时）显式触发，
+// scheduler 重建场景不调，保留旧记录供新 scheduler 懒恢复。
 func (sm *sessionManager) stopAndClean() {
 	sm.coord.Stop()
 }
 
 // cleanExternalRecords 删除本 scheduler 在外部存储的全部 per-session 记录。
 // 锁内拷贝 sessionKey 列表（避免迭代期间 map 被改），交由 Coordinator 同步 Delete。
-// 同步执行（Destroy 是 teardown 非热路径，不经过异步队列，避免 worker 停止后丢 op）。
+// 必须在 stopAndClean 之后调用：Stop 已排空队列并退出 worker，此处的同步 Delete
+// 不会与任何 in-flight Save 竞争（避免 Delete 后被旧 Save 重新写回，留下陈旧绑定）。
 // 仅场景 1/2（函数删除 / resKey 下线，queue 彻底销毁）调用；场景 3（scheduler 重建）不调。
+//
+// 覆盖边界：CleanRecords 只清理 sessionMap 内 key；asyncStoreQueue 的两类 fail-open
+// 路径——queue full 时 DEL 被 drop（带 metric + Warn）、Stop 后再 enqueue 被静默拒绝——
+// 会让外部存储残留 record（已从本地 map 删但 DEL 未到外部）。这两类残留由
+// defaultRecoveryWindowSeconds（24h）物理 TTL 兜底回收，不在本方法清理范围内。
 func (sm *sessionManager) cleanExternalRecords() {
 	sm.RLock()
 	keys := make([]string, 0, len(sm.sessionMap))

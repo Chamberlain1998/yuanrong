@@ -1328,7 +1328,12 @@ func printInputLog() {
 // 确保 concurrencyscheduler.makeSessionStore 取到已初始化的全局 client（否则
 // redisclient.GetRedisCmd() 返回 nil，redis 后端会因 RedisClient 为空初始化失败）。
 func InitSessionStoreRedis(stopCh <-chan struct{}) error {
-	cfg := config.GlobalConfig.SessionStoreConfig
+	cfg := &config.GlobalConfig.SessionStoreConfig
+	if cfg.Backend == "" {
+		log.GetLogger().Debugf("sessionStore.backend is empty, defaulting to %s",
+			config.SessionStoreBackendDataSystem)
+		cfg.Backend = config.SessionStoreBackendDataSystem
+	}
 	ok, err := session.IsRedisBackend(cfg.Backend)
 	if err != nil {
 		return err

@@ -312,11 +312,12 @@ func (si *ScaledInstanceQueue) Destroy() {
 	log.GetLogger().Infof("destroy instance queue type %s for function %s", si.instanceType, si.funcKeyWithRes)
 	commonUtils.SafeCloseChannel(si.stopCh)
 	si.insCreateQueue.destroy()
-	// 场景 1/2（函数删除/resKey 下线）：清理本 scheduler 的 per-session 外部记录。
-	// 必须在 instanceScheduler.Destroy（停 worker）前调——cleanExternalRecords 同步执行，
-	// 不经过异步 worker。场景 3（scheduler 重建）不走 Destroy，不触发清理。
-	si.instanceScheduler.CleanExternalSessionRecords()
+	// 场景 1/2（函数删除/resKey 下线）：先 Destroy 同步停 worker（排空队列 + 等待退出），
+	// 再 CleanExternalSessionRecords 同步删外部记录。顺序不可反转——若先删记录再停 worker，
+	// in-flight Save 可能在 Delete 之后完成，重新写回已清理的记录，留下最长 24h 的陈旧绑定。
+	// 场景 3（scheduler 重建）不走 queue.Destroy，不触发清理，保留旧记录供新 scheduler 懒恢复。
 	si.instanceScheduler.Destroy()
+	si.instanceScheduler.CleanExternalSessionRecords()
 	si.instanceScaler.Destroy()
 	si.cleanInstances()
 	log.GetLogger().Debugf("destroy instance queue type %s for function %s completed", si.instanceType,

@@ -379,6 +379,7 @@ func TestCheckRedisConnectivity(t *testing.T) {
 		defer func() {
 			newRedisClient = oldNewRedisClient
 			patch.Reset()
+			SetRedisCmd(nil)
 		}()
 		stopCh := make(chan struct{}, 0)
 		tickerCh := make(chan time.Time)
@@ -386,7 +387,8 @@ func TestCheckRedisConnectivity(t *testing.T) {
 			return &time.Ticker{C: tickerCh}
 		})
 
-		go CheckRedisConnectivity(&param, nil, stopCh)
+		SetRedisCmd(nil)
+		go CheckRedisConnectivity(&param, stopCh)
 		tickerCh <- time.Time{}
 		stopCh <- struct{}{}
 		convey.So(isCalled, convey.ShouldEqual, 1)
@@ -395,14 +397,69 @@ func TestCheckRedisConnectivity(t *testing.T) {
 			return &Client{}, errors.New("state is not ready")
 		}
 		stopCh = make(chan struct{}, 0)
-		go CheckRedisConnectivity(&param, nil, stopCh)
+		SetRedisCmd(nil)
+		go CheckRedisConnectivity(&param, stopCh)
 		tickerCh <- time.Time{}
 		tickerCh <- time.Time{}
 		stopCh <- struct{}{}
 		convey.So(isCalled, convey.ShouldEqual, 3)
 
-		CheckRedisConnectivity(&param, nil, nil)
+		CheckRedisConnectivity(&param, nil)
 		convey.So(isCalled, convey.ShouldEqual, 3)
+
+		// Regression: 首次重建后全局 client 已健康，下一轮必须读到新全局而非陈旧捕获指针，不再触发重建。
+		// 旧实现把首次 client 指针固定传入，重连后 client 局部赋值无法回写，下一轮仍 ping 旧指针，
+		// 导致每轮都重建并 SetRedisCmd，连接池泄漏 + 抖动。
+		isCalled = 0
+		newRedisClient = func(_ NewRedisClientParam, _ <-chan struct{}, _ ...Option) (*Client, error) {
+			isCalled++
+			return &Client{client: &redis.Client{}}, nil
+		}
+		stopCh = make(chan struct{}, 0)
+		tickerCh = make(chan time.Time)
+		SetRedisCmd(nil)
+		go CheckRedisConnectivity(&param, stopCh)
+		tickerCh <- time.Time{}
+		tickerCh <- time.Time{}
+		stopCh <- struct{}{}
+		convey.So(isCalled, convey.ShouldEqual, 1)
+	})
+}
+
+// TestCheckAndReconnect_DiscardStaleOnParamChange 回归：initClient 创建期间共享 param 被
+// BuildRedisClient 改字段并发布新 client 时，本路径基于旧 param 创建的 stale client 必须
+// 被丢弃，不能 SetRedisCmd 覆盖 Reload 的新 client。
+// 旧实现只 paramMu 保护字段拷贝，创建期间不持锁，会拿旧配置 client 覆盖回去。
+func TestCheckAndReconnect_DiscardStaleOnParamChange(t *testing.T) {
+	param := &NewRedisClientParam{
+		ServerMode: "single", ServerAddr: "old", Password: "pw", Timeout: TimeoutConf{},
+	}
+	var reloaded *Client
+	var staleReturned *Client
+	oldNewRedisClient := newRedisClient
+	newRedisClient = func(_ NewRedisClientParam, _ <-chan struct{}, _ ...Option) (*Client, error) {
+		// 模拟 BuildRedisClient 在创建期间改 param 字段并已 SetRedisCmd 发布新 client。
+		LockParam()
+		param.ServerAddr = "new-addr-after-reload"
+		UnlockParam()
+		reloaded = &Client{client: &redis.Client{}}
+		SetRedisCmd(reloaded)
+		staleReturned = &Client{client: &redis.Client{}}
+		return staleReturned, nil
+	}
+	defer func() {
+		newRedisClient = oldNewRedisClient
+		SetRedisCmd(nil)
+	}()
+	stopCh := make(chan struct{}, 0)
+	defer close(stopCh)
+
+	SetRedisCmd(nil)
+	err := checkAndReconnectRedis(param, stopCh)
+	convey.Convey("stale client discarded", t, func() {
+		convey.So(err, convey.ShouldBeNil)
+		convey.So(GetRedisCmd(), convey.ShouldEqual, reloaded)       // Reload 的新 client 未被覆盖
+		convey.So(GetRedisCmd(), convey.ShouldNotEqual, staleReturned) // stale client 未发布
 	})
 }
 

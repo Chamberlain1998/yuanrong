@@ -21,7 +21,9 @@ import (
 	"testing"
 
 	"github.com/smartystreets/goconvey/convey"
+
 	"yuanrong.org/kernel/pkg/common/faas_common/constant"
+	commontypes "yuanrong.org/kernel/pkg/common/faas_common/types"
 	"yuanrong.org/kernel/pkg/functionscaler/types"
 )
 
@@ -95,12 +97,17 @@ func TestCandidateSlotsAreSessionContextIsolated(t *testing.T) {
 		"a": {InstanceID: "a", SessionCtxID: "ctx-a", Status: InstanceStatusRunning, Capacity: 1},
 		"b": {InstanceID: "b", SessionCtxID: "ctx-b", Status: InstanceStatusRunning, Capacity: 1},
 		"r": {InstanceID: "r", SessionCtxID: "ctx-a", Status: InstanceStatusRunning, Capacity: 1, Reclaiming: true},
-	}}
+	},
+		funcSpec: &types.FunctionSpecification{
+			ExtendedMetaData: commontypes.ExtendedMetaData{
+				EnableSessionCtx: true,
+			},
+		}}
 	slots := pool.candidateSlotsLocked("ctx-a")
 	convey.Convey("only the requested non-reclaiming context is returned", t, func() {
 		convey.So(len(slots), convey.ShouldEqual, 1)
 		convey.So(slots[0].InstanceID, convey.ShouldEqual, "a")
-		convey.So(sessionBindingKey("same", "ctx-a"), convey.ShouldNotEqual,
-			sessionBindingKey("same", "ctx-b"))
+		convey.So(pool.sessionBindingKey("same", "ctx-a"), convey.ShouldNotEqual,
+			pool.sessionBindingKey("same", "ctx-b"))
 	})
 }
