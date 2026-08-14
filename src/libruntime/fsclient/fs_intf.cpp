@@ -26,14 +26,6 @@
 #include "src/utility/logger/logger.h"
 namespace YR {
 namespace Libruntime {
-std::string GetReturnObjectId(const CallRequest &req)
-{
-    if (req.returnobjectids_size() > 0) {
-        return req.returnobjectids(0);
-    }
-    return req.returnobjectid();
-}
-
 FSIntf::FSIntf(const FSIntfHandlers &handlers) : handlers(handlers)
 {
     if (handlers.call == nullptr || handlers.checkpoint == nullptr || handlers.recover == nullptr ||
@@ -244,8 +236,13 @@ std::shared_ptr<CallResultMessageSpec> FSIntf::BuildInterruptedCallResult(const 
     callResult.set_instanceid(req->Immutable().senderid());
     callResult.set_code(common::ERR_NONE);
 
+    if (req->Immutable().returnobjectids_size() == 0) {
+        callResult.set_message(interruptResponse);
+        return result;
+    }
+
     auto *smallObj = callResult.add_smallobjects();
-    smallObj->set_id(GetReturnObjectId(req->Immutable()));
+    smallObj->set_id(req->Immutable().returnobjectids(0));
     std::string payload(MetaDataLen, '\0');
     payload.append(interruptResponse);
     smallObj->set_value(payload.data(), payload.size());
