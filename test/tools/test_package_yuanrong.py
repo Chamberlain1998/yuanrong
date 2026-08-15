@@ -624,6 +624,65 @@ class PackageYuanrongLayoutTest(unittest.TestCase):
 
             subprocess.run(["bash", str(test_script)], check=True)
 
+    def test_python_service_restore_skips_metrics_exporters(self):
+        """Restore of the Python service must not copy metrics exporter plugins.
+
+        The Python runtime places its exporter plugins during the build stage
+        (package_python_runtime_abi_extensions / wheel assembly), so the package
+        restore must neither overwrite nor backfill exporters from
+        functionsystem/lib, which is a different build chain. Other services
+        (cpp/go) keep receiving exporters from functionsystem/lib.
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            package_root = pathlib.Path(temp_dir) / "openyuanrong"
+            cpp_lib_dir = package_root / "runtime" / "service" / "cpp" / "lib"
+            go_bin_dir = package_root / "runtime" / "service" / "go" / "bin"
+            python_service_dir = package_root / "runtime" / "service" / "python" / "yr"
+            python_ds_lib_dir = package_root / "runtime" / "service" / "python" / "yr" / "datasystem" / "lib"
+            functionsystem_lib_dir = package_root / "functionsystem" / "lib"
+            datasystem_lib_dir = package_root / "datasystem" / "sdk" / "cpp" / "lib"
+            for target_dir in (cpp_lib_dir, go_bin_dir, python_service_dir, python_ds_lib_dir):
+                target_dir.mkdir(parents=True)
+            functionsystem_lib_dir.mkdir(parents=True)
+            datasystem_lib_dir.mkdir(parents=True)
+
+            push_exporter = "libobservability-prometheus-push-exporter.so"
+            missing_exporter = "libobservability-metrics-opentelemetry-exporter.so"
+            (cpp_lib_dir / "libcpp_runtime.so").write_text("cpp", encoding="utf-8")
+            (go_bin_dir / "libgo_runtime.so").write_text("go", encoding="utf-8")
+            (python_ds_lib_dir / "libpython_runtime.so").write_text("python", encoding="utf-8")
+            (python_service_dir / push_exporter).write_text("runtime-exporter", encoding="utf-8")
+            (functionsystem_lib_dir / "libshared_dep.so.1.0.0").write_text("shared", encoding="utf-8")
+            (functionsystem_lib_dir / "libshared_dep.so.1").symlink_to("libshared_dep.so.1.0.0")
+            (functionsystem_lib_dir / "libshared_dep.so").symlink_to("libshared_dep.so.1")
+            (functionsystem_lib_dir / push_exporter).write_text("functionsystem-exporter", encoding="utf-8")
+            (functionsystem_lib_dir / missing_exporter).write_text("missing-exporter", encoding="utf-8")
+            (datasystem_lib_dir / "libnested_dep.so").write_text("nested", encoding="utf-8")
+
+            functions_file = pathlib.Path(temp_dir) / "package_functions.sh"
+            functions_file.write_text(load_package_function_definitions(), encoding="utf-8")
+            test_script = pathlib.Path(temp_dir) / "run.sh"
+            test_script.write_text(
+                textwrap.dedent(
+                    f"""\
+                    #!/bin/bash
+                    set -euo pipefail
+                    source "{functions_file}"
+                    restore_runtime_service_native_libs "{package_root}"
+                    test "$(cat "{python_service_dir}/{push_exporter}")" = "runtime-exporter"
+                    test ! -e "{python_service_dir}/{missing_exporter}"
+                    test "$(readlink "{python_service_dir}/libshared_dep.so")" = "libshared_dep.so.1"
+                    test "$(cat "{cpp_lib_dir}/{push_exporter}")" = "functionsystem-exporter"
+                    test "$(cat "{go_bin_dir}/{push_exporter}")" = "functionsystem-exporter"
+                    test "$(readlink "{cpp_lib_dir}/libshared_dep.so")" = "libshared_dep.so.1"
+                    test "$(cat "{python_ds_lib_dir}/libnested_dep.so")" = "nested"
+                    """
+                ),
+                encoding="utf-8",
+            )
+
+            subprocess.run(["bash", str(test_script)], check=True)
+
 
 if __name__ == "__main__":
     unittest.main()
