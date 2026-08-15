@@ -139,3 +139,30 @@ class FileHandler:
             "is_last": is_last,
             "total_size": total_size,
         }
+
+    @staticmethod
+    def file_list(path: str, recursive: bool = False, max_depth=None) -> dict:
+        """List files and directories at the given path.
+
+        Reuses yr.sandbox.filesystem._list_files_impl for directory scanning,
+        returning items in jiuwenbox API format.
+
+        Args:
+            path: Directory path to list.
+            recursive: If True, recursively scan subdirectories.
+            max_depth: Maximum recursion depth (None=unlimited, 0=unlimited).
+
+        Returns:
+            dict with ``items`` key containing a list of file/dir dicts.
+            Each dict has: name, path, size, is_directory, modified_time, type.
+        """
+        if not path:
+            raise ValueError("path must be non-empty")
+        if max_depth is not None and max_depth < 0:
+            raise ValueError(f"max_depth must be non-negative or None, got {max_depth}")
+        from yr.sandbox.filesystem import _list_files_impl
+        # max_depth=0 means unlimited in the query API, but _list_files_impl
+        # treats max_depth=None as unlimited. Convert 0 to None.
+        effective_max_depth = max_depth if max_depth and max_depth > 0 else None
+        items = _list_files_impl(path, recursive=recursive, max_depth=effective_max_depth)
+        return {"items": items}

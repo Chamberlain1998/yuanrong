@@ -101,6 +101,10 @@ def _write_file_impl(path: str, data, mode: str = "wb") -> None:
         f.write(data)
 
 
+_MAX_LIST_ENTRIES = 10000
+_MAX_LIST_DEPTH = 20
+
+
 def _list_files_impl(
     path: str,
     recursive: bool = False,
@@ -108,23 +112,42 @@ def _list_files_impl(
     include_files: bool = True,
     include_dirs: bool = True,
 ) -> List[Dict]:
-    """List files and directories using native os.listdir."""
+    """List files and directories using native os.listdir.
+
+    Raises FileNotFoundError when the root path does not exist.
+
+    Safety limits:
+    - _MAX_LIST_ENTRIES: caps total entries to prevent OOM when scanning
+      directories with a very large number of files.
+    - _MAX_LIST_DEPTH: caps recursion depth to prevent stack overflow on
+      pathological directory structures.
+    """
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"path not found: {path}")
+
     result: List[Dict] = []
 
+    effective_max_depth = max_depth if (max_depth is not None and max_depth > 0) else _MAX_LIST_DEPTH
+
     def _scan(dir_path: str, current_depth: int) -> None:
+        if len(result) >= _MAX_LIST_ENTRIES:
+            return
+        if current_depth > effective_max_depth:
+            return
         try:
             entries = os.listdir(dir_path)
         except OSError:
             return
         for entry in entries:
+            if len(result) >= _MAX_LIST_ENTRIES:
+                return
             entry_path = os.path.join(dir_path, entry)
             is_dir = os.path.isdir(entry_path)
             if is_dir:
                 if include_dirs:
                     result.append(_build_fs_item(entry_path))
                 if recursive:
-                    if max_depth is None or current_depth < max_depth:
-                        _scan(entry_path, current_depth + 1)
+                    _scan(entry_path, current_depth + 1)
             else:
                 if include_files:
                     result.append(_build_fs_item(entry_path))
