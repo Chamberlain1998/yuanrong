@@ -157,7 +157,7 @@ class Executor:
                 msg = f"invalid invoke type {self.invoke_type}"
                 _logger.warning(msg)
                 error_info = ErrorInfo(ErrorCode.ERR_EXTENSION_META_ERROR, ModuleCode.RUNTIME, msg)
-        except RuntimeError as err:
+        except Exception as err:
             error_info = ErrorInfo(ErrorCode.ERR_USER_FUNCTION_EXCEPTION, ModuleCode.RUNTIME, f"{err}")
 
         return result_list, error_info

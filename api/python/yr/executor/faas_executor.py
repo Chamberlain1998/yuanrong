@@ -42,6 +42,7 @@ _STAGE_INVOKE = "invoke"
 _INDEX_META_DATA = 0
 _INDEX_CALL_USER_EVENT = 1
 _RUNTIME_MAX_RESP_BODY_SIZE = 6 * 1024 * 1024
+_FILE_LIST_TIMEOUT_SEC = 30
 _SHUTDOWN_CHECK_INTERVAL = 0.1
 _EVENT_HEADER = "Accept"
 _EVENT_HEADER_VALUE = "text/event-stream"
@@ -49,6 +50,12 @@ _EVENT_EOF = "yuanrong_event_EOF"
 requestQueue = queue.Queue(maxsize=1000)
 
 _logger = logging.getLogger(__name__)
+
+
+# file_list timeout decorator: protects against runaway recursive scans
+# that could OOM the runtime. Uses a thread so the timeout is enforced
+# even for blocking os calls. 30s is well under the 60s dispatch timeout.
+_list_timeout = timeout(_FILE_LIST_TIMEOUT_SEC)
 
 
 def faas_init_handler(posix_args: List[Any]) -> str:
@@ -157,7 +164,7 @@ def faas_call_handler(posix_args: List[Any]) -> str:
                 event.get("upload_id", ""), event.get("is_last", False)
             )
             return transform_call_response_to_str(result, FaasErrorCode.NONE_ERROR)
-        except (OSError, ValueError, RuntimeError) as err:
+        except Exception as err:
             err_msg = f"file_write failed. err: {err}. traceback: {traceback.format_exc()}"
             _logger.exception(err_msg)
             raise RuntimeError(err_msg) from err
@@ -170,8 +177,26 @@ def faas_call_handler(posix_args: List[Any]) -> str:
             length = event.get("length", _DEFAULT_READ_LENGTH)
             result = FileHandler.file_read(file_path, offset, length)
             return transform_call_response_to_str(result, FaasErrorCode.NONE_ERROR)
-        except (OSError, ValueError, RuntimeError) as err:
+        except Exception as err:
             err_msg = f"file_read failed. err: {err}. traceback: {traceback.format_exc()}"
+            _logger.exception(err_msg)
+            raise RuntimeError(err_msg) from err
+    if file_op == "file_list":
+        try:
+            file_path = event.get("path")
+            if not file_path:
+                raise RuntimeError("file_list requires 'path' field")
+            recursive = event.get("recursive", False)
+            max_depth = event.get("max_depth", 0)
+
+            @_list_timeout
+            def _do_list():
+                return FileHandler.file_list(file_path, recursive, max_depth)
+
+            result = _do_list()
+            return transform_call_response_to_str(result, FaasErrorCode.NONE_ERROR)
+        except Exception as err:
+            err_msg = f"file_list failed. err: {err}. traceback: {traceback.format_exc()}"
             _logger.exception(err_msg)
             raise RuntimeError(err_msg) from err
     user_code = CodeManager().load(constants.KEY_USER_CALL_ENTRY)
@@ -295,16 +320,7 @@ def transform_call_response_to_str(
     if response is None:
         result[key_for_body] = ""
     else:
-        try:
-            json.dumps(response)
-        except TypeError as err:
-            _logger.exception("result is not JSON serializable, err: %s", err)
-            result[key_for_body] = (
-                f"failed to convert the result to a JSON string, err:{err}"
-            )
-            status_code = FaasErrorCode.FUNCTION_RESULT_INVALID
-        else:
-            result[key_for_body] = response
+        result[key_for_body] = response
     result["innerCode"] = str(status_code.value)
     if trace_id:
         result["traceId"] = trace_id
@@ -312,7 +328,13 @@ def transform_call_response_to_str(
     result["logResult"] = encode_base64("this is user log TODO".encode("utf-8"))
     result["invokerSummary"] = "this is summary TODO"
 
-    resp_json = to_json_string(result)
+    try:
+        resp_json = to_json_string(result)
+    except (TypeError, ValueError) as err:
+        _logger.exception("result is not JSON serializable, err: %s", err)
+        result[key_for_body] = f"failed to convert the result to a JSON string, err:{err}"
+        result["innerCode"] = str(FaasErrorCode.FUNCTION_RESULT_INVALID.value)
+        resp_json = to_json_string(result)
     if len(resp_json.encode()) > _RUNTIME_MAX_RESP_BODY_SIZE:
         result[key_for_body] = (
             f"response body size {len(resp_json.encode())} exceeds the limit of 6291456"
