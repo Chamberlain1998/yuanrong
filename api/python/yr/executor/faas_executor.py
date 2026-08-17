@@ -35,14 +35,12 @@ from yr.common.constants import META_PREFIX, METALEN
 from yr.functionsdk.context import init_context, init_context_invoke, load_context_meta
 from yr.functionsdk.logger_manager import UserLogManager
 from yr.functionsdk.error_code import FaasErrorCode
-from yr.executor.file_handler import FileHandler, _DEFAULT_READ_LENGTH
 
 _STAGE_INIT = "init"
 _STAGE_INVOKE = "invoke"
 _INDEX_META_DATA = 0
 _INDEX_CALL_USER_EVENT = 1
 _RUNTIME_MAX_RESP_BODY_SIZE = 6 * 1024 * 1024
-_FILE_LIST_TIMEOUT_SEC = 30
 _SHUTDOWN_CHECK_INTERVAL = 0.1
 _EVENT_HEADER = "Accept"
 _EVENT_HEADER_VALUE = "text/event-stream"
@@ -50,12 +48,6 @@ _EVENT_EOF = "yuanrong_event_EOF"
 requestQueue = queue.Queue(maxsize=1000)
 
 _logger = logging.getLogger(__name__)
-
-
-# file_list timeout decorator: protects against runaway recursive scans
-# that could OOM the runtime. Uses a thread so the timeout is enforced
-# even for blocking os calls. 30s is well under the 60s dispatch timeout.
-_list_timeout = timeout(_FILE_LIST_TIMEOUT_SEC)
 
 
 def faas_init_handler(posix_args: List[Any]) -> str:
@@ -150,56 +142,6 @@ def faas_call_handler(posix_args: List[Any]) -> str:
                 return transform_call_response_to_str(err_msg, error_code)
         if event is None:
             event = {}
-    # file_op routing: handle container file operations for agent instances
-    # before entering the user code path so they don't occupy requestQueue.
-    file_op = event.get("file_op") if isinstance(event, dict) else None
-    if file_op == "file_write":
-        try:
-            file_path = event.get("path")
-            file_data = event.get("data")
-            if not file_path or file_data is None or not isinstance(file_data, (str, bytes)):
-                raise RuntimeError("file_write requires 'path' (str) and 'data' (base64 str/bytes)")
-            result = FileHandler.file_write(
-                file_path, file_data, event.get("mode", "wb"),
-                event.get("upload_id", ""), event.get("is_last", False),
-                event.get("permissions", "")
-            )
-            return transform_call_response_to_str(result, FaasErrorCode.NONE_ERROR)
-        except Exception as err:
-            err_msg = f"file_write failed. err: {err}"
-            _logger.exception(err_msg)
-            raise RuntimeError(err_msg) from err
-    if file_op == "file_read":
-        try:
-            file_path = event.get("path")
-            if not file_path:
-                raise RuntimeError("file_read requires 'path' field")
-            offset = event.get("offset", 0)
-            length = event.get("length", _DEFAULT_READ_LENGTH)
-            result = FileHandler.file_read(file_path, offset, length)
-            return transform_call_response_to_str(result, FaasErrorCode.NONE_ERROR)
-        except Exception as err:
-            err_msg = f"file_read failed. err: {err}. traceback: {traceback.format_exc()}"
-            _logger.exception(err_msg)
-            raise RuntimeError(err_msg) from err
-    if file_op == "file_list":
-        try:
-            file_path = event.get("path")
-            if not file_path:
-                raise RuntimeError("file_list requires 'path' field")
-            recursive = event.get("recursive", False)
-            max_depth = event.get("max_depth", 0)
-
-            @_list_timeout
-            def _do_list():
-                return FileHandler.file_list(file_path, recursive, max_depth)
-
-            result = _do_list()
-            return transform_call_response_to_str(result, FaasErrorCode.NONE_ERROR)
-        except Exception as err:
-            err_msg = f"file_list failed. err: {err}. traceback: {traceback.format_exc()}"
-            _logger.exception(err_msg)
-            raise RuntimeError(err_msg) from err
     user_code = CodeManager().load(constants.KEY_USER_CALL_ENTRY)
     if user_code is None:
         err_msg = "faas executor find empty user call code"

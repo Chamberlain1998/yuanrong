@@ -313,5 +313,24 @@ TEST_F(InvokeSpecTest, BuildInstanceCreateRequestTest)
     spec->BuildInstanceCreateRequest(config);
     ASSERT_EQ(spec->requestCreate.mutable_schedulingops()->mutable_resources()->size() != 0, true);
 }
+
+TEST_F(InvokeSpecTest, BuildCreateMetaDataCodePaths)
+{
+    LibruntimeConfig config;
+    config.loadPaths = {"parent-init", "parent-call"};
+    std::string funcMeta;
+    libruntime::MetaData meta;
+
+    ASSERT_TRUE(meta.ParseFromString(spec->BuildCreateMetaData(config, funcMeta)));
+    ASSERT_THAT(meta.config().codepaths(), ElementsAre("parent-init", "parent-call"));
+
+    config.funcMeta.set_apitype(libruntime::ApiType::Faas);
+    ASSERT_TRUE(meta.ParseFromString(spec->BuildCreateMetaData(config, funcMeta)));
+    ASSERT_TRUE(meta.config().codepaths().empty());
+
+    spec->opts.codePaths = {"explicit-path"};
+    ASSERT_TRUE(meta.ParseFromString(spec->BuildCreateMetaData(config, funcMeta)));
+    ASSERT_THAT(meta.config().codepaths(), ElementsAre("explicit-path"));
+}
 }  // namespace test
 }  // namespace YR
