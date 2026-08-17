@@ -36,6 +36,23 @@ def _validate_upload_id(upload_id: str) -> None:
         raise ValueError("upload_id contains invalid characters")
 
 
+def _apply_permissions(path: str, permissions: str) -> None:
+    """Apply octal file permissions (e.g. '600' -> 0o600) to the given path.
+
+    Args:
+        path: Target file path.
+        permissions: Octal permission string, e.g. "600", "755".
+
+    Raises:
+        RuntimeError: If the permission string is invalid or chmod fails.
+    """
+    try:
+        perm_int = int(permissions, 8)
+        os.chmod(path, perm_int)
+    except (ValueError, OSError) as e:
+        raise RuntimeError(f"failed to set permissions '{permissions}' on '{path}': {e}") from e
+
+
 class FileHandler:
     """FileHandler provides file read/write capabilities for agent instances.
 
@@ -45,7 +62,7 @@ class FileHandler:
     """
 
     @staticmethod
-    def file_write(path, data, mode="wb", upload_id="", is_last=False):
+    def file_write(path, data, mode="wb", upload_id="", is_last=False, permissions=""):
         """Write data to a file.
 
         When ``upload_id`` is provided, data is written to a temporary file
@@ -62,6 +79,9 @@ class FileHandler:
             mode: File open mode, ``wb`` for first chunk or ``ab`` for append.
             upload_id: Unique upload session ID for temp-file isolation.
             is_last: True for the final chunk, triggers atomic rename.
+            permissions: Optional octal permission string (e.g. "600").
+                When non-empty, os.chmod is applied to the final file after
+                the write (or rename) completes.
 
         Returns:
             dict with ``success``, ``path`` and cumulative ``size``.
@@ -87,6 +107,8 @@ class FileHandler:
                 size = f.tell()
             if is_last:
                 os.rename(tmp_path, path)
+                if permissions:
+                    _apply_permissions(path, permissions)
                 _logger.info("file_write done (rename), path: %s, size: %s", path, size)
                 return {"success": True, "path": path, "size": size}
             _logger.info("file_write chunk ok, tmp: %s, size: %s", tmp_path, size)
@@ -97,6 +119,8 @@ class FileHandler:
             f.flush()
             os.fsync(f.fileno())
             size = f.tell()
+        if permissions:
+            _apply_permissions(path, permissions)
         _logger.info("file_write ok, path: %s, size: %s", path, size)
         return {"success": True, "path": path, "size": size}
 

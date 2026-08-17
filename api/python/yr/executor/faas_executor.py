@@ -157,15 +157,16 @@ def faas_call_handler(posix_args: List[Any]) -> str:
         try:
             file_path = event.get("path")
             file_data = event.get("data")
-            if not file_path or not isinstance(file_data, (str, bytes)):
+            if not file_path or file_data is None or not isinstance(file_data, (str, bytes)):
                 raise RuntimeError("file_write requires 'path' (str) and 'data' (base64 str/bytes)")
             result = FileHandler.file_write(
                 file_path, file_data, event.get("mode", "wb"),
-                event.get("upload_id", ""), event.get("is_last", False)
+                event.get("upload_id", ""), event.get("is_last", False),
+                event.get("permissions", "")
             )
             return transform_call_response_to_str(result, FaasErrorCode.NONE_ERROR)
         except Exception as err:
-            err_msg = f"file_write failed. err: {err}. traceback: {traceback.format_exc()}"
+            err_msg = f"file_write failed. err: {err}"
             _logger.exception(err_msg)
             raise RuntimeError(err_msg) from err
     if file_op == "file_read":
