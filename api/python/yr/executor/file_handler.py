@@ -28,6 +28,7 @@ _MAX_WRITE_CHUNK_SIZE = 4 * 1024 * 1024  # 4MB raw data per chunk
 _MAX_READ_LENGTH = 4 * 1024 * 1024  # 4MB max per read
 _ALLOWED_WRITE_MODES = ("wb", "ab")
 _SAFE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_\-]+$")
+_PERM_PATTERN = re.compile(r"^[0-7]{3,4}$")
 
 
 def _validate_upload_id(upload_id: str) -> None:
@@ -49,8 +50,27 @@ def _apply_permissions(path: str, permissions: str) -> None:
     try:
         perm_int = int(permissions, 8)
         os.chmod(path, perm_int)
-    except (ValueError, OSError) as e:
+    except (ValueError, TypeError, OSError) as e:
         raise RuntimeError(f"failed to set permissions '{permissions}' on '{path}': {e}") from e
+
+
+def _validate_permissions(permissions: str) -> int:
+    """Validate and parse an octal permission string.
+
+    Args:
+        permissions: Octal permission string, e.g. "600", "755".
+
+    Returns:
+        Parsed integer permission value.
+
+    Raises:
+        ValueError: If the string is not a valid 3-4 digit octal permission.
+    """
+    if not _PERM_PATTERN.match(permissions):
+        raise ValueError(
+            f"invalid permissions '{permissions}', expected 3-4 digit octal (e.g. '600', '755')"
+        )
+    return int(permissions, 8)
 
 
 class FileHandler:
@@ -80,8 +100,10 @@ class FileHandler:
             upload_id: Unique upload session ID for temp-file isolation.
             is_last: True for the final chunk, triggers atomic rename.
             permissions: Optional octal permission string (e.g. "600").
-                When non-empty, os.chmod is applied to the final file after
-                the write (or rename) completes.
+                When non-empty, permissions are validated before any write
+                and applied to the file before rename (upload_id flow) or
+                via os.open at creation time (direct write flow), ensuring
+                the file never appears with default umask perms.
 
         Returns:
             dict with ``success``, ``path`` and cumulative ``size``.
@@ -90,6 +112,9 @@ class FileHandler:
             raise ValueError(f"invalid mode '{mode}', must be one of {_ALLOWED_WRITE_MODES}")
         if upload_id:
             _validate_upload_id(upload_id)
+        # Pre-validate permissions before any write to avoid leaving a committed
+        # file with wrong permissions when the permission string is invalid.
+        perm_int = _validate_permissions(permissions) if permissions else None
         raw_data = base64.b64decode(data, validate=True) if data else b""
         if len(raw_data) > _MAX_WRITE_CHUNK_SIZE:
             raise ValueError(f"data size {len(raw_data)} exceeds max chunk size {_MAX_WRITE_CHUNK_SIZE}")
@@ -106,21 +131,37 @@ class FileHandler:
                 os.fsync(f.fileno())
                 size = f.tell()
             if is_last:
+                # Apply permissions to tmp_path *before* rename so the file
+                # never appears at the final path with default umask perms.
+                if perm_int is not None:
+                    _apply_permissions(tmp_path, permissions)
                 os.rename(tmp_path, path)
-                if permissions:
-                    _apply_permissions(path, permissions)
                 _logger.info("file_write done (rename), path: %s, size: %s", path, size)
                 return {"success": True, "path": path, "size": size}
             _logger.info("file_write chunk ok, tmp: %s, size: %s", tmp_path, size)
             return {"success": True, "path": tmp_path, "size": size}
 
-        with open(path, mode) as f:
-            f.write(raw_data)
-            f.flush()
-            os.fsync(f.fileno())
-            size = f.tell()
-        if permissions:
+        # Non-upload_id path: use os.open with explicit mode to avoid the
+        # umask race where the file is briefly readable before chmod applies.
+        if perm_int is not None:
+            flags = os.O_WRONLY | os.O_CREAT | (os.O_TRUNC if mode == "wb" else os.O_APPEND)
+            fd = os.open(path, flags, perm_int)
+            try:
+                os.write(fd, raw_data)
+                os.fsync(fd)
+                size = os.fstat(fd).st_size
+            finally:
+                os.close(fd)
+            # os.open only applies perm_int on file creation; for an existing
+            # file (O_TRUNC/O_APPEND), permissions are unchanged. Explicitly
+            # chmod to ensure the caller's permissions take effect in all cases.
             _apply_permissions(path, permissions)
+        else:
+            with open(path, mode) as f:
+                f.write(raw_data)
+                f.flush()
+                os.fsync(f.fileno())
+                size = f.tell()
         _logger.info("file_write ok, path: %s, size: %s", path, size)
         return {"success": True, "path": path, "size": size}
 
