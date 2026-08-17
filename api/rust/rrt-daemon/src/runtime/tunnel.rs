@@ -36,7 +36,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot, Notify, Semaphore};
+use tokio::sync::{mpsc, oneshot, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::task::AbortHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
@@ -55,12 +55,19 @@ const DEFAULT_STREAM_CHUNK_BYTES: usize = 64 * 1024;
 const DEFAULT_MAX_INFLIGHT: usize = 16;
 const DEFAULT_STREAM_WINDOW_FRAMES: usize = 16;
 const FAST_PATH_BODY_BYTES: u64 = 64 * 1024;
+/// A V1 body is base64-encoded into one JSON frame. Keep the encoded frame
+/// safely below the control WebSocket's fixed 8 MiB message limit.
+const MAX_V1_BODY_BYTES: usize = 5 * 1024 * 1024;
 const MAX_CONFIGURED_BODY_BYTES: usize = 1024 * 1024 * 1024;
 const MAX_CONFIGURED_STREAM_CHUNK_BYTES: usize = 1024 * 1024;
 const MAX_CONFIGURED_INFLIGHT: usize = 1024;
 const MAX_CONFIGURED_WINDOW_FRAMES: usize = 1024;
 const BINARY_HEADER_BYTES: usize = 26;
 const BINARY_END_OF_BODY: u8 = 0x01;
+const OUTBOUND_QUEUE_FRAMES: usize = 512;
+const OUTBOUND_CONTROL_RESERVE: usize = 32;
+const TERMINATED_STREAM_TTL: Duration = Duration::from_secs(30);
+const TERMINATED_STREAM_LIMIT: usize = 1024;
 
 type HeaderList = Vec<(String, String)>;
 type BoxError = Box<dyn StdError + Send + Sync>;
@@ -147,6 +154,7 @@ fn configured_fast_path_body_bytes() -> u64 {
 }
 
 struct StreamingResponse {
+    generation: u64,
     status: StatusCode,
     headers: HeaderList,
     content_length: Option<u64>,
@@ -181,6 +189,8 @@ struct ResponseStreamSink {
     generation: u64,
     sender: mpsc::Sender<Result<Bytes, String>>,
     received: usize,
+    expected: Option<usize>,
+    max_body_size: usize,
 }
 
 struct StreamCredits {
@@ -189,11 +199,38 @@ struct StreamCredits {
     window: usize,
 }
 
+#[derive(Clone)]
+struct PendingWsChannel {
+    generation: u64,
+    sender: mpsc::Sender<WsTunnelMessage>,
+}
+
+#[derive(Clone)]
+struct ActiveClient {
+    generation: u64,
+    sender: mpsc::Sender<Message>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectionProtocol {
+    Disconnected,
+    Legacy {
+        generation: u64,
+    },
+    Streaming {
+        generation: u64,
+        protocol: NegotiatedProtocol,
+    },
+}
+
 fn b64() -> base64::engine::general_purpose::GeneralPurpose {
     base64::engine::general_purpose::STANDARD
 }
 
-/// Server-local unique frame id (only needs to be unique among in-flight frames).
+/// Server-local unique frame id. `YRRT` makes captures recognizable, the UUID
+/// version/variant bits keep standard parsers happy, and the atomic counter is
+/// sufficient because ids only need to be unique within this process's bounded
+/// in-flight and tombstone windows. Relaxed ordering is enough for uniqueness.
 fn make_id() -> String {
     static N: AtomicU64 = AtomicU64::new(1);
     let sequence = N.fetch_add(1, Ordering::Relaxed);
@@ -244,6 +281,8 @@ enum Frame {
         max_stream_chunk: usize,
         max_inflight: usize,
         stream_window_frames: usize,
+        #[serde(default = "configured_max_body_bytes")]
+        max_body_size: usize,
     },
     #[serde(rename = "http_req")]
     HttpReq {
@@ -352,6 +391,7 @@ struct NegotiatedProtocol {
     max_stream_chunk: usize,
     max_inflight: usize,
     stream_window_frames: usize,
+    max_body_size: usize,
 }
 
 impl BinaryEnvelope {
@@ -430,20 +470,22 @@ impl Frame {
 }
 
 // ───────────────────────── shared state ─────────────────────────
-#[derive(Default)]
 struct State {
-    /// Outbound channel to the active TunnelClient WS (None when no client connected).
-    sdk_tx: Mutex<Option<mpsc::UnboundedSender<Message>>>,
+    /// Outbound bounded channel and generation of the active TunnelClient WS.
+    active_client: Mutex<Option<ActiveClient>>,
     /// HTTP request id -> waiter accepting either a V1 response or V2 stream metadata.
     pending_http: Mutex<HashMap<String, PendingHttpResponse>>,
     /// WS channel id -> queue of frames from the client for that channel.
-    pending_ws: Mutex<HashMap<String, mpsc::UnboundedSender<WsTunnelMessage>>>,
+    pending_ws: Mutex<HashMap<String, PendingWsChannel>>,
     /// In-flight HTTP request frames, cached for resend when a client reconnects.
     pending_requests: Mutex<HashMap<String, (Frame, Instant)>>,
     /// V2 response id -> bounded downstream body channel.
     response_streams: Mutex<HashMap<String, ResponseStreamSink>>,
     /// V2 stream id -> sender-side byte credits granted by the peer.
     stream_credits: Mutex<HashMap<String, StreamCredits>>,
+    /// Recently closed response ids absorb the peer's already-granted window
+    /// without turning a single downstream cancellation into a tunnel reset.
+    terminated_responses: Mutex<HashMap<(u64, String), Instant>>,
     /// Monotonic identity of the active TunnelClient connection.
     active_generation: AtomicU64,
     /// Generation that already timed out negotiation and selected V1 fallback.
@@ -451,19 +493,64 @@ struct State {
     /// V2 limits negotiated for the active connection, if both peers support V2.
     negotiated_protocol: Mutex<Option<(u64, NegotiatedProtocol)>>,
     protocol_notify: Notify,
+    http_permits: Arc<Semaphore>,
+    ws_permits: Arc<Semaphore>,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            active_client: Mutex::new(None),
+            pending_http: Mutex::new(HashMap::new()),
+            pending_ws: Mutex::new(HashMap::new()),
+            pending_requests: Mutex::new(HashMap::new()),
+            response_streams: Mutex::new(HashMap::new()),
+            stream_credits: Mutex::new(HashMap::new()),
+            terminated_responses: Mutex::new(HashMap::new()),
+            active_generation: AtomicU64::new(0),
+            legacy_generation: AtomicU64::new(0),
+            negotiated_protocol: Mutex::new(None),
+            protocol_notify: Notify::new(),
+            http_permits: Arc::new(Semaphore::new(configured_max_inflight())),
+            ws_permits: Arc::new(Semaphore::new(configured_max_inflight())),
+        }
+    }
 }
 
 impl State {
     fn send_message(&self, message: Message) -> Result<(), ()> {
-        let guard = self.sdk_tx.lock().unwrap();
+        let guard = self.active_client.lock().unwrap();
         match guard.as_ref() {
-            Some(tx) => tx.send(message).map_err(|_| ()),
+            Some(client) => client.sender.try_send(message).map_err(|_| ()),
+            None => Err(()),
+        }
+    }
+
+    fn send_message_for_generation(&self, generation: u64, message: Message) -> Result<(), ()> {
+        let guard = self.active_client.lock().unwrap();
+        match guard
+            .as_ref()
+            .filter(|client| client.generation == generation)
+        {
+            Some(client) => client.sender.try_send(message).map_err(|_| ()),
             None => Err(()),
         }
     }
 
     fn send_to_client(&self, frame: &Frame) -> Result<(), ()> {
         self.send_message(frame.to_msg())
+    }
+
+    fn send_to_generation(&self, generation: u64, frame: &Frame) -> Result<(), ()> {
+        self.send_message_for_generation(generation, frame.to_msg())
+    }
+
+    fn active_client_generation(&self) -> Option<u64> {
+        self.active_client
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|client| client.generation)
     }
 
     fn active_protocol(&self) -> Option<(u64, NegotiatedProtocol)> {
@@ -476,24 +563,56 @@ impl State {
             .map(|(_, protocol)| (generation, *protocol))
     }
 
-    async fn wait_for_protocol(&self) -> Option<(u64, NegotiatedProtocol)> {
-        if let Some(protocol) = self.active_protocol() {
-            return Some(protocol);
+    fn select_legacy_if_unnegotiated(&self, generation: u64) -> bool {
+        if self.active_client_generation() != Some(generation) {
+            return false;
         }
-        let generation = self.active_generation.load(Ordering::Acquire);
-        if generation != 0 && self.legacy_generation.load(Ordering::Acquire) == generation {
-            return None;
+        let negotiated = self.negotiated_protocol.lock().unwrap();
+        if negotiated
+            .as_ref()
+            .is_some_and(|(candidate, _)| *candidate == generation)
+        {
+            return false;
+        }
+        self.legacy_generation.store(generation, Ordering::Release);
+        true
+    }
+
+    async fn wait_for_protocol(&self) -> ConnectionProtocol {
+        let Some(generation) = self.active_client_generation() else {
+            return ConnectionProtocol::Disconnected;
+        };
+        if let Some((candidate, protocol)) = self.active_protocol() {
+            return ConnectionProtocol::Streaming {
+                generation: candidate,
+                protocol,
+            };
+        }
+        if self.legacy_generation.load(Ordering::Acquire) == generation {
+            return ConnectionProtocol::Legacy { generation };
         }
         let notified = self.protocol_notify.notified();
-        if let Some(protocol) = self.active_protocol() {
-            return Some(protocol);
-        }
         let _ = tokio::time::timeout(Duration::from_millis(250), notified).await;
-        let protocol = self.active_protocol();
-        if protocol.is_none() && generation != 0 {
-            self.legacy_generation.store(generation, Ordering::Release);
+        if self.active_client_generation() != Some(generation) {
+            return ConnectionProtocol::Disconnected;
         }
-        protocol
+        if let Some((candidate, protocol)) = self.active_protocol() {
+            return ConnectionProtocol::Streaming {
+                generation: candidate,
+                protocol,
+            };
+        }
+        if self.select_legacy_if_unnegotiated(generation) {
+            self.protocol_notify.notify_waiters();
+            ConnectionProtocol::Legacy { generation }
+        } else if let Some((candidate, protocol)) = self.active_protocol() {
+            ConnectionProtocol::Streaming {
+                generation: candidate,
+                protocol,
+            }
+        } else {
+            ConnectionProtocol::Disconnected
+        }
     }
 
     fn register_stream_credits(&self, id: &str, generation: u64, window: usize) -> Arc<Semaphore> {
@@ -573,6 +692,82 @@ impl State {
             .collect();
         for id in credit_ids {
             self.remove_stream_credits(&id);
+        }
+    }
+
+    fn close_ws_for_generation(&self, generation: u64, message: &str) {
+        let ids: Vec<String> = self
+            .pending_ws
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, channel)| channel.generation == generation)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut channels = self.pending_ws.lock().unwrap();
+        for id in ids {
+            if let Some(channel) = channels.remove(&id) {
+                let _ = channel
+                    .sender
+                    .try_send(WsTunnelMessage::Control(Frame::WsClose {
+                        id,
+                        code: 1001,
+                        reason: message.to_string(),
+                    }));
+            }
+        }
+    }
+
+    fn remember_terminated_response(&self, generation: u64, id: &str) {
+        let now = Instant::now();
+        let mut terminated = self.terminated_responses.lock().unwrap();
+        terminated.retain(|_, timestamp| now.duration_since(*timestamp) <= TERMINATED_STREAM_TTL);
+        if terminated.len() >= TERMINATED_STREAM_LIMIT {
+            if let Some(oldest) = terminated
+                .iter()
+                .min_by_key(|(_, timestamp)| **timestamp)
+                .map(|(key, _)| key.clone())
+            {
+                terminated.remove(&oldest);
+            }
+        }
+        terminated.insert((generation, id.to_string()), now);
+    }
+
+    fn is_terminated_response(&self, generation: u64, id: &str) -> bool {
+        self.terminated_responses
+            .lock()
+            .unwrap()
+            .get(&(generation, id.to_string()))
+            .is_some_and(|timestamp| timestamp.elapsed() <= TERMINATED_STREAM_TTL)
+    }
+}
+
+struct DownstreamStreamGuard {
+    state: Arc<State>,
+    generation: u64,
+    id: String,
+}
+
+impl Drop for DownstreamStreamGuard {
+    fn drop(&mut self) {
+        if self
+            .state
+            .response_streams
+            .lock()
+            .unwrap()
+            .remove(&self.id)
+            .is_some()
+        {
+            self.state
+                .remember_terminated_response(self.generation, &self.id);
+            let _ = self.state.send_to_generation(
+                self.generation,
+                &Frame::Error {
+                    id: self.id.clone(),
+                    message: "downstream response closed".into(),
+                },
+            );
         }
     }
 }
@@ -709,21 +904,46 @@ async fn handle_client(stream: TcpStream, state: Arc<State>) -> Result<(), Strin
         .map_err(|e| format!("ws accept: {e}"))?;
     let (mut sink, mut rx_ws) = ws.split();
     let _active = super::activity::enter(); // Count the tunnel WS client connection as busy.
-    let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+    let (tx, mut rx) = mpsc::channel::<Message>(OUTBOUND_QUEUE_FRAMES);
     let generation = state.active_generation.fetch_add(1, Ordering::AcqRel) + 1;
-    // This connection becomes the active client (a reconnect replaces the previous).
-    *state.sdk_tx.lock().unwrap() = Some(tx);
+    // Installing a new generation atomically redirects future sends. Streams
+    // from the replaced connection are failed immediately instead of being
+    // orphaned until the stale socket eventually notices its disconnect.
+    let replaced = state.active_client.lock().unwrap().replace(ActiveClient {
+        generation,
+        sender: tx,
+    });
     *state.negotiated_protocol.lock().unwrap() = None;
+    state.legacy_generation.store(0, Ordering::Release);
+    if let Some(previous) = replaced {
+        state.fail_streams_for_generation(previous.generation, "tunnel client replaced");
+        state.close_ws_for_generation(previous.generation, "tunnel client replaced");
+    }
     rrt_info!("[rrt-runtime] tunnel client connected");
 
-    let _ = state.send_to_client(&Frame::Hello {
-        protocol_version: configured_protocol_version(),
-        max_stream_chunk: configured_stream_chunk_bytes(),
-        max_inflight: configured_max_inflight(),
-        stream_window_frames: configured_stream_window_frames(),
+    state
+        .send_to_generation(
+            generation,
+            &Frame::Hello {
+                protocol_version: configured_protocol_version(),
+                max_stream_chunk: configured_stream_chunk_bytes(),
+                max_inflight: configured_max_inflight(),
+                stream_window_frames: configured_stream_window_frames(),
+                max_body_size: configured_max_body_bytes(),
+            },
+        )
+        .map_err(|_| "failed to queue tunnel hello".to_string())?;
+    // V1 has no hello response. Select it only after the negotiation window;
+    // cached small requests are replayed at that point, never while mode is
+    // unknown and never as oversized single JSON frames.
+    let fallback_state = state.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        if fallback_state.select_legacy_if_unnegotiated(generation) {
+            fallback_state.protocol_notify.notify_waiters();
+            resend_pending_requests(&fallback_state, generation);
+        }
     });
-    // Resend HTTP requests that were in flight when the previous client dropped.
-    resend_pending_requests(&state);
 
     // Outbound pump: frames queued by Port B -> client WS.
     let out = tokio::spawn(async move {
@@ -755,21 +975,12 @@ async fn handle_client(stream: TcpStream, state: Arc<State>) -> Result<(), Strin
     }
 
     out.abort();
-    if state.active_generation.load(Ordering::Acquire) == generation {
-        *state.sdk_tx.lock().unwrap() = None;
+    if state.active_client_generation() == Some(generation) {
+        *state.active_client.lock().unwrap() = None;
         *state.negotiated_protocol.lock().unwrap() = None;
         state.fail_streams_for_generation(generation, "tunnel client disconnected");
+        state.close_ws_for_generation(generation, "tunnel client disconnected");
         state.protocol_notify.notify_waiters();
-        // A stale connection replaced by a reconnect must not drain the new
-        // active connection's WebSocket channels.
-        let drained: Vec<_> = state.pending_ws.lock().unwrap().drain().collect();
-        for (_, queue) in drained {
-            let _ = queue.send(WsTunnelMessage::Control(Frame::WsClose {
-                id: String::new(),
-                code: 1001,
-                reason: "tunnel client disconnected".into(),
-            }));
-        }
     }
     rrt_info!("[rrt-runtime] tunnel client disconnected");
     Ok(())
@@ -798,7 +1009,7 @@ fn cleanup_expired_requests(state: &Arc<State>) {
 }
 
 /// On client (re)connect, resend any HTTP requests still in flight.
-fn resend_pending_requests(state: &Arc<State>) {
+fn resend_pending_requests(state: &Arc<State>, generation: u64) {
     cleanup_expired_requests(state);
     let frames: Vec<Frame> = state
         .pending_requests
@@ -813,7 +1024,7 @@ fn resend_pending_requests(state: &Arc<State>) {
             frames.len()
         );
         for f in &frames {
-            let _ = state.send_to_client(f);
+            let _ = state.send_to_generation(generation, f);
         }
     }
 }
@@ -828,25 +1039,45 @@ async fn dispatch_from_client(frame: Frame, state: &Arc<State>, generation: u64)
             max_stream_chunk,
             max_inflight,
             stream_window_frames,
+            max_body_size,
         } if configured_protocol_version() >= TUNNEL_PROTOCOL_VERSION
             && *protocol_version >= TUNNEL_PROTOCOL_VERSION
             && *max_stream_chunk > 0
             && *max_inflight > 0
-            && *stream_window_frames > 0 =>
+            && *stream_window_frames > 0
+            && *max_body_size > 0 =>
         {
+            let negotiated_max_inflight = (*max_inflight).min(configured_max_inflight());
             let protocol = NegotiatedProtocol {
                 max_stream_chunk: (*max_stream_chunk).min(configured_stream_chunk_bytes()),
-                max_inflight: (*max_inflight).min(configured_max_inflight()),
+                max_inflight: negotiated_max_inflight,
                 stream_window_frames: (*stream_window_frames)
-                    .min(configured_stream_window_frames()),
+                    .min(configured_stream_window_frames())
+                    .min(
+                        OUTBOUND_QUEUE_FRAMES
+                            .saturating_sub(OUTBOUND_CONTROL_RESERVE)
+                            .checked_div(negotiated_max_inflight)
+                            .unwrap_or(0)
+                            .max(1),
+                    ),
+                max_body_size: (*max_body_size).min(configured_max_body_bytes()),
             };
-            *state.negotiated_protocol.lock().unwrap() = Some((generation, protocol));
+            let mut negotiated = state.negotiated_protocol.lock().unwrap();
+            let was_legacy = state.legacy_generation.load(Ordering::Acquire) == generation;
+            *negotiated = Some((generation, protocol));
+            drop(negotiated);
             state.protocol_notify.notify_waiters();
+            // A request already sent after the V1 fallback remains valid when
+            // a late hello upgrades subsequent traffic; do not replay it twice.
+            if !was_legacy {
+                resend_pending_requests(state, generation);
+            }
             rrt_info!(
-                "[rrt-runtime] tunnel protocol_v2 negotiated chunk={} inflight={} window={}",
+                "[rrt-runtime] tunnel protocol_v2 negotiated chunk={} inflight={} window={} body={}",
                 protocol.max_stream_chunk,
                 protocol.max_inflight,
-                protocol.stream_window_frames
+                protocol.stream_window_frames,
+                protocol.max_body_size
             );
         }
         Frame::Ping { id, timestamp } => {
@@ -894,7 +1125,22 @@ async fn dispatch_from_client(frame: Frame, state: &Arc<State>, generation: u64)
                         max_stream_chunk: configured_stream_chunk_bytes(),
                         max_inflight: configured_max_inflight(),
                         stream_window_frames: configured_stream_window_frames(),
+                        max_body_size: configured_max_body_bytes(),
                     });
+                if content_length.is_some_and(|length| length > protocol.max_body_size as u64) {
+                    let _ = pending
+                        .sender
+                        .send(Err("response body exceeds negotiated limit".into()));
+                    let _ = state.send_to_generation(
+                        generation,
+                        &Frame::Error {
+                            id: id.clone(),
+                            message: "response body exceeds negotiated limit".into(),
+                        },
+                    );
+                    state.remember_terminated_response(generation, id);
+                    return;
+                }
                 let (body_tx, body_rx) = mpsc::channel(protocol.stream_window_frames);
                 state.response_streams.lock().unwrap().insert(
                     id.clone(),
@@ -902,10 +1148,13 @@ async fn dispatch_from_client(frame: Frame, state: &Arc<State>, generation: u64)
                         generation,
                         sender: body_tx,
                         received: 0,
+                        expected: content_length.map(|length| length as usize),
+                        max_body_size: protocol.max_body_size,
                     },
                 );
                 let status = StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY);
                 let response = StreamingResponse {
+                    generation,
                     status,
                     headers: headers.clone(),
                     content_length: *content_length,
@@ -926,23 +1175,68 @@ async fn dispatch_from_client(frame: Frame, state: &Arc<State>, generation: u64)
             }
         }
         Frame::HttpRespEnd { id } => {
-            state.response_streams.lock().unwrap().remove(id);
+            if let Some(sink) = state.response_streams.lock().unwrap().remove(id) {
+                if sink
+                    .expected
+                    .is_some_and(|expected| expected != sink.received)
+                {
+                    let message = "response content length mismatch";
+                    let _ = sink.sender.try_send(Err(message.into()));
+                    let _ = state.send_to_generation(
+                        generation,
+                        &Frame::Error {
+                            id: id.clone(),
+                            message: message.into(),
+                        },
+                    );
+                }
+                state.remember_terminated_response(generation, id);
+            }
         }
         Frame::Window { id, credits } => {
             state.grant_stream_credits(id, generation, *credits);
         }
         Frame::Error { id, message } => {
-            if let Some(pending) = state.pending_http.lock().unwrap().remove(id) {
+            state.remove_stream_credits(id);
+            let pending = state.pending_http.lock().unwrap().remove(id);
+            if let Some(pending) = pending {
                 let _ = pending.sender.send(Err(message.clone()));
-            } else if let Some(sink) = state.response_streams.lock().unwrap().remove(id) {
+                return;
+            }
+            let sink = state.response_streams.lock().unwrap().remove(id);
+            if let Some(sink) = sink {
                 let _ = sink.sender.try_send(Err(message.clone()));
-            } else if let Some(queue) = state.pending_ws.lock().unwrap().get(id) {
-                let _ = queue.send(WsTunnelMessage::Control(frame));
+                state.remember_terminated_response(generation, id);
+                return;
+            }
+            let channel = state.pending_ws.lock().unwrap().get(id).cloned();
+            if let Some(channel) = channel.filter(|channel| channel.generation == generation) {
+                if channel
+                    .sender
+                    .try_send(WsTunnelMessage::Control(frame.clone()))
+                    .is_err()
+                {
+                    state.pending_ws.lock().unwrap().remove(id);
+                }
             }
         }
         Frame::WsConnected { id } | Frame::WsMessage { id, .. } | Frame::WsClose { id, .. } => {
-            if let Some(queue) = state.pending_ws.lock().unwrap().get(id) {
-                let _ = queue.send(WsTunnelMessage::Control(frame));
+            let channel = state.pending_ws.lock().unwrap().get(id).cloned();
+            if let Some(channel) = channel.filter(|channel| channel.generation == generation) {
+                if channel
+                    .sender
+                    .try_send(WsTunnelMessage::Control(frame.clone()))
+                    .is_err()
+                {
+                    state.pending_ws.lock().unwrap().remove(id);
+                    let _ = state.send_to_generation(
+                        generation,
+                        &Frame::Error {
+                            id: id.clone(),
+                            message: "WebSocket channel queue limit reached".into(),
+                        },
+                    );
+                }
             }
         }
         _ => {}
@@ -954,36 +1248,78 @@ async fn dispatch_binary_from_client(
     state: &Arc<State>,
     generation: u64,
 ) -> Result<(), String> {
-    if state.active_generation.load(Ordering::Acquire) != generation {
-        return Err("binary frame belongs to a stale tunnel connection".into());
+    if state.active_client_generation() != Some(generation) {
+        return Ok(());
     }
     match envelope.kind {
         BinaryKind::HttpResponse => {
             let id = envelope.id.to_string();
             let sender = {
                 let mut streams = state.response_streams.lock().unwrap();
-                let sink = streams
-                    .get_mut(&id)
-                    .ok_or_else(|| format!("response data for unknown stream: {id}"))?;
+                let Some(sink) = streams.get_mut(&id) else {
+                    if state.is_terminated_response(generation, &id) {
+                        return Ok(());
+                    }
+                    return Err(format!("response data for unknown stream: {id}"));
+                };
                 if sink.generation != generation {
-                    return Err(format!("response data for stale stream: {id}"));
+                    return Ok(());
                 }
                 let total = sink
                     .received
                     .checked_add(envelope.payload.len())
                     .ok_or_else(|| format!("response size overflow for stream: {id}"))?;
-                if total > configured_max_body_bytes() {
-                    return Err(format!("response body exceeds limit for stream: {id}"));
+                if total > sink.max_body_size
+                    || sink.expected.is_some_and(|expected| total > expected)
+                {
+                    let message = "response body exceeds advertised or negotiated limit";
+                    let sink = streams.remove(&id).expect("stream exists");
+                    let _ = sink.sender.try_send(Err(message.into()));
+                    drop(streams);
+                    state.remember_terminated_response(generation, &id);
+                    let _ = state.send_to_generation(
+                        generation,
+                        &Frame::Error {
+                            id,
+                            message: message.into(),
+                        },
+                    );
+                    return Ok(());
                 }
                 sink.received = total;
                 sink.sender.clone()
             };
-            sender
-                .send(Ok(envelope.payload))
-                .await
-                .map_err(|_| format!("downstream response closed for stream: {id}"))?;
-            if envelope.end_of_body {
+            if sender.send(Ok(envelope.payload)).await.is_err() {
                 state.response_streams.lock().unwrap().remove(&id);
+                state.remember_terminated_response(generation, &id);
+                let _ = state.send_to_generation(
+                    generation,
+                    &Frame::Error {
+                        id,
+                        message: "downstream response closed".into(),
+                    },
+                );
+                return Ok(());
+            }
+            if envelope.end_of_body {
+                if let Some(sink) = state.response_streams.lock().unwrap().remove(&id) {
+                    if sink
+                        .expected
+                        .is_some_and(|expected| expected != sink.received)
+                    {
+                        let _ = sink
+                            .sender
+                            .try_send(Err("response content length mismatch".into()));
+                        let _ = state.send_to_generation(
+                            generation,
+                            &Frame::Error {
+                                id: id.clone(),
+                                message: "response content length mismatch".into(),
+                            },
+                        );
+                    }
+                    state.remember_terminated_response(generation, &id);
+                }
             }
             Ok(())
         }
@@ -992,16 +1328,31 @@ async fn dispatch_binary_from_client(
         }
         BinaryKind::WebSocket => {
             let id = envelope.id.clone();
-            let queue = state
+            let channel = state
                 .pending_ws
                 .lock()
                 .unwrap()
                 .get(&id)
                 .cloned()
                 .ok_or_else(|| format!("WebSocket data for unknown channel: {id}"))?;
-            queue
-                .send(WsTunnelMessage::Binary(envelope))
-                .map_err(|_| format!("WebSocket channel closed: {id}"))
+            if channel.generation != generation {
+                return Ok(());
+            }
+            if channel
+                .sender
+                .try_send(WsTunnelMessage::Binary(envelope))
+                .is_err()
+            {
+                state.pending_ws.lock().unwrap().remove(&id);
+                let _ = state.send_to_generation(
+                    generation,
+                    &Frame::Error {
+                        id,
+                        message: "WebSocket channel queue limit reached".into(),
+                    },
+                );
+            }
+            Ok(())
         }
     }
 }
@@ -1200,6 +1551,7 @@ async fn proxy_streaming_http_request(
     state: Arc<State>,
     generation: u64,
     protocol: NegotiatedProtocol,
+    permit: OwnedSemaphorePermit,
 ) -> Response<TunnelBody> {
     let StreamingHttpRequest {
         method,
@@ -1208,7 +1560,7 @@ async fn proxy_streaming_http_request(
         content_length,
         mut body,
     } = request;
-    if content_length.is_some_and(|length| length > configured_max_body_bytes() as u64) {
+    if content_length.is_some_and(|length| length > protocol.max_body_size as u64) {
         return plain_response(StatusCode::PAYLOAD_TOO_LARGE, "request body exceeds limit");
     }
     let id = make_id();
@@ -1228,7 +1580,7 @@ async fn proxy_streaming_http_request(
         headers,
         content_length,
     };
-    if state.send_to_client(&begin).is_err() {
+    if state.send_to_generation(generation, &begin).is_err() {
         state.pending_http.lock().unwrap().remove(&id);
         state.remove_stream_credits(&id);
         return plain_response(StatusCode::BAD_GATEWAY, "Tunnel client is not connected");
@@ -1239,10 +1591,13 @@ async fn proxy_streaming_http_request(
         let frame = match frame {
             Ok(frame) => frame,
             Err(error) => {
-                let _ = state.send_to_client(&Frame::Error {
-                    id: id.clone(),
-                    message: error.to_string(),
-                });
+                let _ = state.send_to_generation(
+                    generation,
+                    &Frame::Error {
+                        id: id.clone(),
+                        message: error.to_string(),
+                    },
+                );
                 state.pending_http.lock().unwrap().remove(&id);
                 state.remove_stream_credits(&id);
                 return plain_response(StatusCode::BAD_REQUEST, "Invalid request body");
@@ -1252,12 +1607,15 @@ async fn proxy_streaming_http_request(
             continue;
         };
         received = match received.checked_add(data.len()) {
-            Some(total) if total <= configured_max_body_bytes() => total,
+            Some(total) if total <= protocol.max_body_size => total,
             _ => {
-                let _ = state.send_to_client(&Frame::Error {
-                    id: id.clone(),
-                    message: "request body exceeds limit".into(),
-                });
+                let _ = state.send_to_generation(
+                    generation,
+                    &Frame::Error {
+                        id: id.clone(),
+                        message: "request body exceeds limit".into(),
+                    },
+                );
                 state.pending_http.lock().unwrap().remove(&id);
                 state.remove_stream_credits(&id);
                 return plain_response(StatusCode::PAYLOAD_TOO_LARGE, "request body exceeds limit");
@@ -1281,7 +1639,10 @@ async fn proxy_streaming_http_request(
             }
             .encode(protocol.max_stream_chunk)
             .expect("request chunk is bounded by the negotiated size");
-            if state.send_message(message).is_err() {
+            if state
+                .send_message_for_generation(generation, message)
+                .is_err()
+            {
                 state.pending_http.lock().unwrap().remove(&id);
                 state.remove_stream_credits(&id);
                 return plain_response(
@@ -1292,16 +1653,19 @@ async fn proxy_streaming_http_request(
         }
     }
     if content_length.is_some_and(|expected| expected != received as u64) {
-        let _ = state.send_to_client(&Frame::Error {
-            id: id.clone(),
-            message: "request content length mismatch".into(),
-        });
+        let _ = state.send_to_generation(
+            generation,
+            &Frame::Error {
+                id: id.clone(),
+                message: "request content length mismatch".into(),
+            },
+        );
         state.pending_http.lock().unwrap().remove(&id);
         state.remove_stream_credits(&id);
         return plain_response(StatusCode::BAD_REQUEST, "Request content length mismatch");
     }
     if state
-        .send_to_client(&Frame::HttpReqEnd { id: id.clone() })
+        .send_to_generation(generation, &Frame::HttpReqEnd { id: id.clone() })
         .is_err()
     {
         state.pending_http.lock().unwrap().remove(&id);
@@ -1330,7 +1694,7 @@ async fn proxy_streaming_http_request(
         }
     };
 
-    streaming_response_to_downstream(method, id, state, streaming_response)
+    streaming_response_to_downstream(method, id, state, streaming_response, permit)
 }
 
 fn streaming_response_to_downstream(
@@ -1338,8 +1702,10 @@ fn streaming_response_to_downstream(
     id: String,
     state: Arc<State>,
     response: StreamingResponse,
+    permit: OwnedSemaphorePermit,
 ) -> Response<TunnelBody> {
     let StreamingResponse {
+        generation,
         status,
         headers,
         content_length,
@@ -1357,18 +1723,31 @@ fn streaming_response_to_downstream(
 
     let ack_state = state.clone();
     let ack_id = id.clone();
-    let stream = ReceiverStream::new(body_rx).map(move |item| match item {
-        Ok(bytes) => {
-            let _ = ack_state.send_to_client(&Frame::Window {
-                id: ack_id.clone(),
-                credits: 1,
-            });
-            Ok(BodyFrame::data(bytes))
+    let permit = permit;
+    let stream_guard = DownstreamStreamGuard {
+        state: state.clone(),
+        generation,
+        id: id.clone(),
+    };
+    let stream = ReceiverStream::new(body_rx).map(move |item| {
+        let _hold_permit = &permit;
+        let _hold_stream_guard = &stream_guard;
+        match item {
+            Ok(bytes) => {
+                let _ = ack_state.send_to_generation(
+                    generation,
+                    &Frame::Window {
+                        id: ack_id.clone(),
+                        credits: 1,
+                    },
+                );
+                Ok(BodyFrame::data(bytes))
+            }
+            Err(message) => Err::<BodyFrame<Bytes>, BoxError>(Box::new(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                message,
+            ))),
         }
-        Err(message) => Err::<BodyFrame<Bytes>, BoxError>(Box::new(io::Error::new(
-            io::ErrorKind::ConnectionAborted,
-            message,
-        ))),
     });
     build_response(
         status,
@@ -1403,8 +1782,27 @@ async fn proxy_http_request(request: Request<Incoming>, state: Arc<State>) -> Re
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok())
         .or_else(|| body.size_hint().exact());
-    let negotiated = state.wait_for_protocol().await;
-    if let Some((generation, protocol)) = negotiated {
+    let permit = match state.http_permits.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return plain_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "Tunnel max_inflight limit reached",
+            );
+        }
+    };
+    let connection = state.wait_for_protocol().await;
+    if connection == ConnectionProtocol::Disconnected {
+        return plain_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Tunnel client is not connected",
+        );
+    }
+    if let ConnectionProtocol::Streaming {
+        generation,
+        protocol,
+    } = connection
+    {
         if content_length.is_none_or(|length| length > configured_fast_path_body_bytes()) {
             return proxy_streaming_http_request(
                 StreamingHttpRequest {
@@ -1417,14 +1815,25 @@ async fn proxy_http_request(request: Request<Incoming>, state: Arc<State>) -> Re
                 state,
                 generation,
                 protocol,
+                permit,
             )
             .await;
         }
     }
-    let body = match Limited::new(body, configured_max_body_bytes())
-        .collect()
-        .await
-    {
+    let body_limit = match connection {
+        ConnectionProtocol::Legacy { .. } => MAX_V1_BODY_BYTES,
+        ConnectionProtocol::Streaming { protocol, .. } => {
+            protocol.max_body_size.min(MAX_V1_BODY_BYTES)
+        }
+        ConnectionProtocol::Disconnected => unreachable!(),
+    };
+    if content_length.is_some_and(|length| length > body_limit as u64) {
+        return plain_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request body requires tunnel protocol V2 streaming",
+        );
+    }
+    let body = match Limited::new(body, body_limit).collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(error) => {
             let message = error.to_string();
@@ -1458,7 +1867,19 @@ async fn proxy_http_request(request: Request<Incoming>, state: Arc<State>) -> Re
         .lock()
         .unwrap()
         .insert(id.clone(), (frame.clone(), Instant::now()));
-    let _ = state.send_to_client(&frame);
+    let generation = match connection {
+        ConnectionProtocol::Legacy { generation }
+        | ConnectionProtocol::Streaming { generation, .. } => generation,
+        ConnectionProtocol::Disconnected => unreachable!(),
+    };
+    if state.send_to_generation(generation, &frame).is_err() {
+        state.pending_http.lock().unwrap().remove(&id);
+        state.pending_requests.lock().unwrap().remove(&id);
+        return plain_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Tunnel client is not connected",
+        );
+    }
 
     let result = tokio::time::timeout(HTTP_TIMEOUT, rx).await;
     state.pending_http.lock().unwrap().remove(&id);
@@ -1484,7 +1905,7 @@ async fn proxy_http_request(request: Request<Incoming>, state: Arc<State>) -> Re
             )
         }
         Ok(Ok(Ok(TunnelResponse::Streaming(response)))) => {
-            return streaming_response_to_downstream(method, id, state, response);
+            return streaming_response_to_downstream(method, id, state, response, permit);
         }
         Ok(Ok(Err(message))) => {
             return plain_response(StatusCode::BAD_GATEWAY, &message);
@@ -1529,6 +1950,7 @@ async fn handle_port_b_http(stream: TcpStream, state: Arc<State>) -> Result<(), 
 
 fn send_ws_binary_to_client(
     state: &State,
+    generation: u64,
     id: &str,
     data: &[u8],
     max_stream_chunk: usize,
@@ -1547,7 +1969,8 @@ fn send_ws_binary_to_client(
     }
     let chunk_count = data.len().div_ceil(max_stream_chunk);
     for (index, chunk) in data.chunks(max_stream_chunk).enumerate() {
-        state.send_message(
+        state.send_message_for_generation(
+            generation,
             BinaryEnvelope {
                 id: id.to_string(),
                 kind: BinaryKind::WebSocket,
@@ -1562,6 +1985,21 @@ fn send_ws_binary_to_client(
 }
 
 async fn handle_port_b_ws(stream: TcpStream, state: Arc<State>) -> Result<(), String> {
+    let _permit = state
+        .ws_permits
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| "tunnel max WebSocket channel limit reached".to_string())?;
+    let connection = state.wait_for_protocol().await;
+    let generation = match connection {
+        ConnectionProtocol::Legacy { generation }
+        | ConnectionProtocol::Streaming { generation, .. } => generation,
+        ConnectionProtocol::Disconnected => return Err("tunnel client is not connected".into()),
+    };
+    let max_body_size = match connection {
+        ConnectionProtocol::Streaming { protocol, .. } => protocol.max_body_size,
+        _ => configured_max_body_bytes().min(MAX_V1_BODY_BYTES),
+    };
     // Capture the request path and end-to-end handshake headers before
     // tungstenite writes the downstream 101 response.
     let captured: Arc<Mutex<(String, HashMap<String, String>)>> =
@@ -1588,8 +2026,8 @@ async fn handle_port_b_ws(stream: TcpStream, state: Arc<State>) -> Result<(), St
             Ok(response)
         },
         Some(WebSocketConfig {
-            max_message_size: Some(configured_max_body_bytes()),
-            max_frame_size: Some(configured_max_body_bytes()),
+            max_message_size: Some(max_body_size),
+            max_frame_size: Some(max_body_size),
             ..WebSocketConfig::default()
         }),
     )
@@ -1602,19 +2040,26 @@ async fn handle_port_b_ws(stream: TcpStream, state: Arc<State>) -> Result<(), St
 
     let (mut sink, mut source) = ws.split();
     let id = make_id();
-    let (queue_tx, mut queue_rx) = mpsc::unbounded_channel::<WsTunnelMessage>();
-    state
-        .pending_ws
-        .lock()
-        .unwrap()
-        .insert(id.clone(), queue_tx);
+    let (queue_tx, mut queue_rx) = mpsc::channel::<WsTunnelMessage>(
+        configured_stream_window_frames().max(DEFAULT_STREAM_WINDOW_FRAMES),
+    );
+    state.pending_ws.lock().unwrap().insert(
+        id.clone(),
+        PendingWsChannel {
+            generation,
+            sender: queue_tx,
+        },
+    );
 
     if state
-        .send_to_client(&Frame::WsConnect {
-            id: id.clone(),
-            path,
-            headers,
-        })
+        .send_to_generation(
+            generation,
+            &Frame::WsConnect {
+                id: id.clone(),
+                path,
+                headers,
+            },
+        )
         .is_err()
     {
         state.pending_ws.lock().unwrap().remove(&id);
@@ -1642,9 +2087,13 @@ async fn handle_port_b_ws(stream: TcpStream, state: Arc<State>) -> Result<(), St
                     });
                 }
                 Some(Ok(Message::Binary(data))) => {
-                    if let Some((_, protocol)) = state.active_protocol() {
+                    if let Some((active_generation, protocol)) = state.active_protocol() {
+                        if active_generation != generation {
+                            break;
+                        }
                         if send_ws_binary_to_client(
                             &state,
+                            generation,
                             &id,
                             &data,
                             protocol.max_stream_chunk,
@@ -1652,7 +2101,7 @@ async fn handle_port_b_ws(stream: TcpStream, state: Arc<State>) -> Result<(), St
                             break;
                         }
                     } else {
-                        let _ = state.send_to_client(&Frame::WsMessage {
+                        let _ = state.send_to_generation(generation, &Frame::WsMessage {
                             id: id.clone(),
                             data: b64().encode(&data),
                             binary: true,
@@ -1660,7 +2109,7 @@ async fn handle_port_b_ws(stream: TcpStream, state: Arc<State>) -> Result<(), St
                     }
                 }
                 Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
-                    let _ = state.send_to_client(&Frame::WsClose {
+                    let _ = state.send_to_generation(generation, &Frame::WsClose {
                         id: id.clone(),
                         code: 1000,
                         reason: String::new(),
@@ -1687,7 +2136,7 @@ async fn handle_port_b_ws(stream: TcpStream, state: Arc<State>) -> Result<(), St
                         .len()
                         .checked_add(envelope.payload.len())
                         .ok_or_else(|| "WebSocket binary message size overflow".to_string())?;
-                    if total > configured_max_body_bytes() {
+                    if total > max_body_size {
                         return Err("WebSocket binary message exceeds limit".into());
                     }
                     incoming_binary.extend_from_slice(&envelope.payload);
@@ -1768,6 +2217,7 @@ mod tests {
                     max_stream_chunk: DEFAULT_STREAM_CHUNK_BYTES,
                     max_inflight: DEFAULT_MAX_INFLIGHT,
                     stream_window_frames: DEFAULT_STREAM_WINDOW_FRAMES,
+                    max_body_size: MAX_HTTP_BODY_BYTES,
                 }
                 .to_msg(),
             )
@@ -1816,11 +2266,108 @@ mod tests {
         let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         stream.write_all(request).await.unwrap();
         let mut response = Vec::new();
-        tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
-            .await
-            .expect("HTTP response timed out")
-            .unwrap();
+        let read_result =
+            tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
+                .await
+                .expect("HTTP response timed out");
+        if let Err(error) = read_result {
+            assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
+        }
         String::from_utf8_lossy(&response).into_owned()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disconnected_http_fails_fast_without_caching_request() {
+        let (_ws_port, http_port) = spawn_test_server().await;
+        let started = Instant::now();
+        let response = http_get(http_port, "/no-client").await;
+        assert!(
+            response.starts_with("HTTP/1.1 503"),
+            "response={response:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn legacy_peer_rejects_oversized_single_frame_request() {
+        let (ws_port, http_port) = spawn_test_server().await;
+        let mut client = connect_client(ws_port).await;
+        let request = format!(
+            "POST /large-v1 HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            MAX_V1_BODY_BYTES + 1
+        );
+        let response = raw_http(http_port, request.as_bytes()).await;
+        assert!(
+            response.starts_with("HTTP/1.1 413"),
+            "response={response:?}"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), next_message(&mut client))
+                .await
+                .is_err(),
+            "oversized V1 requests must not be queued or sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn downstream_stream_cancellation_isolated_to_one_request() {
+        let state = Arc::new(State::default());
+        let generation = 1;
+        state.active_generation.store(generation, Ordering::Release);
+        let (outbound, mut outbound_rx) = mpsc::channel(OUTBOUND_QUEUE_FRAMES);
+        *state.active_client.lock().unwrap() = Some(ActiveClient {
+            generation,
+            sender: outbound,
+        });
+        let (body_tx, body_rx) = mpsc::channel(1);
+        drop(body_rx);
+        let id = make_id();
+        state.response_streams.lock().unwrap().insert(
+            id.clone(),
+            ResponseStreamSink {
+                generation,
+                sender: body_tx,
+                received: 0,
+                expected: None,
+                max_body_size: MAX_HTTP_BODY_BYTES,
+            },
+        );
+
+        dispatch_binary_from_client(
+            BinaryEnvelope {
+                id: id.clone(),
+                kind: BinaryKind::HttpResponse,
+                payload: Bytes::from_static(b"late"),
+                end_of_body: false,
+            },
+            &state,
+            generation,
+        )
+        .await
+        .unwrap();
+        assert!(state.is_terminated_response(generation, &id));
+        match outbound_rx.recv().await.unwrap() {
+            Message::Text(raw) => match serde_json::from_str::<Frame>(&raw).unwrap() {
+                Frame::Error { id: error_id, .. } => assert_eq!(error_id, id),
+                other => panic!("expected stream error, got {other:?}"),
+            },
+            other => panic!("expected control frame, got {other:?}"),
+        }
+
+        // Remaining data from the already-granted window is absorbed without
+        // closing the tunnel connection.
+        dispatch_binary_from_client(
+            BinaryEnvelope {
+                id,
+                kind: BinaryKind::HttpResponse,
+                payload: Bytes::from_static(b"later"),
+                end_of_body: true,
+            },
+            &state,
+            generation,
+        )
+        .await
+        .unwrap();
     }
 
     #[test]
@@ -1877,6 +2424,7 @@ mod tests {
             max_stream_chunk: DEFAULT_STREAM_CHUNK_BYTES,
             max_inflight: DEFAULT_MAX_INFLIGHT,
             stream_window_frames: DEFAULT_STREAM_WINDOW_FRAMES,
+            max_body_size: MAX_HTTP_BODY_BYTES,
         };
         let value: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&frame).unwrap()).unwrap();
@@ -1885,6 +2433,7 @@ mod tests {
         assert_eq!(value["max_stream_chunk"], 65536);
         assert_eq!(value["max_inflight"], 16);
         assert_eq!(value["stream_window_frames"], 16);
+        assert_eq!(value["max_body_size"], 67108864);
     }
 
     #[test]
@@ -2347,6 +2896,83 @@ mod tests {
         let first = response.find("data: first").expect("first SSE event");
         let second = response.find("data: second").expect("second SSE event");
         assert!(first < second, "response={response:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn response_length_mismatch_fails_only_that_stream() {
+        let (ws_port, http_port) = spawn_test_server().await;
+        let mut client = connect_v2_client(ws_port).await;
+        let request = tokio::spawn(async move { http_get(http_port, "/mismatch").await });
+        let id = match next_frame(&mut client).await {
+            Frame::HttpReq { id, .. } => id,
+            other => panic!("expected fast-path request, got {other:?}"),
+        };
+        client
+            .send(
+                Frame::HttpRespBegin {
+                    id: id.clone(),
+                    status: 200,
+                    headers: Vec::new(),
+                    content_length: Some(3),
+                }
+                .to_msg(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            next_frame(&mut client).await,
+            Frame::Window { .. }
+        ));
+        client
+            .send(
+                BinaryEnvelope {
+                    id: id.clone(),
+                    kind: BinaryKind::HttpResponse,
+                    payload: Bytes::from_static(b"ok"),
+                    end_of_body: false,
+                }
+                .encode(DEFAULT_STREAM_CHUNK_BYTES)
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        client
+            .send(Frame::HttpRespEnd { id: id.clone() }.to_msg())
+            .await
+            .unwrap();
+        loop {
+            match next_frame(&mut client).await {
+                Frame::Window { .. } => continue,
+                Frame::Error {
+                    id: error_id,
+                    message,
+                } => {
+                    assert_eq!(error_id, id);
+                    assert!(message.contains("content length mismatch"));
+                    break;
+                }
+                other => panic!("expected stream-local error, got {other:?}"),
+            }
+        }
+        let _ = request.await.unwrap();
+
+        client
+            .send(
+                Frame::Ping {
+                    id: "still-alive".into(),
+                    timestamp: 1.0,
+                }
+                .to_msg(),
+            )
+            .await
+            .unwrap();
+        loop {
+            match next_frame(&mut client).await {
+                Frame::Pong { id, .. } if id == "still-alive" => break,
+                Frame::Window { .. } | Frame::Error { .. } => continue,
+                other => panic!("expected tunnel to remain alive, got {other:?}"),
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
