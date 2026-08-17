@@ -47,7 +47,7 @@ const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const PENDING_REQUEST_TTL: Duration = Duration::from_secs(120);
 const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
 const MAX_HTTP_HEADERS: usize = 200;
-const MAX_HTTP_BODY_BYTES: usize = 64 * 1024 * 1024;
+const MAX_HTTP_BODY_BYTES: usize = 512 * 1024 * 1024;
 const TUNNEL_PROTOCOL_VERSION: u8 = 2;
 const BINARY_ENVELOPE_VERSION: u8 = 1;
 const BINARY_MAGIC: [u8; 2] = *b"YD";
@@ -2433,7 +2433,7 @@ mod tests {
         assert_eq!(value["max_stream_chunk"], 65536);
         assert_eq!(value["max_inflight"], 16);
         assert_eq!(value["stream_window_frames"], 16);
-        assert_eq!(value["max_body_size"], 67108864);
+        assert_eq!(value["max_body_size"], 536870912);
     }
 
     #[test]
