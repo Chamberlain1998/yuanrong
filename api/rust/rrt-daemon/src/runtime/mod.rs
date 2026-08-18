@@ -670,7 +670,7 @@ mod tests {
 
     #[tokio::test]
     async fn tunnel_server_ports_are_reserved_before_start_returns() {
-        let ws_probe = tokio::net::TcpListener::bind("127.0.0.1:0")
+        let ws_probe = tokio::net::TcpListener::bind("0.0.0.0:0")
             .await
             .expect("an ephemeral tunnel WS port should be available");
         let ws_port = ws_probe.local_addr().expect("WS probe address").port();
@@ -686,7 +686,7 @@ mod tests {
             .expect("both tunnel listeners should bind before start returns");
 
         assert_eq!(*ready.borrow(), RuntimeReadyState::Ready);
-        let ws_error = tokio::net::TcpListener::bind(("127.0.0.1", ws_port))
+        let ws_error = tokio::net::TcpListener::bind(("0.0.0.0", ws_port))
             .await
             .expect_err("the tunnel server must already reserve its WS port");
         assert_eq!(ws_error.kind(), std::io::ErrorKind::AddrInUse);
@@ -698,7 +698,7 @@ mod tests {
 
     #[tokio::test]
     async fn tunnel_bind_failure_is_exposed_as_readiness_failure() {
-        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0")
+        let occupied = tokio::net::TcpListener::bind("0.0.0.0:0")
             .await
             .expect("an ephemeral tunnel WS port should be available");
         let ws_port = occupied.local_addr().expect("occupied address").port();
