@@ -13,6 +13,7 @@ yr start [OPTIONS]
 * `--master`：以主节点模式启动（默认不带该参数时为 agent 模式）。
 * `-s, --set KEY=VALUE`：命令行覆盖配置，可重复指定；`VALUE` 必须是合法 TOML 字面量。
 * `--master_address http(s)://host:port`：仅 agent 模式可用。启动前从指定 `function_master` 拉取服务发现信息并自动转换为 `-s` 覆盖项。
+* `--log-dir-prefix <path>`：指定会话与日志输出的前缀目录（默认 `/tmp/yr_sessions`）。会话目录 `<prefix>/<timestamp>/`、`latest` 软链、`session.json`、`yr_current_master_info` 以及组件日志 `<deploy_path>/logs/` 均创建在该前缀下，整体迁移、不会分裂。
 
 :::{Note}
 
@@ -44,10 +45,10 @@ yr start [OPTIONS]
 
 执行 `yr start` 后，CLI 会：
 
-1. 创建部署目录 `/tmp/yr_sessions/<timestamp>/`
-2. 更新符号链接 `/tmp/yr_sessions/latest -> /tmp/yr_sessions/<timestamp>/`
+1. 创建部署目录 `<prefix>/<timestamp>/`（`<prefix>` 默认为 `/tmp/yr_sessions`，可通过 `--log-dir-prefix` 指定）
+2. 更新符号链接 `<prefix>/latest -> <prefix>/<timestamp>/`
 3. 启动模式对应组件并执行健康检查
-4. 写入会话文件 `/tmp/yr_sessions/latest/session.json`
+4. 写入会话文件 `<prefix>/latest/session.json`
 
 其中：
 
@@ -79,3 +80,15 @@ yr start -s 'values.etcd.address=[{ip="10.88.0.4",peer_port="32380",port="32379"
 ```shell
 yr start --master_address http://10.88.0.4:22770
 ```
+
+指定日志输出前缀（将所有会话与日志迁到 `/data/yr_logs` 下）：
+
+```shell
+yr start --master --log-dir-prefix /data/yr_logs
+```
+
+:::{Note}
+
+`--log-dir-prefix` 仅替换前缀部分，其下的 `<timestamp>/` 子目录、`logs/`、`session.json` 等结构保持不变。多次启动会在同一前缀下累积多个时间戳目录，`latest` 软链始终指向最近一次。
+
+:::

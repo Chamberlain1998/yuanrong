@@ -13,6 +13,7 @@ yr start [OPTIONS]
 * `--master`: Start in master mode (defaults to agent mode without this parameter).
 * `-s, --set KEY=VALUE`: Override configuration from the command line; can be specified multiple times. `VALUE` must be a valid TOML literal.
 * `--master_address http(s)://host:port`: Only available in agent mode. Before startup, pulls service discovery information from the specified `function_master` and automatically converts it to `-s` overrides.
+* `--log-dir-prefix <path>`: Prefix directory for session and log output (default `/tmp/yr_sessions`). The session dir `<prefix>/<timestamp>/`, `latest` symlink, `session.json`, `yr_current_master_info`, and component logs `<deploy_path>/logs/` are all created under this prefix, migrating the whole output tree together without splitting paths.
 
 :::{Note}
 
@@ -44,10 +45,10 @@ When `yr start` starts, the final configuration is merged according to the follo
 
 After executing `yr start`, the CLI will:
 
-1. Create a deployment directory `/tmp/yr_sessions/<timestamp>/`
-2. Update the symbolic link `/tmp/yr_sessions/latest -> /tmp/yr_sessions/<timestamp>/`
+1. Create a deployment directory `<prefix>/<timestamp>/` (`<prefix>` defaults to `/tmp/yr_sessions`, overridable via `--log-dir-prefix`)
+2. Update the symbolic link `<prefix>/latest -> <prefix>/<timestamp>/`
 3. Start the components corresponding to the mode and perform health checks
-4. Write the session file `/tmp/yr_sessions/latest/session.json`
+4. Write the session file `<prefix>/latest/session.json`
 
 Where:
 
@@ -79,3 +80,15 @@ Or use the auto-discovery mode (agent):
 ```shell
 yr start --master_address http://10.88.0.4:22770
 ```
+
+Specify a log output prefix (migrate all sessions and logs under `/data/yr_logs`):
+
+```shell
+yr start --master --log-dir-prefix /data/yr_logs
+```
+
+:::{Note}
+
+`--log-dir-prefix` only replaces the prefix; the `<timestamp>/` subdirectory, `logs/`, `session.json`, etc. beneath it keep their structure. Repeated starts accumulate multiple timestamped directories under the same prefix, and the `latest` symlink always points to the most recent one.
+
+:::

@@ -36,11 +36,8 @@ from yr.cli.component.base import ComponentConfig, ComponentLauncher
 from yr.cli.component.registry import LAUNCHER_CLASSES, PREPEND_CHAR_OVERRIDES, get_depends_on_overrides
 from yr.cli.config import ConfigResolver
 from yr.cli.const import (
-    DEFAULT_DEPLOY_DIR,
-    DEFAULT_LOG_DIR,
     DEFAULT_MASTER_INFO_PATH,
-    SESSION_JSON_PATH,
-    SESSION_LATEST_PATH,
+    DEFAULT_SESSIONS_DIR,
     StartMode,
 )
 from yr.cli.utils import fetch_url, wait_pid_exit
@@ -180,8 +177,10 @@ class SessionManager:
         session_id: str,
         mode: StartMode,
         session_file: Optional[str] = None,
+        sessions_dir: str = DEFAULT_SESSIONS_DIR,
     ) -> None:
-        self.session_file = Path(session_file or SESSION_JSON_PATH)
+        default_session_json = f"{sessions_dir}/latest/session.json"
+        self.session_file = Path(session_file or default_session_json)
         self.session_data = {
             "components": {},
             "start_time": None,
@@ -298,8 +297,17 @@ class SystemLauncher:
         session_file: Optional[str] = None,
         render: bool = True,
         port_policy: str = "RANDOM",
+        sessions_dir: str = DEFAULT_SESSIONS_DIR,
     ):
         self.mode = mode
+        self.sessions_dir = sessions_dir
+        # Derived runtime paths, all rooted at the (possibly overridden) sessions
+        # prefix so that session dir, latest symlink, session.json, master_info
+        # and logs migrate together when --log-dir-prefix is used.
+        self.session_latest_path = Path(f"{sessions_dir}/latest")
+        self.default_log_dir = self.session_latest_path / "logs"
+        self.default_deploy_dir = self.session_latest_path / "deploy"
+        self.default_master_info_path = Path(f"{sessions_dir}/yr_current_master_info")
         self.resolver = ConfigResolver(
             config_path,
             cli_dir,
@@ -307,11 +315,13 @@ class SystemLauncher:
             overrides,
             render,
             port_policy=port_policy,
+            sessions_dir=sessions_dir,
         )
         self.session_manager = SessionManager(
             self.resolver.runtime_context["time"] if mode else "",
             mode,
             self.resolver.runtime_context["deploy_path"] / "session.json" if mode else session_file,
+            sessions_dir=sessions_dir,
         )
         self.components: dict[str, ComponentLauncher] = {}
         self.processes: dict[str, subprocess.Popen] = {}
@@ -674,16 +684,16 @@ class SystemLauncher:
         deploy_path = self.resolver.runtime_context["deploy_path"]
 
         deploy_path.mkdir(parents=True, exist_ok=True)
-        symlink_path = Path(SESSION_LATEST_PATH)
+        symlink_path = self.session_latest_path
         symlink_path.parent.mkdir(parents=True, exist_ok=True)
         if symlink_path.is_symlink() or symlink_path.exists():
             symlink_path.unlink()
-        # /tmp/yr/session_latest -> real deploy path. we only need to focus on dealing with /tmp/yr/session_latest
+        # <sessions_dir>/latest -> real deploy path. we only need to focus on dealing with <sessions_dir>/latest
         symlink_path.symlink_to(deploy_path)
         logger.info(f"Created symlink {symlink_path} -> {deploy_path}")
-        Path(DEFAULT_LOG_DIR).mkdir(parents=True, exist_ok=True)
-        Path(DEFAULT_DEPLOY_DIR).mkdir(parents=True, exist_ok=True)
-        os.chdir(DEFAULT_DEPLOY_DIR)
+        self.default_log_dir.mkdir(parents=True, exist_ok=True)
+        self.default_deploy_dir.mkdir(parents=True, exist_ok=True)
+        os.chdir(self.default_deploy_dir)
 
     def _apply_component_overrides(self, comp_name: str, launcher: ComponentLauncher) -> None:
         """Apply per-component configuration tweaks after a launcher is constructed."""
@@ -728,7 +738,9 @@ class SystemLauncher:
             self.resolver.rendered_config,
         )
         if self.mode == StartMode.MASTER:
-            write_old_current_master_info(self.session_manager.session_data)
+            write_old_current_master_info(
+                self.session_manager.session_data, str(self.default_master_info_path)
+            )
 
         # From this point, parent exiting is expected and should not stop the daemon.
         self._startup_complete = True
@@ -1153,8 +1165,10 @@ class SystemLauncher:
                     print_logger.info(f"        {metric}")
 
 
-def write_old_current_master_info(session_data: dict[str, any]) -> None:
-    master_info = Path(DEFAULT_MASTER_INFO_PATH)
+def write_old_current_master_info(
+    session_data: dict[str, any], master_info_path: str = DEFAULT_MASTER_INFO_PATH
+) -> None:
+    master_info = Path(master_info_path)
     join_info = session_data["cluster_info"]["for-join"]
     etcd_addresses = join_info.get("etcd.addresses") or []
     with master_info.open("w") as f:

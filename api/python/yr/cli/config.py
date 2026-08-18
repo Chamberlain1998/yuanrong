@@ -33,7 +33,12 @@ except ImportError:
 import tomli_w
 from jinja2 import Environment, StrictUndefined
 
-from yr.cli.const import DEFAULT_CONFIG_TEMPLATE_PATH, DEFAULT_VALUES_TOML, SESSIONS_DIR, StartMode
+from yr.cli.const import (
+    DEFAULT_CONFIG_TEMPLATE_PATH,
+    DEFAULT_SESSIONS_DIR,
+    DEFAULT_VALUES_TOML,
+    StartMode,
+)
 from yr.cli.utils import check_port, get_ip, get_total_memory_mb, trim_hostname
 
 logger = logging.getLogger(__name__)
@@ -59,7 +64,9 @@ def create_jinja_environment(port_policy: str = "RANDOM") -> Environment:
     return env
 
 
-def build_runtime_context(yr_package_path: Path) -> dict[str, Any]:
+def build_runtime_context(
+    yr_package_path: Path, sessions_dir: str = DEFAULT_SESSIONS_DIR
+) -> dict[str, Any]:
     hostname = socket.gethostname()
     pid = os.getpid()
     node_id = f"{trim_hostname()}-{pid}"
@@ -75,7 +82,7 @@ def build_runtime_context(yr_package_path: Path) -> dict[str, Any]:
         "ip": get_ip(),
         "timestamp": timestamp,
         "time": time_str,
-        "deploy_path": Path(f"{SESSIONS_DIR}/{time_str}"),
+        "deploy_path": Path(f"{sessions_dir}/{time_str}"),
         "cwd": Path.cwd(),
         "ld_library_path": os.environ.get("LD_LIBRARY_PATH", ""),
         "python_path": os.environ.get("PYTHONPATH", ""),
@@ -95,14 +102,16 @@ def _get_template_error_lineno(exc: Exception) -> Optional[int]:
     return lineno
 
 
-def render_user_config_template(template_path: Path, cli_dir: Path) -> str:
+def render_user_config_template(
+    template_path: Path, cli_dir: Path, sessions_dir: str = DEFAULT_SESSIONS_DIR
+) -> str:
     template_path = Path(template_path)
     try:
         template_text = template_path.read_text()
     except OSError as exc:
         raise ValueError(f"Failed to read template '{template_path}': {exc}") from exc
 
-    runtime_context = build_runtime_context(Path(cli_dir).parent)
+    runtime_context = build_runtime_context(Path(cli_dir).parent, sessions_dir)
     jinja_env = create_jinja_environment()
     jinja_env.globals.update(runtime_context)
     jinja_env.globals["env"] = dict(os.environ)
@@ -142,10 +151,12 @@ class ConfigResolver:
         render: Optional[bool] = True,
         env_subst_keys: Optional[tuple[str, ...]] = None,
         port_policy: str = "RANDOM",
+        sessions_dir: str = DEFAULT_SESSIONS_DIR,
     ) -> None:
         self.mode = mode
         self.yr_package_path = cli_dir.parent
         self.env_subst_keys = env_subst_keys
+        self.sessions_dir = sessions_dir
         # full wheel bundles binaries under yr/inner/; sanbao's yr/inner/ holds
         # only the legacy run_yr script, so detect by a binary dir unique to full.
         inner = self.yr_package_path / "inner"
@@ -179,7 +190,7 @@ class ConfigResolver:
                     "ip": self.runtime_context["ip"],
                     "timestamp": self.runtime_context["timestamp"],
                     "time": self.runtime_context["time"],
-                    "deploy_path": f"{SESSIONS_DIR}/{self.runtime_context['time']}",
+                    "deploy_path": f"{self.sessions_dir}/{self.runtime_context['time']}",
                     "ld_library_path": self.runtime_context["ld_library_path"],
                     "python_path": self.runtime_context["python_path"],
                 },
@@ -273,7 +284,7 @@ class ConfigResolver:
 
     def _build_runtime_context(self) -> dict[str, any]:
         """build runtime context, collect environment information"""
-        return build_runtime_context(self.yr_package_path)
+        return build_runtime_context(self.yr_package_path, self.sessions_dir)
 
     def _apply_env_subst(self, text: str) -> str:
         if not self.env_subst_keys:

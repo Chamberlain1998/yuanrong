@@ -27,6 +27,7 @@ from yr.cli.config import ConfigResolver, render_user_config_template
 from yr.cli.const import (
     DEFAULT_CONFIG_PATH,
     DEFAULT_CONFIG_TEMPLATE_PATH,
+    DEFAULT_SESSIONS_DIR,
     DEFAULT_VALUES_TOML,
     SESSION_JSON_PATH,
     StartMode,
@@ -202,6 +203,18 @@ Common patterns:\n
     default=False,
     help="Keep yr start in the foreground after components become healthy.",
 )
+@click.option(
+    "--log-dir-prefix",
+    "log_dir_prefix",
+    type=str,
+    default=None,
+    help=(
+        f"Prefix directory for session and log output (default: {DEFAULT_SESSIONS_DIR}). "
+        "The session dir (<prefix>/<timestamp>/), latest symlink, session.json, "
+        "master_info and component logs are all created under this prefix, so the "
+        "whole output tree migrates together instead of under /tmp/yr_sessions/."
+    ),
+)
 @click.pass_context
 def start(ctx: click.Context, **kwargs) -> None:
     """Start the YuanRong system in master or agent mode."""
@@ -213,6 +226,7 @@ def start(ctx: click.Context, **kwargs) -> None:
     data_system_enable = kwargs["data_system_enable"]
     port_policy = kwargs["port_policy"]
     block = kwargs["block"]
+    log_dir_prefix = kwargs["log_dir_prefix"]
     config_path: Path = ctx.obj["config_path"]
     cli_dir: Path = ctx.obj["cli_dir"]
     mode = StartMode.MASTER if master_mode else StartMode.AGENT
@@ -258,12 +272,14 @@ def start(ctx: click.Context, **kwargs) -> None:
             ]
         )
 
+    sessions_dir = log_dir_prefix or DEFAULT_SESSIONS_DIR
     launcher = SystemLauncher(
         config_path,
         cli_dir,
         mode,
         overrides=tuple(effective_overrides),
         port_policy=port_policy,
+        sessions_dir=sessions_dir,
     )
     launcher.load_components()
     success = launcher.start_all()
@@ -338,13 +354,31 @@ def launch(
         "This file is created when `yr start` succeeds and is used by status/stop."
     ),
 )
+@click.option(
+    "--log-dir-prefix",
+    "log_dir_prefix",
+    type=str,
+    default=None,
+    help=(
+        f"Prefix directory used to locate the session file when --file is not "
+        f"given (default: {DEFAULT_SESSIONS_DIR}). Must match the prefix passed "
+        "to `yr start --log-dir-prefix`."
+    ),
+)
 @click.pass_context
-def health(ctx: click.Context, session_file: Optional[str]) -> None:
+def health(
+    ctx: click.Context, session_file: Optional[str], log_dir_prefix: Optional[str]
+) -> None:
     config_path: Path = ctx.obj["config_path"]
     cli_dir: Path = ctx.obj["cli_dir"]
+    sessions_dir = log_dir_prefix or DEFAULT_SESSIONS_DIR
 
     launcher = SystemLauncher(
-        config_path, cli_dir, session_file=session_file, render=None
+        config_path,
+        cli_dir,
+        session_file=session_file,
+        render=None,
+        sessions_dir=sessions_dir,
     )
     ok = launcher.health()
     ctx.exit(0 if ok else 1)
@@ -361,13 +395,31 @@ def health(ctx: click.Context, session_file: Optional[str]) -> None:
         "Master mode can additionally query the global scheduler for resources."
     ),
 )
+@click.option(
+    "--log-dir-prefix",
+    "log_dir_prefix",
+    type=str,
+    default=None,
+    help=(
+        f"Prefix directory used to locate the session file when --file is not "
+        f"given (default: {DEFAULT_SESSIONS_DIR}). Must match the prefix passed "
+        "to `yr start --log-dir-prefix`."
+    ),
+)
 @click.pass_context
-def status(ctx: click.Context, session_file: Optional[str]) -> None:
+def status(
+    ctx: click.Context, session_file: Optional[str], log_dir_prefix: Optional[str]
+) -> None:
     config_path: Path = ctx.obj["config_path"]
     cli_dir: Path = ctx.obj["cli_dir"]
+    sessions_dir = log_dir_prefix or DEFAULT_SESSIONS_DIR
 
     launcher = SystemLauncher(
-        config_path, cli_dir, session_file=session_file, render=None
+        config_path,
+        cli_dir,
+        session_file=session_file,
+        render=None,
+        sessions_dir=sessions_dir,
     )
     ok = launcher.status()
     ctx.exit(0 if ok else 1)
@@ -389,13 +441,31 @@ def status(ctx: click.Context, session_file: Optional[str]) -> None:
         "Use this when your session file is stored in a non-default location."
     ),
 )
+@click.option(
+    "--log-dir-prefix",
+    "log_dir_prefix",
+    type=str,
+    default=None,
+    help=(
+        f"Prefix directory used to locate the session file when --file is not "
+        f"given (default: {DEFAULT_SESSIONS_DIR}). Must match the prefix passed "
+        "to `yr start --log-dir-prefix`."
+    ),
+)
 @click.pass_context
-def stop(ctx: click.Context, force: bool, session_file: Optional[str]) -> None:
+def stop(
+    ctx: click.Context, force: bool, session_file: Optional[str], log_dir_prefix: Optional[str]
+) -> None:
     config_path: Path = ctx.obj["config_path"]
     cli_dir: Path = ctx.obj["cli_dir"]
+    sessions_dir = log_dir_prefix or DEFAULT_SESSIONS_DIR
     logger.info("Stopping yr system components...")
     launcher = SystemLauncher(
-        config_path, cli_dir, session_file=session_file, render=None
+        config_path,
+        cli_dir,
+        session_file=session_file,
+        render=None,
+        sessions_dir=sessions_dir,
     )
     if force:
         logger.warning("Force stopping components...")
