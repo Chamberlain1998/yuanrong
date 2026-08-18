@@ -48,6 +48,7 @@ class TestCliMain(unittest.TestCase):
         fake_const.DEFAULT_CONFIG_PATH = "/tmp/config.toml"
         fake_const.DEFAULT_CONFIG_TEMPLATE_PATH = "config.toml.jinja"
         fake_const.DEFAULT_VALUES_TOML = "values.toml"
+        fake_const.DEFAULT_SESSIONS_DIR = "/tmp/yr_sessions"
         fake_const.SESSION_JSON_PATH = "/tmp/session.json"
         fake_const.StartMode = types.SimpleNamespace(
             MASTER=types.SimpleNamespace(value="master"),
@@ -70,6 +71,18 @@ class TestCliMain(unittest.TestCase):
 
             def load_components(self):
                 pass
+
+            def health(self):
+                return True
+
+            def status(self):
+                return True
+
+            def stop_daemon_from_session(self, force=False):
+                return True
+
+            def stop_components_from_session(self, force=False):
+                return True
 
         fake_launcher.SystemLauncher = FakeSystemLauncher
 
@@ -176,6 +189,45 @@ class TestCliMain(unittest.TestCase):
                         main.FakeSystemLauncher.calls[-1][1]["port_policy"],
                         expected_policy,
                     )
+
+    def test_start_log_dir_prefix_option(self):
+        cases = [
+            ([], "/tmp/yr_sessions"),
+            (
+                ["--log-dir-prefix", "/data/yr_logs"],
+                "/data/yr_logs",
+            ),
+        ]
+        for args, expected_sessions_dir in cases:
+            with self.subTest(args=args):
+                main = self.load_cli_main_with_stubbed_deps()
+                result = CliRunner().invoke(main.cli, ["start", *args], obj={})
+
+                self.assertEqual(result.exit_code, 0, result.output)
+                self.assertEqual(
+                    main.FakeSystemLauncher.calls[-1][1]["sessions_dir"],
+                    expected_sessions_dir,
+                )
+
+    def test_stop_status_health_log_dir_prefix_option(self):
+        # stop/status/health must honor --log-dir-prefix so they can locate the
+        # session file when start used a non-default prefix.
+        cases = [
+            ("stop", [], "/tmp/yr_sessions"),
+            ("stop", ["--log-dir-prefix", "/data/yr_logs"], "/data/yr_logs"),
+            ("status", ["--log-dir-prefix", "/data/yr_logs"], "/data/yr_logs"),
+            ("health", ["--log-dir-prefix", "/data/yr_logs"], "/data/yr_logs"),
+        ]
+        for cmd, args, expected_sessions_dir in cases:
+            with self.subTest(cmd=cmd, args=args):
+                main = self.load_cli_main_with_stubbed_deps()
+                result = CliRunner().invoke(main.cli, [cmd, *args], obj={})
+
+                self.assertEqual(result.exit_code, 0, result.output)
+                self.assertEqual(
+                    main.FakeSystemLauncher.calls[-1][1]["sessions_dir"],
+                    expected_sessions_dir,
+                )
 
     def test_start_data_system_enable_option(self):
         cases = [

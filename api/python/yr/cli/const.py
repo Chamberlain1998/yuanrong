@@ -18,7 +18,13 @@ from enum import Enum
 
 DEFAULT_CONFIG_PATH = "/etc/yuanrong/config.toml"
 HTTP_PROTOCOL = "http://"
-SESSIONS_DIR = "/tmp/yr_sessions"
+# Default prefix for session and log output. Can be overridden at startup via
+# `yr start --log-dir-prefix <path>`, in which case all derived paths (session
+# dir, latest symlink, session.json, master_info, component logs) migrate under
+# the new prefix instead of this default.
+DEFAULT_SESSIONS_DIR = "/tmp/yr_sessions"
+# Kept as an alias for backwards compatibility with existing imports/tests.
+SESSIONS_DIR = DEFAULT_SESSIONS_DIR
 SESSION_LATEST_PATH = f"{SESSIONS_DIR}/latest"
 DEFAULT_LOG_DIR = f"{SESSION_LATEST_PATH}/logs"
 DEFAULT_DEPLOY_DIR = f"{SESSION_LATEST_PATH}/deploy"
