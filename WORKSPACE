@@ -467,6 +467,7 @@ http_archive(
 http_archive(
     name = "etcd_source",
     build_file = "//bazel:etcd.BUILD",
+    sha256 = "2d3d88bcb7113d4eef5800fa876d099aaf581a0063513a221b31a0917b664169",
     strip_prefix = "etcd-3.5.24",
     urls = [
         "https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/thirdparty/github.com/etcd-io/etcd/v3.5.24.zip",

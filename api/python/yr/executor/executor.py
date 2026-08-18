@@ -103,23 +103,18 @@ class Executor:
         """
         Determine the execution type based on the INIT_HANDLER environment variable.
         """
-        import os
-        init_handler = os.environ.get("INIT_HANDLER", "")
-        if not init_handler:
-            # INIT_HANDLER not set (e.g. agent runtime without handler) -> use FaasHandler (no-op)
+        init_handler = get_environment_variable(INIT_HANDLER)
+        try:
+            module_name, _ = init_handler.rsplit(".", 1)
+        except ValueError as err:
+            raise RuntimeError("Failed to parse INIT_HANDLER environment variable") from err
+
+        if module_name == ACTOR_HANDLER_MODULE_NAME:
+            handler = FunctionHandler()
+        elif module_name == FAAS_HANDLER_MODULE_NAME:
             handler = FaasHandler()
         else:
-            try:
-                module_name, _ = init_handler.rsplit(".", 1)
-            except ValueError as err:
-                raise RuntimeError("Failed to parse INIT_HANDLER environment variable") from err
-
-            if module_name == ACTOR_HANDLER_MODULE_NAME:
-                handler = FunctionHandler()
-            elif module_name == FAAS_HANDLER_MODULE_NAME:
-                handler = FaasHandler()
-            else:
-                handler = PosixHandler()
+            handler = PosixHandler()
 
         with _LOCK:
             global HANDLER

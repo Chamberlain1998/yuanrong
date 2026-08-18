@@ -35,14 +35,12 @@ class FaasHandler(HandlerIntf):
         pass
 
     def execute_function(self, func_meta, args: List, invoke_type, return_num: int, is_actor_async: bool):
-        """execute function
-
-        This handler is a no-op fallback used when INIT_HANDLER is not set (e.g. agent runtime
-        without handler). Agent instances run user code inside the docker container via the image's
-        own entrypoint, not through this execute_function path. The None result list with a
-        success ErrorInfo satisfies the caller's return-value contract without executing anything.
-        """
-        return [None] * max(return_num, 1), ErrorInfo()
+        """Reject execution through the generic handler interface."""
+        return [], ErrorInfo(
+            ErrorCode.ERR_EXTENSION_META_ERROR,
+            ModuleCode.RUNTIME,
+            "FaaS execution must use the FaaS invocation path",
+        )
 
     def shutdown(self, grace_period_second: int) -> ErrorInfo:
         """shutdown"""

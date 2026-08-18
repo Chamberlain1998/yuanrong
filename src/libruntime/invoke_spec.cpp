@@ -438,6 +438,10 @@ std::string InvokeSpec::BuildCreateMetaData(const LibruntimeConfig &config, std:
         for (const auto &path : this->opts.codePaths) {
             metaConfig->add_codepaths(path);
         }
+    } else if (config.funcMeta.apitype() == libruntime::ApiType::Faas) {
+        // FaaS code paths are handler entries rather than import paths. They belong to the
+        // current FaaS runtime and must not be propagated to child actor instances.
+        metaConfig->clear_codepaths();
     }
     if (!this->functionMeta.functionId.empty()) {
         bool isSetValue = false;
