@@ -14,22 +14,23 @@ openYuanrong 目前支持在 Linux x86_64 及 aarch64 (ARM) 上安装。不同�
 
 ```bash
 # 支持以下版本
-# openyuanrong-0.9.0-[py3-none/cp39-cp39/cp310-cp310/cp311-cp311]-manylinux_2_34_[x86_64/aarch64].whl
+# openyuanrong-0.10.0-[py3-none/cp39-cp39/cp310-cp310/cp311-cp311]-manylinux_2_34_[x86_64/aarch64].whl
 # 以在Python3.9及X86_64环境安装为例，最小安装包含以下whl包
-pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.9.0/openeuler/x86_64/openyuanrong-0.9.0-py3-none-manylinux_2_34_x86_64.whl
-pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.9.0/openeuler/x86_64/openyuanrong_runtime-0.9.0-cp39-cp39-manylinux_2_34_x86_64.whl
-pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.9.0/openeuler/x86_64/openyuanrong_datasystem-0.9.0-cp39-cp39-manylinux_2_34_x86_64.whl
-pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.9.0/openeuler/x86_64/openyuanrong_functionsystem-0.9.0-py3-none-manylinux_2_34_x86_64.whl
+pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.10.0/openeuler/x86_64/openyuanrong-0.10.0-py3-none-manylinux_2_34_x86_64.whl
+pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.10.0/openeuler/x86_64/openyuanrong_runtime-0.10.0-cp39-cp39-manylinux_2_34_x86_64.whl
+pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.10.0/openeuler/x86_64/openyuanrong_datasystem-0.10.0-cp39-cp39-manylinux_2_34_x86_64.whl
+pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.10.0/openeuler/x86_64/openyuanrong_functionsystem-0.10.0-py3-none-manylinux_2_34_x86_64.whl
 # 需要使用C++ SDK时安装
-pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.9.0/openeuler/x86_64/openyuanrong_cpp_sdk-0.9.0-cp39-cp39-manylinux_2_34_x86_64.whl
+pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.10.0/openeuler/x86_64/openyuanrong_cpp_sdk-0.10.0-cp39-cp39-manylinux_2_34_x86_64.whl
 # 需要开发函数服务时安装
-pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.9.0/openeuler/x86_64/openyuanrong_faas-0.9.0-cp39-cp39-manylinux_2_34_x86_64.whl
+pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.10.0/openeuler/x86_64/openyuanrong_faas-0.10.0-cp39-cp39-manylinux_2_34_x86_64.whl
 # 需要使用Dashboard能力时安装
-pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.9.0/openeuler/x86_64/openyuanrong_dashboard-0.9.0-cp39-cp39-manylinux_2_34_x86_64.whl
+pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.10.0/openeuler/x86_64/openyuanrong_dashboard-0.10.0-cp39-cp39-manylinux_2_34_x86_64.whl
 # 需要使用agentruntime能力时安装
-pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.9.0/openeuler/x86_64/openyuanrong_agentruntime-0.9.0-py3-none-any.whl
+pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.10.0/openeuler/x86_64/agent_dx_cli-0.10.0-py3-none-any.whl
+pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.10.0/openeuler/x86_64/agent_dx_sdk-0.10.0-py3-none-any.whl
 # 需要使用ray-adapter能力时安装
-pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.9.0/openeuler/x86_64/ray_adapter-0.9.0-py3-none-any.whl
+pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.10.0/openeuler/x86_64/ray_adapter-0.10.0-py3-none-any.whl
 ```
 
 ### 每日版本

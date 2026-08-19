@@ -45,11 +45,11 @@ To run the following examples, you need to install openYuanrong first, with the 
 - Run C++ examples: `gcc>=10.3.0 and stdc++>=14`.
 
 ```bash
-pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.9.0/openeuler/x86_64/openyuanrong-0.9.0-py3-none-manylinux_2_34_x86_64.whl
-pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.9.0/openeuler/x86_64/openyuanrong_runtime-0.9.0-cp39-cp39-manylinux_2_34_x86_64.whl
-pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.9.0/openeuler/x86_64/openyuanrong_datasystem-0.9.0-cp39-cp39-manylinux_2_34_x86_64.whl
-pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.9.0/openeuler/x86_64/openyuanrong_functionsystem-0.9.0-py3-none-manylinux_2_34_x86_64.whl
-pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.9.0/openeuler/x86_64/openyuanrong_cpp_sdk-0.9.0-cp39-cp39-manylinux_2_34_x86_64.whl
+pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.10.0/openeuler/x86_64/openyuanrong-0.10.0-py3-none-manylinux_2_34_x86_64.whl
+pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.10.0/openeuler/x86_64/openyuanrong_runtime-0.10.0-cp39-cp39-manylinux_2_34_x86_64.whl
+pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.10.0/openeuler/x86_64/openyuanrong_datasystem-0.10.0-cp39-cp39-manylinux_2_34_x86_64.whl
+pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.10.0/openeuler/x86_64/openyuanrong_functionsystem-0.10.0-py3-none-manylinux_2_34_x86_64.whl
+pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.10.0/openeuler/x86_64/openyuanrong_cpp_sdk-0.10.0-cp39-cp39-manylinux_2_34_x86_64.whl
 ```
 
 :::
@@ -205,11 +205,11 @@ To run the following examples, you need to install openYuanrong first, with the 
 - Run C++ examples: `gcc>=10.3.0 and stdc++>=14`.
 
 ```bash
-pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.9.0/openeuler/x86_64/openyuanrong-0.9.0-py3-none-manylinux_2_34_x86_64.whl
-pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.9.0/openeuler/x86_64/openyuanrong_runtime-0.9.0-cp39-cp39-manylinux_2_34_x86_64.whl
-pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.9.0/openeuler/x86_64/openyuanrong_datasystem-0.9.0-cp39-cp39-manylinux_2_34_x86_64.whl
-pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.9.0/openeuler/x86_64/openyuanrong_functionsystem-0.9.0-py3-none-manylinux_2_34_x86_64.whl
-pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.9.0/openeuler/x86_64/openyuanrong_cpp_sdk-0.9.0-cp39-cp39-manylinux_2_34_x86_64.whl
+pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.10.0/openeuler/x86_64/openyuanrong-0.10.0-py3-none-manylinux_2_34_x86_64.whl
+pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.10.0/openeuler/x86_64/openyuanrong_runtime-0.10.0-cp39-cp39-manylinux_2_34_x86_64.whl
+pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.10.0/openeuler/x86_64/openyuanrong_datasystem-0.10.0-cp39-cp39-manylinux_2_34_x86_64.whl
+pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.10.0/openeuler/x86_64/openyuanrong_functionsystem-0.10.0-py3-none-manylinux_2_34_x86_64.whl
+pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.10.0/openeuler/x86_64/openyuanrong_cpp_sdk-0.10.0-cp39-cp39-manylinux_2_34_x86_64.whl
 ```
 
 :::
@@ -427,12 +427,12 @@ To run the following examples, you need to install openYuanrong first, with the 
 - Run C++ examples: `gcc>=10.3.0 and stdc++>=14`.
 
 ```bash
-pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.9.0/openeuler/x86_64/openyuanrong-0.9.0-py3-none-manylinux_2_34_x86_64.whl
-pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.9.0/openeuler/x86_64/openyuanrong_runtime-0.9.0-cp39-cp39-manylinux_2_34_x86_64.whl
-pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.9.0/openeuler/x86_64/openyuanrong_datasystem-0.9.0-cp39-cp39-manylinux_2_34_x86_64.whl
-pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.9.0/openeuler/x86_64/openyuanrong_functionsystem-0.9.0-py3-none-manylinux_2_34_x86_64.whl
-pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.9.0/openeuler/x86_64/openyuanrong_cpp_sdk-0.9.0-cp39-cp39-manylinux_2_34_x86_64.whl
-pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.9.0/openeuler/x86_64/openyuanrong_faas-0.9.0-cp39-cp39-manylinux_2_34_x86_64.whl
+pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.10.0/openeuler/x86_64/openyuanrong-0.10.0-py3-none-manylinux_2_34_x86_64.whl
+pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.10.0/openeuler/x86_64/openyuanrong_runtime-0.10.0-cp39-cp39-manylinux_2_34_x86_64.whl
+pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.10.0/openeuler/x86_64/openyuanrong_datasystem-0.10.0-cp39-cp39-manylinux_2_34_x86_64.whl
+pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.10.0/openeuler/x86_64/openyuanrong_functionsystem-0.10.0-py3-none-manylinux_2_34_x86_64.whl
+pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.10.0/openeuler/x86_64/openyuanrong_cpp_sdk-0.10.0-cp39-cp39-manylinux_2_34_x86_64.whl
+pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.10.0/openeuler/x86_64/openyuanrong_faas-0.10.0-cp39-cp39-manylinux_2_34_x86_64.whl
 ```
 
 :::

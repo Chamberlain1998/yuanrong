@@ -140,7 +140,7 @@ html_theme_options = {
     "home_page_in_toc": True,
     "check_switcher": False,
     "announcement": (
-        "🚀 <b>openYuanrong v0.9.0</b> 已发布 — 新增企业级Agent分布式运行时"
+        "🚀 <b>openYuanrong v0.10.0</b> 已发布 — Agent 提供企业级语义一致的故障恢复和高并发能力"
         " &nbsp;·&nbsp; "
         "<a href='https://gitcode.com/openeuler/yuanrong/releases'>查看详情 →</a>"
         "<button type='button' id='close-banner' aria-label='关闭横幅'>&times;</button>"
