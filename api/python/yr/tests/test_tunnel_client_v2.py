@@ -19,6 +19,8 @@ from yr.sandbox.tunnel_protocol import (
     hello_frame,
 )
 
+_REQUEST_ID = "00112233-4455-6677-8899-aabbccddeeff"
+
 
 class _RecordingHandler(http.server.BaseHTTPRequestHandler):
     requests: ClassVar[list] = []
@@ -73,7 +75,7 @@ class _FrameWebSocket:
         self.incoming.put_nowait(frame)
 
     def close_input(self):
-        self.incoming.put_nowait(None)
+        self.feed(None)
 
 
 class TunnelClientV2Tests(unittest.IsolatedAsyncioTestCase):
@@ -106,18 +108,16 @@ class TunnelClientV2Tests(unittest.IsolatedAsyncioTestCase):
         response_hello = await asyncio.wait_for(websocket.sent.get(), timeout=2)
         self.assertEqual(response_hello["type"], "hello")
         self.assertEqual(response_hello["max_body_size"], 512 * 1024 * 1024)
-        return client, task
+        return task
 
     async def test_streams_request_and_response_with_credit_backpressure(self):
-        request_id = "00112233-4455-6677-8899-aabbccddeeff"
         payload = b"a" * 100_000
         websocket = _FrameWebSocket()
-        client, proxy_task = await self._start_v2(websocket)
-        del client
+        proxy_task = await self._start_v2(websocket)
         websocket.feed(
             {
                 "type": "http_req_begin",
-                "id": request_id,
+                "id": _REQUEST_ID,
                 "method": "POST",
                 "path": "/stream",
                 "headers": [["Content-Type", "application/octet-stream"]],
@@ -129,25 +129,25 @@ class TunnelClientV2Tests(unittest.IsolatedAsyncioTestCase):
             initial_window,
             {
                 "type": "window",
-                "id": request_id,
+                "id": _REQUEST_ID,
                 "credits": 16,
             },
         )
         websocket.feed(
             BinaryEnvelope(
-                request_id=request_id,
+                request_id=_REQUEST_ID,
                 kind=BinaryKind.HTTP_REQUEST_DATA,
                 payload=payload[:65536],
             ).encode()
         )
         websocket.feed(
             BinaryEnvelope(
-                request_id=request_id,
+                request_id=_REQUEST_ID,
                 kind=BinaryKind.HTTP_REQUEST_DATA,
                 payload=payload[65536:],
             ).encode()
         )
-        websocket.feed({"type": "http_req_end", "id": request_id})
+        websocket.feed({"type": "http_req_end", "id": _REQUEST_ID})
 
         returned_credits = 0
         while True:
@@ -159,27 +159,26 @@ class TunnelClientV2Tests(unittest.IsolatedAsyncioTestCase):
             returned_credits += frame["credits"]
         self.assertEqual(returned_credits, 2)
         self.assertEqual(response_begin["status"], 200)
-        websocket.feed({"type": "window", "id": request_id, "credits": 16})
+        websocket.feed({"type": "window", "id": _REQUEST_ID, "credits": 16})
         response_data = await asyncio.wait_for(websocket.sent.get(), timeout=2)
         envelope = BinaryEnvelope.decode(response_data)
         self.assertEqual(envelope.kind, BinaryKind.HTTP_RESPONSE_DATA)
         self.assertEqual(envelope.payload, b"ok")
         self.assertEqual(
             await asyncio.wait_for(websocket.sent.get(), timeout=2),
-            {"type": "http_resp_end", "id": request_id},
+            {"type": "http_resp_end", "id": _REQUEST_ID},
         )
         websocket.close_input()
         await asyncio.wait_for(proxy_task, timeout=2)
         self.assertEqual(_RecordingHandler.requests[-1][2], payload)
 
     async def test_peer_error_cancels_only_target_stream(self):
-        request_id = "00112233-4455-6677-8899-aabbccddeeff"
         websocket = _FrameWebSocket()
-        _, proxy_task = await self._start_v2(websocket)
+        proxy_task = await self._start_v2(websocket)
         websocket.feed(
             {
                 "type": "http_req_begin",
-                "id": request_id,
+                "id": _REQUEST_ID,
                 "method": "POST",
                 "path": "/stream",
                 "headers": [],
@@ -193,7 +192,7 @@ class TunnelClientV2Tests(unittest.IsolatedAsyncioTestCase):
         websocket.feed(
             {
                 "type": "error",
-                "id": request_id,
+                "id": _REQUEST_ID,
                 "message": "downstream closed",
             }
         )
@@ -205,7 +204,6 @@ class TunnelClientV2Tests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(proxy_task, timeout=2)
 
     async def test_binary_websocket_message_uses_bounded_raw_chunks(self):
-        request_id = "00112233-4455-6677-8899-aabbccddeeff"
         payload = b"z" * 100_000
 
         async def echo(upstream_websocket):
@@ -226,25 +224,25 @@ class TunnelClientV2Tests(unittest.IsolatedAsyncioTestCase):
             websocket.feed(
                 {
                     "type": "ws_connect",
-                    "id": request_id,
+                    "id": _REQUEST_ID,
                     "path": "/binary",
                     "headers": {},
                 }
             )
             self.assertEqual(
                 await asyncio.wait_for(websocket.sent.get(), timeout=2),
-                {"type": "ws_connected", "id": request_id},
+                {"type": "ws_connected", "id": _REQUEST_ID},
             )
             websocket.feed(
                 BinaryEnvelope(
-                    request_id=request_id,
+                    request_id=_REQUEST_ID,
                     kind=BinaryKind.WS_BINARY_DATA,
                     payload=payload[:65536],
                 ).encode()
             )
             websocket.feed(
                 BinaryEnvelope(
-                    request_id=request_id,
+                    request_id=_REQUEST_ID,
                     kind=BinaryKind.WS_BINARY_DATA,
                     payload=payload[65536:],
                     end_of_body=True,
@@ -263,7 +261,7 @@ class TunnelClientV2Tests(unittest.IsolatedAsyncioTestCase):
 
     async def test_malformed_binary_frame_terminates_and_cleans_tasks(self):
         websocket = _FrameWebSocket()
-        _, proxy_task = await self._start_v2(websocket)
+        proxy_task = await self._start_v2(websocket)
         websocket.feed(b"bad")
         with self.assertRaises(ProtocolError):
             await asyncio.wait_for(proxy_task, timeout=2)
