@@ -29,7 +29,7 @@ Options:
             if it is "multi", will compile python3.9 and python3.11.
             If it is not specified, python3.9 is compiled by default.
             for example bash build.sh -p multi; bash build.sh -p python3.11
-    -P download third party packages, default: true
+    -P package all build artifacts into release tarball and whl packages, default: false
     -S Use Google Sanitizers tools to detect bugs. Choose from off/address/thread,
            if set the value to 'address' enable AddressSanitizer,
            if set the value to 'thread' enable ThreadSanitizer,
