@@ -645,7 +645,7 @@ def invoke_function(function_name, payload, headers=None, user=None, timeout=30)
         jwt_token=__jwt_token,
         accept_status=(200, 202),  # Accept 202 for async invoke
     )
-    url = f"http://{__server_address}/invocations/{user}/{function_name.invocation_path()}"
+    url = f"http://{__server_address}/invocations/{user}/{function_name.invocation_path()}/"
     resp = http_client.request(url, payload, headers=headers, method="POST")
     if resp["success"]:
         return True, resp["data"]
