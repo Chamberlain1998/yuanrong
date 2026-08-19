@@ -277,13 +277,7 @@ class TunnelServer:
                     await self._dispatch_text(conn, message)
         except websockets.ConnectionClosed:
             logger.info("TunnelClient disconnected generation=%d", conn.generation)
-        except (
-            ProtocolError,
-            ValueError,
-            TypeError,
-            KeyError,
-            json.JSONDecodeError,
-        ) as exc:
+        except (ValueError, TypeError, KeyError) as exc:
             logger.warning("Closing malformed tunnel connection: %s", exc)
             with contextlib.suppress(Exception):
                 await websocket.close(code=1002, reason="invalid tunnel frame")
@@ -513,15 +507,15 @@ class TunnelServer:
             return
         raise ProtocolError(f"unexpected binary frame kind: {envelope.kind.name}")
 
+    @staticmethod
     def _grant_credits(
-        self,
         queue: asyncio.Queue,
-        credits: Any,
+        credit_count: Any,
         conn: _Connection,
     ) -> None:
-        if not isinstance(credits, int) or credits <= 0:
+        if not isinstance(credit_count, int) or credit_count <= 0:
             raise ProtocolError("window credits must be a positive integer")
-        for _ in range(min(credits, conn.protocol.stream_window)):
+        for _ in range(min(credit_count, conn.protocol.stream_window)):
             with contextlib.suppress(asyncio.QueueFull):
                 queue.put_nowait(None)
 

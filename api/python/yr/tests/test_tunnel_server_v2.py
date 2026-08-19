@@ -168,10 +168,10 @@ class TunnelServerV2Tests(unittest.IsolatedAsyncioTestCase):
                 )
                 initial_window = await _recv_json(websocket)
                 self.assertEqual(initial_window["type"], "window")
-                credits = initial_window["credits"]
+                remaining_credits = initial_window["credits"]
                 for offset in range(0, len(payload), 64 * 1024):
-                    if credits == 0:
-                        credits += (await _recv_json(websocket))["credits"]
+                    if remaining_credits == 0:
+                        remaining_credits += (await _recv_json(websocket))["credits"]
                     chunk = payload[offset : offset + 64 * 1024]
                     await websocket.send(
                         BinaryEnvelope(
@@ -180,7 +180,7 @@ class TunnelServerV2Tests(unittest.IsolatedAsyncioTestCase):
                             payload=chunk,
                         ).encode()
                     )
-                    credits -= 1
+                    remaining_credits -= 1
                 await websocket.send(
                     json.dumps(
                         {
