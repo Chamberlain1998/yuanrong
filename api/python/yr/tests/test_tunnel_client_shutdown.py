@@ -22,8 +22,7 @@ from pathlib import Path
 class TestTunnelClientShutdown(unittest.TestCase):
     def test_stop_does_not_leave_asyncio_shutdown_errors(self):
         sandbox_dir = Path(__file__).resolve().parents[1] / "sandbox"
-        script = textwrap.dedent(
-            f"""
+        script = textwrap.dedent(f"""
             import asyncio
             import importlib.util
             import pathlib
@@ -38,7 +37,9 @@ class TestTunnelClientShutdown(unittest.TestCase):
 
             for name in ['tunnel_protocol', 'tunnel_server', 'tunnel_client']:
                 path = root / f'{{name}}.py'
-                spec = importlib.util.spec_from_file_location(f'yr.sandbox.{{name}}', path)
+                spec = importlib.util.spec_from_file_location(
+                    f'yr.sandbox.{{name}}', path
+                )
                 mod = importlib.util.module_from_spec(spec)
                 sys.modules[f'yr.sandbox.{{name}}'] = mod
                 spec.loader.exec_module(mod)
@@ -63,12 +64,15 @@ class TestTunnelClientShutdown(unittest.TestCase):
                 await web.TCPSite(runner, '127.0.0.1', UPSTREAM_PORT).start()
 
                 client = TunnelClient(upstream=f'http://127.0.0.1:{{UPSTREAM_PORT}}')
-                client.start(f'ws://127.0.0.1:{{WS_PORT}}')
+                await asyncio.to_thread(
+                    client.start, f'ws://127.0.0.1:{{WS_PORT}}', 2
+                )
                 try:
                     await asyncio.sleep(1)
                     import aiohttp
                     async with aiohttp.ClientSession() as session:
-                        async with session.get(f'http://127.0.0.1:{{HTTP_PORT}}/ping') as resp:
+                        url = f'http://127.0.0.1:{{HTTP_PORT}}/ping'
+                        async with session.get(url) as resp:
                             body = await resp.read()
                             sys.stdout.write(f"{{resp.status}} {{body}}\\n")
                 finally:
@@ -77,8 +81,7 @@ class TestTunnelClientShutdown(unittest.TestCase):
                     await server.stop()
 
             asyncio.run(main())
-            """
-        )
+            """)
 
         result = subprocess.run(
             [sys.executable, "-c", script],

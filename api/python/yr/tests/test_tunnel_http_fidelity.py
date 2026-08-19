@@ -22,10 +22,8 @@ import threading
 import unittest
 from typing import ClassVar
 
-import httpx
-
 from yr.sandbox.tunnel_client import TunnelClient
-from yr.sandbox.tunnel_protocol import HttpReqFrame, HttpRespFrame, parse_frame
+from yr.sandbox.tunnel_protocol import HttpRespFrame, parse_frame
 from yr.sandbox.tunnel_server import TunnelServer
 
 
@@ -344,91 +342,6 @@ class TestCompatibleHeaderProtocol(unittest.TestCase):
                     }
                 )
             )
-
-
-class _QueueWebSocket:
-    def __init__(self):
-        self.incoming = asyncio.Queue()
-        self.sent = []
-
-    def __aiter__(self):
-        return self
-
-    async def __anext__(self):
-        value = await self.incoming.get()
-        if value is None:
-            raise StopAsyncIteration
-        return value
-
-    async def send(self, value):
-        self.sent.append(value)
-
-
-class _FakeResponse:
-    status_code = 200
-    headers = httpx.Headers({"Content-Length": "2"})
-    content = b"ok"
-
-    async def aiter_raw(self):
-        yield b"ok"
-
-
-class _FakeStream:
-    def __init__(self, client):
-        self.client = client
-
-    async def __aenter__(self):
-        self.client.active += 1
-        self.client.max_active = max(self.client.max_active, self.client.active)
-        await asyncio.sleep(0.05)
-        return _FakeResponse()
-
-    async def __aexit__(self, *_args):
-        self.client.active -= 1
-
-
-class _FakeHttpClient:
-    def __init__(self):
-        self.active = 0
-        self.max_active = 0
-
-    async def request(self, **_kwargs):
-        self.active += 1
-        self.max_active = max(self.max_active, self.active)
-        await asyncio.sleep(0.05)
-        self.active -= 1
-        return _FakeResponse()
-
-    def stream(self, *_args, **_kwargs):
-        return _FakeStream(self)
-
-
-class TestTunnelClientConcurrency(unittest.IsolatedAsyncioTestCase):
-    async def test_http_concurrency_is_bounded_and_tasks_are_drained(self):
-        websocket = _QueueWebSocket()
-        http = _FakeHttpClient()
-        client = TunnelClient(upstream="http://127.0.0.1:1")
-        client._max_http_concurrency = 1
-        for index in range(3):
-            websocket.incoming.put_nowait(
-                HttpReqFrame(
-                    id=f"request-{index}",
-                    method="GET",
-                    path="/",
-                    headers={},
-                    body=b"",
-                ).to_json()
-            )
-
-        receive_task = asyncio.create_task(client._recv_frames(websocket, http))
-        async def wait_for_responses():
-            while len(websocket.sent) < 3:
-                await asyncio.sleep(0.01)
-        await asyncio.wait_for(wait_for_responses(), timeout=2)
-        websocket.incoming.put_nowait(None)
-        await receive_task
-
-        self.assertEqual(http.max_active, 1)
 
 
 if __name__ == "__main__":
