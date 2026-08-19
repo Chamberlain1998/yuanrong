@@ -14,14 +14,16 @@
 
 # api/python/yr/tests/test_tunnel_integration.py
 """End-to-end: TunnelServer (in sandbox) + TunnelClient (local) + mock upstream."""
+
 import asyncio
 import threading
 import unittest
 from unittest import mock
-from aiohttp import web
+
 import websockets
-from yr.sandbox.tunnel_server import TunnelServer
+from aiohttp import web
 from yr.sandbox.tunnel_client import TunnelClient
+from yr.sandbox.tunnel_server import TunnelServer
 
 SRV_WS_PORT = 38765
 SRV_HTTP_PORT = 38766
@@ -48,26 +50,34 @@ class TestIntegration(unittest.TestCase):
     def tearDown(self):
         # Properly close server sockets before stopping the loop so ports are
         # released immediately and the next test can bind to the same ports.
-        stop_fut = asyncio.run_coroutine_threadsafe(self._server.stop(), self._server_loop)
+        stop_fut = asyncio.run_coroutine_threadsafe(
+            self._server.stop(), self._server_loop
+        )
         stop_fut.result(timeout=5)
         self._server_loop.call_soon_threadsafe(self._server_loop.stop)
         self._server_thread.join(timeout=5)
+        self._server_loop.close()
 
     def test_http_get_roundtrip_through_tunnel(self):
-        """Full roundtrip: Port B HTTP GET → WS tunnel → TunnelClient → mock upstream → response."""
+        """Round-trip Port B HTTP through TunnelClient to the mock upstream."""
         import time
 
         async def handler(request):
-            return web.Response(status=200, body=b"hello-from-c",
-                                headers={"Content-Type": "text/plain"})
+            return web.Response(
+                status=200, body=b"hello-from-c", headers={"Content-Type": "text/plain"}
+            )
+
         app = web.Application()
         app.router.add_route("GET", "/ping", handler)
         upstream_runner = self._start_upstream(app)
 
         async def _fetch_via_portb():
             import aiohttp
+
             async with aiohttp.ClientSession() as session:
-                async with session.get(f"http://127.0.0.1:{SRV_HTTP_PORT}/ping") as resp:
+                async with session.get(
+                    f"http://127.0.0.1:{SRV_HTTP_PORT}/ping"
+                ) as resp:
                     return resp.status, await resp.read()
 
         try:
@@ -83,22 +93,29 @@ class TestIntegration(unittest.TestCase):
             self._stop_upstream(upstream_runner)
 
     def test_large_http_response_roundtrip_through_tunnel(self):
-        """HTTP responses larger than websockets' default 1 MiB frame limit should pass."""
+        """Pass HTTP responses larger than the default 1 MiB WS frame."""
         import time
 
         large_body = b"x" * (2 << 20)
 
         async def handler(request):
-            return web.Response(status=200, body=large_body,
-                                headers={"Content-Type": "application/octet-stream"})
+            return web.Response(
+                status=200,
+                body=large_body,
+                headers={"Content-Type": "application/octet-stream"},
+            )
+
         app = web.Application()
         app.router.add_route("GET", "/large", handler)
         upstream_runner = self._start_upstream(app)
 
         async def _fetch_via_portb():
             import aiohttp
+
             async with aiohttp.ClientSession() as session:
-                async with session.get(f"http://127.0.0.1:{SRV_HTTP_PORT}/large") as resp:
+                async with session.get(
+                    f"http://127.0.0.1:{SRV_HTTP_PORT}/large"
+                ) as resp:
                     return resp.status, await resp.read()
 
         try:
@@ -116,17 +133,20 @@ class TestIntegration(unittest.TestCase):
     def test_http_post_with_body_roundtrip(self):
         """POST with body is forwarded and body reaches upstream."""
         import time
+
         received_body = {}
 
         async def handler(request):
             received_body["data"] = await request.read()
             return web.Response(status=201, body=b"created")
+
         app = web.Application()
         app.router.add_route("POST", "/items", handler)
         upstream_runner = self._start_upstream(app)
 
         async def _post_via_portb():
             import aiohttp
+
             async with aiohttp.ClientSession() as session:
                 async with session.post(
                     f"http://127.0.0.1:{SRV_HTTP_PORT}/items",
@@ -148,7 +168,7 @@ class TestIntegration(unittest.TestCase):
             self._stop_upstream(upstream_runner)
 
     def test_ws_message_relay_through_tunnel(self):
-        """WebSocket messages are relayed end-to-end: Port B client ↔ upstream WS server."""
+        """Relay WebSocket messages between Port B and the upstream server."""
         import time
 
         async def ws_handler(request):
@@ -158,6 +178,7 @@ class TestIntegration(unittest.TestCase):
                 if msg.type == web.WSMsgType.TEXT:
                     await ws.send_str(f"echo:{msg.data}")
             return ws
+
         app = web.Application()
         app.router.add_route("GET", "/ws", ws_handler)
         upstream_runner = self._start_upstream(app)
@@ -179,7 +200,6 @@ class TestIntegration(unittest.TestCase):
             client.stop()
             self._stop_upstream(upstream_runner)
 
-
     def test_concurrent_http_requests(self):
         """Multiple HTTP requests in parallel are all handled correctly."""
         import time
@@ -194,6 +214,7 @@ class TestIntegration(unittest.TestCase):
 
         async def _fetch_all():
             import aiohttp
+
             async with aiohttp.ClientSession() as session:
                 tasks = [
                     session.get(f"http://127.0.0.1:{SRV_HTTP_PORT}/item/{i}")
@@ -235,13 +256,16 @@ class TestIntegration(unittest.TestCase):
         7. Verify tunnel recovers (HTTP roundtrip succeeds again)
         """
         # Stop the server started by setUp so we can manage our own lifecycle.
-        stop_fut = asyncio.run_coroutine_threadsafe(self._server.stop(), self._server_loop)
+        stop_fut = asyncio.run_coroutine_threadsafe(
+            self._server.stop(), self._server_loop
+        )
         stop_fut.result(timeout=5)
 
         async def _run():
             # Start mock upstream HTTP service
             async def upstream_handler(request):
                 return web.Response(status=200, body=b"ok")
+
             upstream_app = web.Application()
             upstream_app.router.add_route("*", "/{path_info:.*}", upstream_handler)
             upstream_runner = web.AppRunner(upstream_app)
@@ -268,8 +292,11 @@ class TestIntegration(unittest.TestCase):
 
                 # Verify tunnel works: send HTTP request through tunnel
                 import aiohttp
+
                 async with aiohttp.ClientSession() as session:
-                    async with session.get(f"http://127.0.0.1:{SRV_HTTP_PORT}/test") as resp:
+                    async with session.get(
+                        f"http://127.0.0.1:{SRV_HTTP_PORT}/test"
+                    ) as resp:
                         self.assertEqual(resp.status, 200)
                         body = await resp.read()
                         self.assertEqual(body, b"ok")
@@ -286,7 +313,9 @@ class TestIntegration(unittest.TestCase):
 
                 # Verify tunnel recovers: HTTP request should work again
                 async with aiohttp.ClientSession() as session:
-                    async with session.get(f"http://127.0.0.1:{SRV_HTTP_PORT}/test2") as resp:
+                    async with session.get(
+                        f"http://127.0.0.1:{SRV_HTTP_PORT}/test2"
+                    ) as resp:
                         self.assertEqual(resp.status, 200)
                         body = await resp.read()
                         self.assertEqual(body, b"ok")
@@ -389,18 +418,30 @@ class TestIntegration(unittest.TestCase):
             def get(url):
                 return _FakeRequestContext()
 
+        real_server = self._server
+        real_server_loop = self._server_loop
         self._server = _FakeExistingServer()
         self._server_loop = object()
-
-        with mock.patch(__name__ + ".TunnelServer", _FakeTunnelServer), \
-             mock.patch(__name__ + ".TunnelClient", _FakeTunnelClient), \
-             mock.patch(__name__ + ".web.AppRunner", side_effect=lambda app: _FakeRunner()), \
-             mock.patch(__name__ + ".web.TCPSite", _FakeTCPSite), \
-             mock.patch(__name__ + ".asyncio.run_coroutine_threadsafe", side_effect=_run_coroutine_threadsafe), \
-             mock.patch(__name__ + ".asyncio.sleep", new=mock.AsyncMock()), \
-             mock.patch("aiohttp.ClientSession", _FakeClientSession):
-            with self.assertRaisesRegex(RuntimeError, "restart failed"):
-                self.test_tunnel_reconnects_after_server_restart()
+        try:
+            with mock.patch(__name__ + ".TunnelServer", _FakeTunnelServer), mock.patch(
+                __name__ + ".TunnelClient", _FakeTunnelClient
+            ), mock.patch(
+                __name__ + ".web.AppRunner", side_effect=lambda app: _FakeRunner()
+            ), mock.patch(
+                __name__ + ".web.TCPSite", _FakeTCPSite
+            ), mock.patch(
+                __name__ + ".asyncio.run_coroutine_threadsafe",
+                side_effect=_run_coroutine_threadsafe,
+            ), mock.patch(
+                __name__ + ".asyncio.sleep", new=mock.AsyncMock()
+            ), mock.patch(
+                "aiohttp.ClientSession", _FakeClientSession
+            ):
+                with self.assertRaisesRegex(RuntimeError, "restart failed"):
+                    self.test_tunnel_reconnects_after_server_restart()
+        finally:
+            self._server = real_server
+            self._server_loop = real_server_loop
 
         self.assertTrue(cleanup["client_stopped"])
         self.assertTrue(cleanup["upstream_cleaned"])
@@ -408,7 +449,6 @@ class TestIntegration(unittest.TestCase):
     def test_ws_channel_cleanup_on_client_disconnect(self):
         """WS channel is removed from _ws_channels when client disconnects."""
         import time
-        from yr.sandbox.tunnel_protocol import WsConnectFrame, make_id
 
         async def ws_handler(request):
             ws = web.WebSocketResponse()
@@ -422,7 +462,7 @@ class TestIntegration(unittest.TestCase):
         upstream_runner = self._start_upstream(app)
 
         async def _connect_and_disconnect():
-            async with websockets.connect(f"ws://127.0.0.1:{SRV_HTTP_PORT}/ws") as ws:
+            async with websockets.connect(f"ws://127.0.0.1:{SRV_HTTP_PORT}/ws"):
                 await asyncio.sleep(0.1)
                 # connection opens and closes
             await asyncio.sleep(0.2)
@@ -442,15 +482,21 @@ class TestIntegration(unittest.TestCase):
 
     def _start_upstream(self, app: web.Application) -> web.AppRunner:
         """Start an aiohttp app on UPSTREAM_PORT inside the shared server loop."""
+
         async def _start():
             runner = web.AppRunner(app)
             await runner.setup()
             await web.TCPSite(runner, "127.0.0.1", UPSTREAM_PORT).start()
             return runner
-        return asyncio.run_coroutine_threadsafe(_start(), self._server_loop).result(timeout=5)
+
+        return asyncio.run_coroutine_threadsafe(_start(), self._server_loop).result(
+            timeout=5
+        )
 
     def _stop_upstream(self, runner: web.AppRunner) -> None:
-        asyncio.run_coroutine_threadsafe(runner.cleanup(), self._server_loop).result(timeout=5)
+        asyncio.run_coroutine_threadsafe(runner.cleanup(), self._server_loop).result(
+            timeout=5
+        )
 
 
 if __name__ == "__main__":

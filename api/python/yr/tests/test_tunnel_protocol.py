@@ -16,19 +16,33 @@
 import base64
 import json
 import unittest
+
 from yr.sandbox.tunnel_protocol import (
     MAX_TUNNEL_FRAME_SIZE,
-    HttpReqFrame, HttpRespFrame,
-    WsConnectFrame, WsConnectedFrame, WsMessageFrame, WsCloseFrame, ErrorFrame,
-    PingFrame, PongFrame,
-    parse_frame, make_id,
+    BinaryEnvelope,
+    BinaryKind,
+    ErrorFrame,
+    HttpReqFrame,
+    HttpRespFrame,
+    PingFrame,
+    PongFrame,
+    ProtocolError,
+    WsCloseFrame,
+    WsConnectedFrame,
+    WsConnectFrame,
+    WsMessageFrame,
+    hello_frame,
+    make_id,
+    parse_frame,
 )
 
 
 class TestHttpFrames(unittest.TestCase):
     def test_http_req_roundtrip(self):
         frame = HttpReqFrame(
-            id="id-1", method="POST", path="/api/data",
+            id="id-1",
+            method="POST",
+            path="/api/data",
             headers={"Content-Type": "application/json"},
             body=b'{"key": "val"}',
         )
@@ -42,7 +56,9 @@ class TestHttpFrames(unittest.TestCase):
         self.assertEqual(parsed.body, b'{"key": "val"}')
 
     def test_http_resp_roundtrip(self):
-        frame = HttpRespFrame(id="id-2", status=200, headers={"X-Foo": "bar"}, body=b"hello")
+        frame = HttpRespFrame(
+            id="id-2", status=200, headers={"X-Foo": "bar"}, body=b"hello"
+        )
         parsed = parse_frame(frame.to_json())
         self.assertIsInstance(parsed, HttpRespFrame)
         self.assertEqual(parsed.status, 200)
@@ -64,51 +80,69 @@ class TestHttpFrames(unittest.TestCase):
         self.assertEqual(parsed.body, b"")
 
     def test_body_is_base64_in_json(self):
-        frame = HttpReqFrame(id="x", method="GET", path="/", headers={}, body=b"\x00\x01\x02")
+        frame = HttpReqFrame(
+            id="x", method="GET", path="/", headers={}, body=b"\x00\x01\x02"
+        )
         data = json.loads(frame.to_json())
         self.assertEqual(base64.b64decode(data["body"]), b"\x00\x01\x02")
 
     def test_http_req_null_body_parses_as_empty_bytes(self):
-        parsed = parse_frame(json.dumps({
-            "type": "http_req",
-            "id": "id-4",
-            "method": "GET",
-            "path": "/",
-            "headers": {},
-            "body": None,
-        }))
+        parsed = parse_frame(
+            json.dumps(
+                {
+                    "type": "http_req",
+                    "id": "id-4",
+                    "method": "GET",
+                    "path": "/",
+                    "headers": {},
+                    "body": None,
+                }
+            )
+        )
         self.assertEqual(parsed.body, b"")
 
     def test_http_resp_null_body_parses_as_empty_bytes(self):
-        parsed = parse_frame(json.dumps({
-            "type": "http_resp",
-            "id": "id-5",
-            "status": 204,
-            "headers": {},
-            "body": None,
-        }))
+        parsed = parse_frame(
+            json.dumps(
+                {
+                    "type": "http_resp",
+                    "id": "id-5",
+                    "status": 204,
+                    "headers": {},
+                    "body": None,
+                }
+            )
+        )
         self.assertEqual(parsed.body, b"")
 
     def test_http_req_invalid_method_raises(self):
         with self.assertRaises(ValueError):
-            parse_frame(json.dumps({
-                "type": "http_req",
-                "id": "id-6",
-                "method": "GET /bad",
-                "path": "/",
-                "headers": {},
-                "body": "",
-            }))
+            parse_frame(
+                json.dumps(
+                    {
+                        "type": "http_req",
+                        "id": "id-6",
+                        "method": "GET /bad",
+                        "path": "/",
+                        "headers": {},
+                        "body": "",
+                    }
+                )
+            )
 
     def test_http_resp_invalid_status_raises(self):
         with self.assertRaises(ValueError):
-            parse_frame(json.dumps({
-                "type": "http_resp",
-                "id": "id-7",
-                "status": 99,
-                "headers": {},
-                "body": "",
-            }))
+            parse_frame(
+                json.dumps(
+                    {
+                        "type": "http_resp",
+                        "id": "id-7",
+                        "status": 99,
+                        "headers": {},
+                        "body": "",
+                    }
+                )
+            )
 
 
 class TestWsFrames(unittest.TestCase):
@@ -140,12 +174,16 @@ class TestWsFrames(unittest.TestCase):
 
     def test_ws_close_invalid_code_raises(self):
         with self.assertRaises(ValueError):
-            parse_frame(json.dumps({
-                "type": "ws_close",
-                "id": "c2",
-                "code": 999,
-                "reason": "bad",
-            }))
+            parse_frame(
+                json.dumps(
+                    {
+                        "type": "ws_close",
+                        "id": "c2",
+                        "code": 999,
+                        "reason": "bad",
+                    }
+                )
+            )
 
     def test_error_roundtrip(self):
         frame = ErrorFrame(id="e1", message="connection refused")
@@ -183,6 +221,42 @@ class TestMakeId(unittest.TestCase):
 
     def test_make_id_is_string(self):
         self.assertIsInstance(make_id(), str)
+
+
+class TestStreamingProtocol(unittest.TestCase):
+    def test_binary_envelope_roundtrip(self):
+        request_id = "00112233-4455-6677-8899-aabbccddeeff"
+        encoded = BinaryEnvelope(
+            request_id=request_id,
+            kind=BinaryKind.HTTP_REQUEST_DATA,
+            payload=b"chunk",
+            end_of_body=True,
+        ).encode()
+
+        decoded = BinaryEnvelope.decode(encoded)
+        self.assertEqual(decoded.request_id, request_id)
+        self.assertEqual(decoded.kind, BinaryKind.HTTP_REQUEST_DATA)
+        self.assertEqual(decoded.payload, b"chunk")
+        self.assertTrue(decoded.end_of_body)
+
+    def test_binary_envelope_rejects_malformed_and_oversized_data(self):
+        request_id = "00112233-4455-6677-8899-aabbccddeeff"
+        with self.assertRaises(ProtocolError):
+            BinaryEnvelope.decode(b"bad")
+        with self.assertRaises(ProtocolError):
+            BinaryEnvelope(
+                request_id=request_id,
+                kind=BinaryKind.HTTP_RESPONSE_DATA,
+                payload=b"too large",
+            ).encode(max_payload=1)
+
+    def test_default_hello_advertises_independent_http_and_ws_limits(self):
+        hello = hello_frame()
+        self.assertEqual(hello["protocol_version"], 2)
+        self.assertEqual(hello["max_stream_chunk"], 64 * 1024)
+        self.assertEqual(hello["stream_window_frames"], 16)
+        self.assertEqual(hello["max_body_size"], 512 * 1024 * 1024)
+        self.assertEqual(hello["max_ws_message_size"], 8 * 1024 * 1024)
 
 
 if __name__ == "__main__":

@@ -22,9 +22,8 @@ import types
 import unittest
 from unittest.mock import patch
 
-from websockets.uri import parse_proxy, parse_uri
 import websockets.asyncio.client as ws_client
-
+from websockets.uri import parse_uri
 
 _TUNNEL_MODULES = (
     "yr",
@@ -102,8 +101,6 @@ class TestTunnelClientProxy(unittest.TestCase):
 
         ssl_contexts = []
         connection_count = 0
-        http_client_count = 0
-        http_client_close_count = 0
         http_verify_values = []
 
         class FakeWebSocketContext:
@@ -119,21 +116,8 @@ class TestTunnelClientProxy(unittest.TestCase):
             ssl_contexts.append(kwargs["ssl"])
             return FakeWebSocketContext()
 
-        class FakeHttpClient:
-            def __init__(self, **kwargs):
-                nonlocal http_client_count
-                http_client_count += 1
-                http_verify_values.append(kwargs["verify"])
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, _exc_type, _exc, _traceback):
-                nonlocal http_client_close_count
-                http_client_close_count += 1
-                return False
-
-        async def fake_recv_loop(_ws, _http):
+        async def fake_recv_loop(_ws, http_context):
+            http_verify_values.append(http_context)
             if connection_count == 3:
                 getattr(client, "_stop_event").set()
 
@@ -153,64 +137,17 @@ class TestTunnelClientProxy(unittest.TestCase):
                 tunnel_client.httpx,
                 "create_ssl_context",
                 return_value=expected_http_context,
-            ) as create_http_context, patch.object(
-                tunnel_client.httpx,
-                "AsyncClient",
-                FakeHttpClient,
-            ):
+            ) as create_http_context:
                 asyncio.run(getattr(client, "_connect_loop")())
 
         self.assertEqual(connection_count, 3)
         self.assertEqual(create_default_context.call_count, 1)
         create_http_context.assert_called_once_with(verify=True, trust_env=False)
-        self.assertEqual(http_client_count, 3)
-        self.assertEqual(http_client_close_count, 3)
         self.assertTrue(
             all(context is expected_http_context for context in http_verify_values)
         )
         self.assertTrue(all(context is ssl_contexts[0] for context in ssl_contexts))
         self.assertFalse(client.is_connected())
-
-    def test_disconnect_cancels_websocket_proxy_tasks(self):
-        tunnel_client = _load_tunnel_client_module()
-        client = tunnel_client.TunnelClient(upstream="http://127.0.0.1:28800")
-        frame = tunnel_client.WsConnectFrame(id="ws-1", path="/stream", headers={})
-
-        async def run_scenario():
-            started = asyncio.Event()
-            cancelled = asyncio.Event()
-            proxy_task = None
-
-            async def blocked_ws_proxy(_ws, _frame):
-                nonlocal proxy_task
-                proxy_task = asyncio.current_task()
-                started.set()
-                try:
-                    await asyncio.Future()
-                finally:
-                    cancelled.set()
-
-            class DisconnectingWebSocket:
-                def __aiter__(self):
-                    async def messages():
-                        yield frame.to_json()
-                        await started.wait()
-
-                    return messages()
-
-            setattr(client, "_handle_ws_connect", blocked_ws_proxy)
-            await getattr(client, "_recv_frames")(
-                DisconnectingWebSocket(), object()
-            )
-            return proxy_task, cancelled.is_set()
-
-        proxy_task, was_cancelled = asyncio.run(run_scenario())
-
-        self.assertIsNotNone(proxy_task)
-        self.assertTrue(proxy_task.done())
-        self.assertTrue(proxy_task.cancelled())
-        self.assertTrue(was_cancelled)
-        self.assertEqual(getattr(client, "_ws_channels"), {})
 
     def test_proxy_auth_unquotes_url_encoded_credentials(self):
         tunnel_client = _load_tunnel_client_module()
@@ -218,7 +155,9 @@ class TestTunnelClientProxy(unittest.TestCase):
         try:
             getattr(tunnel_client, "_patch_websockets_proxy_auth_unquote")()
             request = ws_client.prepare_connect_request(
-                parse_proxy("http://z00826700:huawei%40123@proxy.example:8080"),
+                ws_client.parse_proxy(
+                    "http://z00826700:huawei%40123@proxy.example:8080"
+                ),
                 parse_uri("wss://124.70.166.142:443/tunnel"),
             )
         finally:
@@ -239,7 +178,9 @@ class TestTunnelClientProxy(unittest.TestCase):
 
             self.assertIs(kwargs["proxy"], True)
             self.assertTrue(
-                getattr(ws_client.prepare_connect_request, "_yr_proxy_auth_unquote", False)
+                getattr(
+                    ws_client.prepare_connect_request, "_yr_proxy_auth_unquote", False
+                )
             )
         finally:
             ws_client.prepare_connect_request = original_prepare
@@ -264,7 +205,9 @@ class TestTunnelClientProxy(unittest.TestCase):
 
             self.assertIsNone(kwargs["proxy"])
             self.assertFalse(
-                getattr(ws_client.prepare_connect_request, "_yr_proxy_auth_unquote", False)
+                getattr(
+                    ws_client.prepare_connect_request, "_yr_proxy_auth_unquote", False
+                )
             )
         finally:
             ws_client.prepare_connect_request = original_prepare

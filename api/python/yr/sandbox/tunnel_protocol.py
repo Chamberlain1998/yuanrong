@@ -13,34 +13,52 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Wire protocol frames for the sandbox reverse tunnel."""
+
 import base64
 import json
 import os
 import re
+import struct
 import uuid
 from dataclasses import dataclass, field
+from enum import IntEnum
 from typing import Dict, List, Optional, Tuple
 
-
 _HTTP_METHOD_RE = re.compile(r"^[A-Z]+$")
-_DEFAULT_MAX_BODY_SIZE = 256 << 20   # 256 MB
-_DEFAULT_MAX_FRAME_SIZE = 384 << 20  # Allows 256 MB base64 bodies plus JSON overhead.
+PROTOCOL_VERSION = 2
+BINARY_ENVELOPE_VERSION = 1
+BINARY_MAGIC = b"YD"
+DEFAULT_STREAM_CHUNK_BYTES = 64 * 1024
+MIN_STREAM_CHUNK_BYTES = 1024
+DEFAULT_FAST_PATH_BODY_BYTES = 64 * 1024
+DEFAULT_MAX_INFLIGHT = 16
+DEFAULT_STREAM_WINDOW_FRAMES = 16
+DEFAULT_MAX_BODY_BYTES = 512 * 1024 * 1024
+DEFAULT_MAX_WS_MESSAGE_BYTES = 8 * 1024 * 1024
+MAX_V1_BODY_BYTES = 5 * 1024 * 1024
+_DEFAULT_MAX_BODY_SIZE = DEFAULT_MAX_BODY_BYTES
+_DEFAULT_MAX_FRAME_SIZE = 8 * 1024 * 1024
 _CRLF_RE = re.compile(r"[\r\n]")
 _PATH_TRAVERSAL_RE = re.compile(r"(?:^|/)\.\.(?:/|$)")
 _HEADER_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
+_END_OF_BODY = 0x01
+_UUID_BYTES = 16
+_BINARY_HEADER = struct.Struct("!2sBBB16sBI")
 
 HeaderItems = List[Tuple[str, str]]
-HOP_BY_HOP_HEADERS = frozenset({
-    "connection",
-    "keep-alive",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "proxy-connection",
-    "te",
-    "trailer",
-    "transfer-encoding",
-    "upgrade",
-})
+HOP_BY_HOP_HEADERS = frozenset(
+    {
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "proxy-connection",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    }
+)
 
 
 def _read_size_env(name: str, default: int) -> int:
@@ -52,9 +70,128 @@ def _read_size_env(name: str, default: int) -> int:
 
 
 MAX_TUNNEL_BODY_SIZE = _read_size_env("YR_TUNNEL_MAX_BODY_SIZE", _DEFAULT_MAX_BODY_SIZE)
-MAX_TUNNEL_FRAME_SIZE = _read_size_env("YR_TUNNEL_MAX_FRAME_SIZE", _DEFAULT_MAX_FRAME_SIZE)
+MAX_TUNNEL_FRAME_SIZE = _read_size_env(
+    "YR_TUNNEL_MAX_FRAME_SIZE", _DEFAULT_MAX_FRAME_SIZE
+)
 _MAX_BODY_SIZE = MAX_TUNNEL_BODY_SIZE
 _MAX_FRAME_SIZE = MAX_TUNNEL_FRAME_SIZE
+
+
+class ProtocolError(ValueError):
+    """Raised when a tunnel frame violates the negotiated protocol."""
+
+
+class BinaryKind(IntEnum):
+    HTTP_REQUEST_DATA = 0x01
+    HTTP_RESPONSE_DATA = 0x02
+    WS_BINARY_DATA = 0x03
+
+
+@dataclass(frozen=True)
+class BinaryEnvelope:
+    """Compact V2 envelope used for bounded binary body chunks."""
+
+    request_id: str
+    kind: BinaryKind
+    payload: bytes
+    end_of_body: bool = False
+
+    def encode(self, max_payload: int = DEFAULT_STREAM_CHUNK_BYTES) -> bytes:
+        if len(self.payload) > max_payload:
+            raise ProtocolError(
+                "binary payload exceeds negotiated chunk limit: "
+                f"{len(self.payload)} > {max_payload}"
+            )
+        try:
+            request_uuid = uuid.UUID(self.request_id)
+        except (ValueError, AttributeError) as exc:
+            raise ProtocolError("binary envelope id must be a UUID") from exc
+        flags = _END_OF_BODY if self.end_of_body else 0
+        return (
+            _BINARY_HEADER.pack(
+                BINARY_MAGIC,
+                BINARY_ENVELOPE_VERSION,
+                int(self.kind),
+                _UUID_BYTES,
+                request_uuid.bytes,
+                flags,
+                len(self.payload),
+            )
+            + self.payload
+        )
+
+    @classmethod
+    def decode(
+        cls,
+        raw: bytes,
+        max_payload: int = DEFAULT_STREAM_CHUNK_BYTES,
+    ) -> "BinaryEnvelope":
+        if len(raw) < _BINARY_HEADER.size:
+            raise ProtocolError("binary envelope is shorter than its header")
+        magic, version, kind, id_length, raw_id, flags, payload_length = (
+            _BINARY_HEADER.unpack_from(raw)
+        )
+        if magic != BINARY_MAGIC:
+            raise ProtocolError("invalid binary envelope magic")
+        if version != BINARY_ENVELOPE_VERSION:
+            raise ProtocolError(f"unsupported binary envelope version: {version}")
+        if id_length != _UUID_BYTES:
+            raise ProtocolError(f"invalid binary envelope UUID length: {id_length}")
+        try:
+            binary_kind = BinaryKind(kind)
+        except ValueError as exc:
+            raise ProtocolError(f"unknown binary envelope kind: {kind}") from exc
+        if flags & ~_END_OF_BODY:
+            raise ProtocolError(f"unknown binary envelope flags: {flags:#x}")
+        if payload_length > max_payload:
+            raise ProtocolError(
+                "binary payload exceeds negotiated chunk limit: "
+                f"{payload_length} > {max_payload}"
+            )
+        payload = raw[_BINARY_HEADER.size :]
+        if len(payload) != payload_length:
+            raise ProtocolError(
+                f"binary payload length mismatch: {len(payload)} != {payload_length}"
+            )
+        return cls(
+            request_id=str(uuid.UUID(bytes=raw_id)),
+            kind=binary_kind,
+            payload=payload,
+            end_of_body=bool(flags & _END_OF_BODY),
+        )
+
+
+def hello_frame(
+    *,
+    protocol_version: int = PROTOCOL_VERSION,
+    max_stream_chunk: int = DEFAULT_STREAM_CHUNK_BYTES,
+    max_inflight: int = DEFAULT_MAX_INFLIGHT,
+    stream_window_frames: int = DEFAULT_STREAM_WINDOW_FRAMES,
+    max_body_size: int = DEFAULT_MAX_BODY_BYTES,
+    max_ws_message_size: int = DEFAULT_MAX_WS_MESSAGE_BYTES,
+) -> dict:
+    """Build and validate the V2 capability advertisement."""
+    if protocol_version <= 0:
+        raise ValueError("protocol_version must be greater than zero")
+    if max_stream_chunk < MIN_STREAM_CHUNK_BYTES:
+        raise ValueError("max_stream_chunk must be at least 1024 bytes")
+    if max_inflight <= 0:
+        raise ValueError("max_inflight must be greater than zero")
+    if stream_window_frames <= 0:
+        raise ValueError("stream_window_frames must be greater than zero")
+    if max_body_size <= 0:
+        raise ValueError("max_body_size must be greater than zero")
+    if max_ws_message_size <= 0:
+        raise ValueError("max_ws_message_size must be greater than zero")
+    return {
+        "type": "hello",
+        "protocol_version": protocol_version,
+        "max_stream_chunk": max_stream_chunk,
+        "max_inflight": max_inflight,
+        "stream_window_frames": stream_window_frames,
+        "max_body_size": max_body_size,
+        "max_ws_message_size": max_ws_message_size,
+    }
 
 
 def _validate_path(path: str) -> str:
@@ -129,14 +266,10 @@ def filter_hop_by_hop_header_items(
         for token in value.split(",")
         if token.strip()
     }
-    blocked = HOP_BY_HOP_HEADERS | connection_tokens | {
-        name.lower() for name in excluded
-    }
-    return [
-        (name, value)
-        for name, value in items
-        if name.lower() not in blocked
-    ]
+    blocked = (
+        HOP_BY_HOP_HEADERS | connection_tokens | {name.lower() for name in excluded}
+    )
+    return [(name, value) for name, value in items if name.lower() not in blocked]
 
 
 def rebuilt_request_header_items(
@@ -161,9 +294,7 @@ def rebuilt_response_header_items(
     """Build downstream response headers from actual response bytes."""
     items = _validate_header_items(list(header_items))
     content_lengths = [
-        value.strip()
-        for name, value in items
-        if name.lower() == "content-length"
+        value.strip() for name, value in items if name.lower() == "content-length"
     ]
     representation_length = None
     if content_lengths and len(set(content_lengths)) == 1:
@@ -196,8 +327,9 @@ def _decode_body(data: dict) -> bytes:
     if not isinstance(body, str):
         raise ValueError("body must be a base64 string or null")
     decoded = base64.b64decode(body, validate=True)
-    if len(decoded) > _MAX_BODY_SIZE:
-        raise ValueError(f"Body exceeds {_MAX_BODY_SIZE} bytes limit")
+    v1_limit = min(_MAX_BODY_SIZE, MAX_V1_BODY_BYTES)
+    if len(decoded) > v1_limit:
+        raise ValueError(f"Body exceeds {v1_limit} bytes V1 limit")
     return decoded
 
 
@@ -239,12 +371,17 @@ class HttpReqFrame:
         self.headers = header_items_to_legacy_headers(items)
 
     def to_json(self) -> str:
-        return json.dumps({
-            "type": self.type, "id": self.id, "method": self.method,
-            "path": self.path, "headers": self.headers,
-            "header_items": self.header_items,
-            "body": base64.b64encode(self.body).decode(),
-        })
+        return json.dumps(
+            {
+                "type": self.type,
+                "id": self.id,
+                "method": self.method,
+                "path": self.path,
+                "headers": self.headers,
+                "header_items": self.header_items,
+                "body": base64.b64encode(self.body).decode(),
+            }
+        )
 
 
 @dataclass
@@ -266,12 +403,16 @@ class HttpRespFrame:
         self.headers = header_items_to_legacy_headers(items)
 
     def to_json(self) -> str:
-        return json.dumps({
-            "type": self.type, "id": self.id, "status": self.status,
-            "headers": self.headers,
-            "header_items": self.header_items,
-            "body": base64.b64encode(self.body).decode(),
-        })
+        return json.dumps(
+            {
+                "type": self.type,
+                "id": self.id,
+                "status": self.status,
+                "headers": self.headers,
+                "header_items": self.header_items,
+                "body": base64.b64encode(self.body).decode(),
+            }
+        )
 
 
 @dataclass
@@ -282,7 +423,14 @@ class WsConnectFrame:
     type: str = field(default="ws_connect", init=False)
 
     def to_json(self) -> str:
-        return json.dumps({"type": self.type, "id": self.id, "path": self.path, "headers": self.headers})
+        return json.dumps(
+            {
+                "type": self.type,
+                "id": self.id,
+                "path": self.path,
+                "headers": self.headers,
+            }
+        )
 
 
 @dataclass
@@ -302,7 +450,9 @@ class WsMessageFrame:
     type: str = field(default="ws_message", init=False)
 
     def to_json(self) -> str:
-        return json.dumps({"type": self.type, "id": self.id, "data": self.data, "binary": self.binary})
+        return json.dumps(
+            {"type": self.type, "id": self.id, "data": self.data, "binary": self.binary}
+        )
 
 
 @dataclass
@@ -313,7 +463,9 @@ class WsCloseFrame:
     type: str = field(default="ws_close", init=False)
 
     def to_json(self) -> str:
-        return json.dumps({"type": self.type, "id": self.id, "code": self.code, "reason": self.reason})
+        return json.dumps(
+            {"type": self.type, "id": self.id, "code": self.code, "reason": self.reason}
+        )
 
 
 @dataclass
@@ -333,7 +485,9 @@ class PingFrame:
     type: str = field(default="ping", init=False)
 
     def to_json(self) -> str:
-        return json.dumps({"type": self.type, "id": self.id, "timestamp": self.timestamp})
+        return json.dumps(
+            {"type": self.type, "id": self.id, "timestamp": self.timestamp}
+        )
 
 
 @dataclass
@@ -343,7 +497,9 @@ class PongFrame:
     type: str = field(default="pong", init=False)
 
     def to_json(self) -> str:
-        return json.dumps({"type": self.type, "id": self.id, "timestamp": self.timestamp})
+        return json.dumps(
+            {"type": self.type, "id": self.id, "timestamp": self.timestamp}
+        )
 
 
 def parse_frame(raw: str):
@@ -357,7 +513,8 @@ def parse_frame(raw: str):
     if t == "http_req":
         headers, header_items = _http_headers_from_frame(data)
         return HttpReqFrame(
-            id=data["id"], method=_validate_http_method(data["method"]),
+            id=data["id"],
+            method=_validate_http_method(data["method"]),
             path=_validate_path(data["path"]),
             headers=headers,
             header_items=header_items,
@@ -366,20 +523,24 @@ def parse_frame(raw: str):
     if t == "http_resp":
         headers, header_items = _http_headers_from_frame(data)
         return HttpRespFrame(
-            id=data["id"], status=_validate_http_status(data["status"]),
+            id=data["id"],
+            status=_validate_http_status(data["status"]),
             headers=headers,
             header_items=header_items,
             body=_decode_body(data),
         )
     if t == "ws_connect":
         return WsConnectFrame(
-            id=data["id"], path=_validate_path(data["path"]),
+            id=data["id"],
+            path=_validate_path(data["path"]),
             headers=_validate_headers(data.get("headers", {})),
         )
     if t == "ws_connected":
         return WsConnectedFrame(id=data["id"])
     if t == "ws_message":
-        return WsMessageFrame(id=data["id"], data=data["data"], binary=data.get("binary", False))
+        return WsMessageFrame(
+            id=data["id"], data=data["data"], binary=data.get("binary", False)
+        )
     if t == "ws_close":
         return WsCloseFrame(
             id=data["id"],
