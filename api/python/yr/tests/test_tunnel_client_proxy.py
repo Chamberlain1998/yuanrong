@@ -156,7 +156,7 @@ class TestTunnelClientProxy(unittest.TestCase):
             getattr(tunnel_client, "_patch_websockets_proxy_auth_unquote")()
             request = ws_client.prepare_connect_request(
                 ws_client.parse_proxy(
-                    "http://z00826700:huawei%40123@proxy.example:8080"
+                    "http://test-user:pa%40ssword@proxy.example:8080"
                 ),
                 parse_uri("wss://124.70.166.142:443/tunnel"),
             )
@@ -165,7 +165,7 @@ class TestTunnelClientProxy(unittest.TestCase):
 
         auth = _proxy_authorization_from_request(request)
         decoded = base64.b64decode(auth.split(None, 1)[1]).decode()
-        self.assertEqual(decoded, "z00826700:huawei@123")
+        self.assertEqual(decoded, "test-user:pa@ssword")
 
     def test_proxy_enabled_patches_auth_and_sets_proxy_true(self):
         tunnel_client = _load_tunnel_client_module()
