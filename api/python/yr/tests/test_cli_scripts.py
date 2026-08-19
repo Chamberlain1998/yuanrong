@@ -248,6 +248,32 @@ class TestCliScripts(unittest.TestCase):
         self.assertEqual(function_name.full_name(), "0-system-faasExecutorPython3.10:$latest")
         self.assertEqual(str(function_name), "0-system-faasExecutorPython3.10:$latest")
 
+    def test_invoke_function_uses_trailing_slash(self):
+        scripts = self.load_cli_scripts_with_stubbed_deps()
+        setattr(scripts, "__server_address", "frontend.example")
+
+        class FakeHTTPClient:
+            def __init__(self, **kwargs):
+                pass
+
+            def request(self, url, data, method="POST", headers=None):
+                self.__class__.url = url
+                self.__class__.method = method
+                return {"success": True, "data": {"result": "ok"}}
+
+        with mock.patch.object(scripts, "HTTPClient", FakeHTTPClient):
+            ret, resp = scripts.invoke_function(
+                scripts.FunctionName("default@hello:$latest"), {"value": 1}, user="tenant-a"
+            )
+
+        self.assertTrue(ret)
+        self.assertEqual(resp, {"result": "ok"})
+        self.assertEqual(FakeHTTPClient.method, "POST")
+        self.assertEqual(
+            FakeHTTPClient.url,
+            "http://frontend.example/invocations/tenant-a/default/hello:$latest/",
+        )
+
     def test_list_instances_passes_pagination_params(self):
         scripts = self.load_cli_scripts_with_stubbed_deps()
         setattr(scripts, "__user", "tenant-a")
