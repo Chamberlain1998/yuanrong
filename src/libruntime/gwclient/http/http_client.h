@@ -16,9 +16,11 @@
 
 #pragma once
 
+#include <cerrno>
 #include <functional>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <unordered_map>
 
 #include <boost/asio/ssl.hpp>
@@ -29,6 +31,7 @@
 #include "absl/synchronization/mutex.h"
 #include "src/dto/config.h"
 #include "src/libruntime/err_type.h"
+#include "src/libruntime/utils/fd_utils.h"
 #include "src/libruntime/utils/utils.h"
 #include "src/utility/logger/logger.h"
 #include "src/utility/string_utility.h"
@@ -155,38 +158,52 @@ inline void ConnectWithOptionalProxy(beast::tcp_stream &stream, asio::ip::tcp::r
         stream.expires_after(std::chrono::seconds(param.timeoutSec));
     }
 
-    const std::string target = param.ip + ":" + param.port;
-    if (proxyUrl.empty()) {
-        stream.connect(resolver.resolve(param.ip, param.port));
-    } else {
-        const auto proxy = ParseProxyUrl(proxyUrl);
-        YRLOG_INFO("HTTP CONNECT {} via proxy {}:{}", target, proxy.host, proxy.port);
-        stream.connect(resolver.resolve(proxy.host, proxy.port));
+    try {
+        const auto connect = [&stream](const asio::ip::tcp::resolver::results_type &endpoints) {
+            stream.connect(endpoints);
+            if (!SetCloseOnExec(stream.socket().native_handle())) {
+                const int error = errno;
+                throw std::system_error(error, std::generic_category(), "failed to set socket close-on-exec");
+            }
+        };
 
-        http::request<http::empty_body> req{http::verb::connect, target, 11};
-        req.set(http::field::host, target);
-        req.set(http::field::connection, "keep-alive");
-        req.set(http::field::proxy_connection, "keep-alive");
-        if (!proxy.auth.empty()) {
-            req.set(http::field::proxy_authorization, proxy.auth);
-        }
-        http::write(stream, req);
+        const std::string target = param.ip + ":" + param.port;
+        if (proxyUrl.empty()) {
+            connect(resolver.resolve(param.ip, param.port));
+        } else {
+            const auto proxy = ParseProxyUrl(proxyUrl);
+            YRLOG_INFO("HTTP CONNECT {} via proxy {}:{}", target, proxy.host, proxy.port);
+            connect(resolver.resolve(proxy.host, proxy.port));
 
-        beast::flat_buffer buffer;
-        http::response_parser<http::empty_body> parser;
-        http::read_header(stream, buffer, parser);
-        if (parser.get().result() != http::status::ok) {
-            throw std::runtime_error("HTTP CONNECT rejected, status " +
-                                     std::to_string(parser.get().result_int()));
-        }
-        // Header 之后的字节（含 TLS 首包）留在 buffer 中，勿当作 HTTP body 消费掉。
-        if (connectPrefix != nullptr) {
-            *connectPrefix = std::move(buffer);
-        }
-    }
+            http::request<http::empty_body> req{http::verb::connect, target, 11};
+            req.set(http::field::host, target);
+            req.set(http::field::connection, "keep-alive");
+            req.set(http::field::proxy_connection, "keep-alive");
+            if (!proxy.auth.empty()) {
+                req.set(http::field::proxy_authorization, proxy.auth);
+            }
+            http::write(stream, req);
 
-    if (param.timeoutSec != CONNECTION_NO_TIMEOUT) {
-        stream.expires_never();
+            beast::flat_buffer buffer;
+            http::response_parser<http::empty_body> parser;
+            http::read_header(stream, buffer, parser);
+            if (parser.get().result() != http::status::ok) {
+                throw std::runtime_error("HTTP CONNECT rejected, status " +
+                                         std::to_string(parser.get().result_int()));
+            }
+            // Header 之后的字节（含 TLS 首包）留在 buffer 中，勿当作 HTTP body 消费掉。
+            if (connectPrefix != nullptr) {
+                *connectPrefix = std::move(buffer);
+            }
+        }
+
+        if (param.timeoutSec != CONNECTION_NO_TIMEOUT) {
+            stream.expires_never();
+        }
+    } catch (...) {
+        beast::error_code closeError;
+        stream.socket().close(closeError);
+        throw;
     }
 }
 

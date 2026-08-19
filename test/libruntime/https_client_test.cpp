@@ -14,8 +14,12 @@
  * limitations under the License.
  */
 
+#include <fcntl.h>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+
+#include "httpserver/async_https_server.h"
+#include "src/libruntime/gwclient/http/async_https_client.h"
 #include "src/libruntime/gwclient/http/client_manager.h"
 #include "src/libruntime/gwclient/http/http_client.h"
 namespace YR {
@@ -62,6 +66,28 @@ TEST_F(HttpsClientTest, InitFailed)
     auto httpClient = std::make_unique<ClientManager>(librtCfg);
     auto err = httpClient->Init({"127.0.0.1", "0", 1}, 1, 1);
     ASSERT_EQ(err.OK(), false);
+}
+
+TEST_F(HttpsClientTest, ConnectedTcpSocketIsCloseOnExec)
+{
+    auto serverCtx = std::make_shared<ssl::context>(ssl::context::tlsv12_server);
+    serverCtx->use_certificate_chain_file("./test/data/cert/server.crt");
+    serverCtx->use_private_key_file("./test/data/cert/server.key", ssl::context::pem);
+    auto httpsServer = std::make_shared<AsyncHttpsServer>();
+    ASSERT_TRUE(httpsServer->StartServer("127.0.0.1", 0, 1, serverCtx));
+
+    auto clientIoc = std::make_shared<asio::io_context>();
+    auto clientCtx = std::make_shared<ssl::context>(ssl::context::tlsv12_client);
+    clientCtx->set_verify_mode(ssl::verify_none);
+    auto client = std::make_shared<AsyncHttpsClient>(clientIoc, clientCtx);
+    auto err = client->Init({"127.0.0.1", std::to_string(httpsServer->GetListeningPort())});
+    ASSERT_TRUE(err.OK()) << err.Msg();
+
+    const int fd = client->stream_->next_layer().socket().native_handle();
+    const int flags = fcntl(fd, F_GETFD);
+    ASSERT_NE(flags, -1);
+    EXPECT_NE(flags & FD_CLOEXEC, 0);
+    httpsServer->StopServer();
 }
 }  // namespace test
 }  // namespace YR

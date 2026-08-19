@@ -32,6 +32,13 @@ config_setting(
 )
 
 cc_library(
+    name = "fd_utils",
+    srcs = ["src/libruntime/utils/fd_utils.cpp"],
+    hdrs = ["src/libruntime/utils/fd_utils.h"],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
     name = "runtime_lib",
     srcs = glob([
         "src/libruntime/*.cpp",
@@ -84,6 +91,8 @@ cc_library(
         "src/libruntime/traceadaptor/*.h",
         "src/libruntime/traceadaptor/exporter/*.cpp",
         "src/libruntime/traceadaptor/exporter/*.h",
+    ], exclude = [
+        "src/libruntime/utils/fd_utils.cpp",
     ]) + glob(
         ["src/libruntime/*.h"],
         exclude = [
@@ -108,6 +117,7 @@ cc_library(
     }),
     linkopts = [],
     deps = [
+        ":fd_utils",
         "//src/libruntime/fsclient/protobuf:posix_cc_grpc",
         "//src/proto:libruntime_cc_proto",
         "//src/proto:socket_cc_proto",
@@ -189,6 +199,7 @@ cc_library(
         "//conditions:default": ["-DENABLE_OBSERVABILITY"],
     }),
     deps = [
+        ":fd_utils",
         "//src/libruntime/fsclient/protobuf:posix_cc_grpc_hdrs",
         "//src/proto:libruntime_cc_proto_hdrs",
         "//src/proto:socket_cc_proto_hdrs",

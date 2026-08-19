@@ -17,6 +17,7 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <fcntl.h>
 #include <string>
 
 #include "mock/mock_datasystem.h"
@@ -233,7 +234,7 @@ public:
         auto clientsMgr = std::make_shared<ClientsManager>();
         auto metricsAdaptor = MetricsAdaptor::GetInstance();
         auto sec = std::make_shared<Security>();
-        auto socketClient = std::make_shared<DomainSocketClient>(SOCK_PATH);
+        socketClient = std::make_shared<DomainSocketClient>(SOCK_PATH);
         lr = std::make_shared<YR::Libruntime::Libruntime>(lc, clientsMgr, metricsAdaptor, sec, socketClient);
     }
 
@@ -249,9 +250,26 @@ public:
     }
 
     std::shared_ptr<FakeDomainSocketServer> server;
+    std::shared_ptr<DomainSocketClient> socketClient;
     std::shared_ptr<YR::Libruntime::Libruntime> lr;
     std::shared_ptr<LibruntimeConfig> lc;
 };
+
+TEST_F(ConnectTest, DomainSocketClientMarksSocketCloseOnExec)
+{
+    FunctionLog funcLog;
+    funcLog.set_level("info");
+    funcLog.set_content("close-on-exec probe");
+    funcLog.set_logtype("tail");
+    funcLog.set_functioninfo("fd-flags");
+
+    lr->ProcessLog(funcLog);
+
+    ASSERT_GE(socketClient->sockfd_, 0);
+    const int flags = fcntl(socketClient->sockfd_, F_GETFD);
+    ASSERT_NE(flags, -1);
+    EXPECT_NE(flags & FD_CLOEXEC, 0);
+}
 
 TEST_F(ConnectTest, TestProcessLogSuccessfully)
 {
