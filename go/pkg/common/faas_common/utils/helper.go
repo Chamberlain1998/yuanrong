@@ -30,7 +30,19 @@ import (
 
 const (
 	envPathSeparators = ":"
+	// BypassDataSystemEnvKey controls the invoke return path for FaaS-created runtimes.
+	BypassDataSystemEnvKey = "YR_BYPASS_DATASYSTEM"
 )
+
+// BypassDataSystemEnabled reports whether invoke results should bypass DataSystem.
+func BypassDataSystemEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(BypassDataSystemEnvKey))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
 
 // IsFile returns true if the path is a file
 func IsFile(path string) bool {

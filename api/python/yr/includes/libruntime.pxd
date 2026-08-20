@@ -232,6 +232,7 @@ cdef extern from "src/libruntime/libruntime_config.h" nogil:
         int functionSystemRtServerPort
         string dataSystemIpAddr
         int dataSystemPort
+        bool dataSystemDeployed
         bool isDriver
         string jobId
         string runtimeId

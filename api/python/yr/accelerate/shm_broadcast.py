@@ -25,6 +25,7 @@ from typing import Optional
 from enum import IntEnum
 from dataclasses import dataclass
 import yr
+from yr.datasystem_capability import require_data_system
 
 _logger = logging.getLogger(__name__)
 
@@ -61,6 +62,7 @@ class Handle:
 
 class ShmRingBuffer:
     def __init__(self, n_reader: int, max_chunk_bytes: int, max_chunks: int, name: Optional[str] = None):
+        require_data_system("shared memory buffer")
         self.n_reader = n_reader
         self.metadata_size = 1 + n_reader
         self.max_chunk_bytes = max_chunk_bytes

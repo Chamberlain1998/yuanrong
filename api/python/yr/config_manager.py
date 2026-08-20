@@ -22,6 +22,7 @@ from dataclasses import replace
 from yr.common import utils
 from yr.common.singleton import Singleton
 from yr.config import Config, DeploymentConfig, MetaConfig, MetaFunctionID
+from yr.datasystem_capability import DataSystemCapability
 
 _DEFAULT_CLUSTER_PORT = "31222"
 _DEFAULT_IN_CLUSTER_CLUSTER_PORT = "21003"
@@ -100,7 +101,7 @@ class ConfigManager:
         self.dedup_logs = False
         self.env_file = ""
         self.auth_token = ""
-        self.bypass_datasystem = None
+        self.data_system_capability = DataSystemCapability()
 
     @property
     def deployment_config(self) -> DeploymentConfig:
@@ -230,7 +231,7 @@ class ConfigManager:
         """"""
         self._num_cpus = value
 
-    def init(self, conf: Config, is_init=False):
+    def init(self, conf: Config, is_init=False, data_system_capability=None):
         """
         Init the ConfigManager
 
@@ -238,6 +239,8 @@ class ConfigManager:
             :param conf: The yr api config which set by user.
             :param is_init: init state
         """
+        if data_system_capability is not None:
+            self.data_system_capability = data_system_capability
         job_id = conf.job_id if conf.job_id != "" else utils.generate_job_id()
         if not conf.local_mode:
             _ = _check_function_urn(conf.is_driver, conf.function_id)
@@ -277,7 +280,7 @@ class ConfigManager:
             return
         self.__is_driver = conf.is_driver
         self.server_address = conf.server_address
-        if self.__in_cluster:
+        if self.__in_cluster and self.data_system_capability.data_system_deployed:
             self.ds_address = conf.ds_address
         self.rt_server_address = conf.rt_server_address
         self.log_dir = conf.log_dir
@@ -309,13 +312,12 @@ class ConfigManager:
         self.dedup_logs = conf.dedup_logs
         self.env_file = conf.env_file
         self.auth_token = conf.auth_token
-        self.bypass_datasystem = conf.bypass_datasystem
 
-    def override_bypass_datasystem(self, invoke_options):
-        """Apply the process-wide bypass override without mutating caller options."""
-        if self.bypass_datasystem is None:
+    def apply_data_system_capability(self, invoke_options):
+        """Apply the detected invoke path without mutating caller options."""
+        if not self.data_system_capability.bypass_data_system or invoke_options.bypass_datasystem:
             return invoke_options
-        return replace(invoke_options, bypass_datasystem=self.bypass_datasystem)
+        return replace(invoke_options, bypass_datasystem=True)
 
     def get_function_id_by_language(self, language):
         """

@@ -355,6 +355,33 @@ TEST_F(InvokeAdaptorTest, CallTest)
     metaData.release_functionmeta();
 }
 
+TEST_F(InvokeAdaptorTest, CallRejectsOversizedAggregateBypassDataSystemReturnPayload)
+{
+    constexpr uint64_t mib = 1024 * 1024;
+    LibruntimeOptions options{};
+    options.functionExecuteCallback = [](const FunctionMeta &, const libruntime::InvokeType,
+                                         const std::vector<std::shared_ptr<DataObject>> &,
+                                         std::vector<std::shared_ptr<DataObject>> &returnValues) -> ErrorInfo {
+        returnValues.emplace_back(
+            std::make_shared<DataObject>("first", std::make_shared<StringNativeBuffer>(51 * mib)));
+        returnValues.emplace_back(
+            std::make_shared<DataObject>("second", std::make_shared<StringNativeBuffer>(51 * mib)));
+        return ErrorInfo();
+    };
+    std::vector<std::string> objectsInDs;
+    CallRequest req;
+    req.set_requestid("oversized-bypass-response");
+    req.set_senderid("instance_id");
+    req.set_bypass_datasystem(true);
+    libruntime::MetaData metaData;
+
+    auto result = invokeAdaptor->Call(req, metaData, options, objectsInDs);
+
+    EXPECT_EQ(result.code(), common::ERR_PARAM_INVALID);
+    EXPECT_THAT(result.message(),
+                HasSubstr("return payload size (106954752 bytes) exceeds the 104857600 bytes limit"));
+}
+
 TEST_F(InvokeAdaptorTest, InitCallTest)
 {
     CallRequest req;

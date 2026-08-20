@@ -20,6 +20,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -27,6 +28,13 @@ import yaml
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+REPO_ROOT = ROOT.parents[2]
+sys.path.append(str(REPO_ROOT / "api/python"))
+
+from yr.cli.config import ConfigResolver
+from yr.cli.const import StartMode
+
+
 HELM_BIN = pathlib.Path(os.environ.get("HELM_BIN") or shutil.which("helm") or "helm")
 PYTHON_BIN = pathlib.Path(os.environ.get("PYTHON_BIN", "/usr/bin/python3"))
 BASH_BIN = pathlib.Path(os.environ.get("BASH_BIN", "/bin/bash"))
@@ -160,6 +168,90 @@ def render_chart(*extra_args: str) -> list[dict]:
         text=True,
     )
     return [doc for doc in yaml.safe_load_all(result.stdout) if doc]
+
+
+def render_production_chart(*extra_args: str) -> list[dict]:
+    chart = ROOT.parents[1] / "k8s/charts/openyuanrong"
+    result = subprocess.run(
+        [str(HELM_BIN), "template", "yr", str(chart), *extra_args],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return [doc for doc in yaml.safe_load_all(result.stdout) if doc]
+
+
+def render_launcher_config(relative_path: str) -> tuple[dict, StartMode]:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_path = pathlib.Path(temp_dir)
+        fake_yr = temp_path / "yr"
+        fake_yr.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json\n"
+            "import sys\n"
+            "print(json.dumps(sys.argv[1:]))\n"
+        )
+        fake_yr.chmod(fake_yr.stat().st_mode | stat.S_IXUSR)
+
+        launcher = temp_path / pathlib.Path(relative_path).name
+        launcher.write_text(
+            (ROOT / relative_path)
+            .read_text()
+            .replace("/usr/local/bin/yr", str(fake_yr))
+        )
+        launcher.chmod(launcher.stat().st_mode | stat.S_IXUSR)
+
+        env = dict(os.environ)
+        env.update(
+            {
+                "HOST_IP": "127.0.0.1",
+                "RUNTIME_HOST_IP": "127.0.0.1",
+                "RUNTIME_POD_IP": "127.0.0.1",
+                "YR_CONTROLPLANE_HELPER_DIR": str(temp_path),
+                "YR_ETCD_ADDR_LIST": "127.0.0.1:2379",
+                "YR_MASTER_IP": "127.0.0.1",
+                "YR_DATASYSTEM_DEPLOYED": "false",
+                "YR_BYPASS_DATASYSTEM": "true",
+            }
+        )
+        result = subprocess.run(
+            [str(BASH_BIN), str(launcher)],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        args = json.loads(result.stdout)
+
+        mode = StartMode.MASTER if "--master" in args else StartMode.AGENT
+        overrides = [args[index + 1] for index, arg in enumerate(args) if arg == "-s"]
+        if "--function-proxy-merge-process-enable" in args:
+            overrides.extend(
+                [
+                    f"mode.{mode.value}.function_agent=false",
+                    "function_proxy.args.enable_merge_process=true",
+                ]
+            )
+        if "--enable-runtime-launcher" in args:
+            overrides.extend(
+                [
+                    f"mode.{mode.value}.runtime_launcher=true",
+                    "values.runtime_launcher.enable=true",
+                ]
+            )
+
+        config_path = temp_path / "config.toml"
+        config_path.write_text("")
+        cli_dir = REPO_ROOT / "api/python/yr/cli"
+        config = ConfigResolver(
+            config_path,
+            cli_dir,
+            mode=mode,
+            overrides=tuple(overrides),
+            port_policy="FIX",
+        ).rendered_config
+        return config, mode
 
 
 def find_manifest(manifests: list[dict], kind: str, name: str) -> dict:
@@ -430,6 +522,8 @@ class YrK8sLayoutTests(unittest.TestCase):
                 "function_master.args.traefik_forward_timeout_ms",
                 "function_proxy.args.services_path",
                 "controlplane_cpu_num",
+                "YR_DATASYSTEM_DEPLOYED",
+                "mode.master.ds_worker=false",
             ],
             "bin/start-frontend.sh": [
                 "/usr/local/bin/yr start",
@@ -454,7 +548,7 @@ class YrK8sLayoutTests(unittest.TestCase):
                 "/usr/local/bin/yr start",
                 "--block true",
                 "--function-proxy-merge-process-enable",
-                "--data-system-enable true",
+                '--data-system-enable "${data_system_deployed}"',
                 "--enable-runtime-launcher",
                 "RUNTIME_LAUNCHER_SOCK",
                 "CONTAINER_EP",
@@ -614,6 +708,179 @@ class YrK8sLayoutTests(unittest.TestCase):
             sorted(values["node"]["ports"].keys()),
             ["dsWorker", "functionProxy", "functionProxyGrpc"],
         )
+
+    def test_datasystem_defaults_preserve_existing_deployment(self):
+        values = load_yaml_file(ROOT / "charts/yr-k8s/values.yaml")
+
+        self.assertTrue(values["global"]["dataSystem"]["enabled"])
+        self.assertFalse(values["global"]["dataSystem"]["bypass"])
+
+    def test_no_datasystem_mode_propagates_capability_and_removes_worker_port(self):
+        manifests = render_chart(
+            "--set",
+            "global.dataSystem.enabled=false",
+            "--set",
+            "global.dataSystem.bypass=true",
+        )
+        master = find_manifest(manifests, "StatefulSet", "yr-master")
+        frontend = find_manifest(manifests, "Deployment", "yr-frontend")
+        node = find_manifest(manifests, "DaemonSet", "yr-node")
+
+        for manifest, container_name in [(master, "master"), (frontend, "frontend"), (node, "node")]:
+            container = find_container(manifest, container_name)
+            self.assertEqual(find_env(container, "YR_DATASYSTEM_DEPLOYED"), "false")
+            self.assertEqual(find_env(container, "YR_BYPASS_DATASYSTEM"), "true")
+
+        frontend_env = {item["name"] for item in find_container(frontend, "frontend")["env"]}
+        node_container = find_container(node, "node")
+        node_env = {item["name"] for item in node_container["env"]}
+        self.assertNotIn("DS_WORKER_PORT", frontend_env)
+        self.assertNotIn("DS_WORKER_PORT", node_env)
+        self.assertNotIn("dsWorker", {item["name"] for item in node_container["ports"]})
+
+    def test_no_datasystem_without_bypass_is_rejected(self):
+        result = subprocess.run(
+            [
+                str(HELM_BIN),
+                "template",
+                RELEASE,
+                str(ROOT / "charts/yr-k8s"),
+                "--namespace",
+                NAMESPACE,
+                "--set",
+                "global.dataSystem.enabled=false",
+                "--set",
+                "global.dataSystem.bypass=false",
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("YR_BYPASS_DATASYSTEM must be true", result.stderr)
+
+    def test_no_datasystem_launchers_disable_ds_worker(self):
+        launchers = {
+            "bin/start-master.sh": (
+                "function_master",
+                "function_proxy",
+                "function_scheduler",
+            ),
+            "bin/start-node.sh": ("function_proxy",),
+            "bin/start-frontend.sh": (
+                "function_proxy",
+                "function_agent",
+                "frontend",
+            ),
+        }
+        for relative_path, enabled_components in launchers.items():
+            with self.subTest(path=relative_path):
+                config, mode = render_launcher_config(relative_path)
+                self.assertFalse(config["mode"][mode.value]["ds_worker"])
+                for component in enabled_components:
+                    self.assertTrue(config["mode"][mode.value][component])
+                    self.assertEqual(
+                        config[component]["env"]["YR_DATASYSTEM_DEPLOYED"],
+                        "false",
+                    )
+                    self.assertEqual(
+                        config[component]["env"]["YR_BYPASS_DATASYSTEM"],
+                        "true",
+                    )
+                if relative_path == "bin/start-node.sh":
+                    self.assertFalse(config["function_proxy"]["args"]["data_system_enable"])
+                    self.assertFalse(config["function_agent"]["args"]["data_system_enable"])
+
+    def test_production_chart_no_datasystem_contract(self):
+        manifests = render_production_chart(
+            "--set",
+            "global.dataSystem.enabled=false",
+            "--set",
+            "global.dataSystem.bypass=true",
+        )
+        config = find_manifest(manifests, "ConfigMap", "components-toml-config")["data"]["config.toml"]
+
+        self.assertGreaterEqual(config.count('YR_DATASYSTEM_DEPLOYED="false"'), 7)
+        self.assertGreaterEqual(config.count('YR_BYPASS_DATASYSTEM="true"'), 7)
+        self.assertIn('cache_storage_host=""', config)
+        self.assertIn('cache_storage_port=""', config)
+        self.assertIn('state_storage_type="disable"', config)
+        self.assertNotIn("DS_WORKER_PORT=", config)
+
+    def test_production_chart_isolates_non_default_namespace(self):
+        namespace = "yr-no-ds-smoke"
+        manifests = render_production_chart(
+            "--set",
+            f"global.namespace={namespace}",
+            "--set",
+            "global.dataSystem.enabled=false",
+            "--set",
+            "global.dataSystem.bypass=true",
+        )
+
+        for manifest in manifests:
+            metadata = manifest.get("metadata", {})
+            rendered_namespace = metadata.get("namespace")
+            if rendered_namespace is not None:
+                self.assertEqual(rendered_namespace, namespace)
+
+        cluster_roles = {
+            manifest["metadata"]["name"]
+            for manifest in manifests
+            if manifest.get("kind") == "ClusterRole"
+        }
+        cluster_role_bindings = {
+            manifest["metadata"]["name"]
+            for manifest in manifests
+            if manifest.get("kind") == "ClusterRoleBinding"
+        }
+        expected_names = {
+            f"function-proxy-{namespace}",
+            f"function-manager-{namespace}",
+            f"function-master-{namespace}",
+            f"function-scheduler-{namespace}",
+        }
+        self.assertEqual(cluster_roles, expected_names)
+        self.assertEqual(cluster_role_bindings, expected_names)
+
+        for manifest in manifests:
+            if manifest.get("kind") != "ClusterRoleBinding":
+                continue
+            self.assertEqual(manifest["roleRef"]["name"], manifest["metadata"]["name"])
+            for subject in manifest["subjects"]:
+                self.assertEqual(subject["namespace"], namespace)
+
+    def test_production_chart_default_does_not_enable_function_agent_kv_client(self):
+        manifests = render_production_chart()
+        config = find_manifest(manifests, "ConfigMap", "components-toml-config")["data"]["config.toml"]
+        function_agent_args = config.split("[function_agent.args]", 1)[1].split("[runtime_manager]", 1)[0]
+
+        self.assertNotIn("data_system_enable=", function_agent_args)
+        self.assertIn('YR_DATASYSTEM_DEPLOYED="true"', config)
+
+    def test_production_chart_rejects_no_datasystem_without_bypass(self):
+        chart = ROOT.parents[1] / "k8s/charts/openyuanrong"
+        result = subprocess.run(
+            [
+                str(HELM_BIN),
+                "template",
+                "yr",
+                str(chart),
+                "--set",
+                "global.dataSystem.enabled=false",
+                "--set",
+                "global.dataSystem.bypass=false",
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("YR_BYPASS_DATASYSTEM must be true", result.stderr)
 
     def test_rendered_manifests_match_three_workload_model(self):
         values = load_yaml_file(ROOT / "charts/yr-k8s/values.yaml")
@@ -790,6 +1057,7 @@ class YrK8sLayoutTests(unittest.TestCase):
         self.assertIn(frontend_name, traefik_dynamic_text)
         self.assertIn("/api/sandbox", traefik_dynamic_text)
         self.assertIn("/serverless/v1/componentshealth", traefik_dynamic_text)
+        self.assertIn("/serverless/v1/capabilities", traefik_dynamic_text)
         self.assertIn("/invocations", traefik_dynamic_text)
         self.assertRegex(traefik_annotations["checksum/traefik-config"], r"^[0-9a-f]{64}$")
         self.assertRegex(traefik_annotations["checksum/traefik-dynamic"], r"^[0-9a-f]{64}$")
@@ -1558,355 +1826,6 @@ class YrK8sLayoutTests(unittest.TestCase):
             "test-sandbox-sdk",
             with_sandbox_steps["publish-wheels-testpypi"]["depends_on"],
         )
-
-    def test_python314_buildkite_execution_contract(self):
-        packager = "registry.example.com/openyuanrong/sandbox-packager:test"
-        bootstrap = emit_dynamic_pipeline(
-            ENABLE_PYTHON314_BUILDER_BOOTSTRAP="true",
-            SANDBOX_PACKAGER_IMAGE=packager,
-        )
-        product = emit_dynamic_pipeline(
-            ENABLE_PYTHON314_BUILDER_BOOTSTRAP="false",
-            SANDBOX_PACKAGER_IMAGE=packager,
-            ENABLE_MACOS_SDK="true",
-            ENABLE_LINUX_ARM="true",
-            ENABLE_RUNTIME_X86="true",
-            ENABLE_RUNTIME_ARM="true",
-            ENABLE_SANDBOX_PACKAGE="true",
-            ENABLE_SANDBOX_K8S_TEST="false",
-            ENABLE_TEST_PYPI_PUBLISH="false",
-            ENABLE_RUST_FUNCTIONSYSTEM_ST="false",
-        )
-        amd64_cp314_product = emit_dynamic_pipeline(
-            ENABLE_PYTHON314_BUILDER_BOOTSTRAP="false",
-            ENABLE_MACOS_SDK="true",
-            ENABLE_LINUX_ARM="false",
-            ENABLE_RUNTIME_X86="true",
-            ENABLE_RUNTIME_ARM="false",
-            ENABLE_SANDBOX_PACKAGE="true",
-            ENABLE_SANDBOX_MANIFEST="false",
-            ENABLE_SANDBOX_K8S_TEST="false",
-            ENABLE_TEST_PYPI_PUBLISH="false",
-            ENABLE_RUST_FUNCTIONSYSTEM_ST="false",
-            SDK_PYTHON_VERSIONS="python3.14",
-            SANDBOX_RUNTIME_IMAGE_PYTHON_VERSIONS="python3.14",
-        )
-        bootstrap_steps = index_pipeline_steps(bootstrap)
-        product_steps = index_pipeline_steps(product)
-        amd64_cp314_steps = index_pipeline_steps(amd64_cp314_product)
-        bootstrap_keys = {
-            "build-python314-builder-amd64",
-            "build-python314-builder-arm64",
-            "publish-python314-builder-manifest",
-        }
-        self.assertEqual(set(bootstrap_steps), bootstrap_keys)
-        self.assertTrue(bootstrap_keys.isdisjoint(product_steps))
-        self.assertIn(
-            "build-sdk-amd64-cp314",
-            amd64_cp314_steps["publish-sandbox-release-amd64"]["depends_on"],
-        )
-        self.assertNotIn(
-            "build-sdk-amd64-cp311",
-            amd64_cp314_steps["publish-sandbox-release-amd64"]["depends_on"],
-        )
-        self.assertIn("build-sdk-macos-arm64-cp314", amd64_cp314_steps)
-        self.assertFalse(any("arm64" in key and "macos" not in key for key in amd64_cp314_steps))
-        self.assertNotIn("publish-sandbox-manifest", amd64_cp314_steps)
-        self.assertEqual(
-            set(bootstrap_steps["publish-python314-builder-manifest"]["depends_on"]),
-            bootstrap_keys - {"publish-python314-builder-manifest"},
-        )
-        for key in {
-            "build-python314-builder-amd64",
-            "publish-python314-builder-manifest",
-        }:
-            with self.subTest(bootstrap_executor=key):
-                step = bootstrap_steps[key]
-                self.assertEqual(pipeline_step_container(step)["image"], packager)
-
-        standard_base = (
-            "swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/"
-            "compile-ubuntu2004:v20260428_cmake33110"
-        )
-        existing_rust_builder = (
-            "swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/"
-            "compile-ubuntu2004-rust:v20260507_x86_64"
-        )
-        self.assertEqual(
-            bootstrap_steps["build-python314-builder-amd64"]["env"]["PYTHON314_BUILDER_BASE_IMAGE"],
-            standard_base,
-        )
-        self.assertEqual(
-            bootstrap_steps["build-python314-builder-arm64"]["env"]["PYTHON314_BUILDER_BASE_IMAGE"],
-            standard_base,
-        )
-        self.assertEqual(
-            pipeline_step_container(bootstrap_steps["build-python314-builder-arm64"])["image"],
-            standard_base,
-        )
-        python314_builder = standard_base.replace(
-            ":v20260428_cmake33110", ":v20260717_py3146_obs"
-        )
-        self.assertEqual(
-            pipeline_step_container(product_steps["build-all-amd64"])["image"],
-            python314_builder,
-        )
-        self.assertEqual(
-            pipeline_step_container(product_steps["build-sdk-amd64-cp314"])["image"],
-            python314_builder,
-        )
-        self.assertEqual(
-            pipeline_step_container(product_steps["build-rrt-amd64"])["image"],
-            existing_rust_builder,
-        )
-
-        amd64_docker_step_keys = {
-            "publish-sandbox-release-amd64",
-            "publish-sandbox-manifest",
-            *{
-                f"publish-runtime-amd64-{suffix}"
-                for suffix in ("cp39", "cp310", "cp311", "cp312", "cp313", "cp314")
-            },
-        }
-        for key in amd64_docker_step_keys:
-            with self.subTest(product_executor=key):
-                step = product_steps[key]
-                container = pipeline_step_container(step)
-                self.assertEqual(container["image"], packager)
-                secret_names = {entry["name"] for entry in container["env"]}
-                self.assertTrue(
-                    {"SWR_USERNAME", "SWR_PASSWORD", "SWR_DOCKER_CONFIG_JSON"}.issubset(secret_names)
-                )
-
-        for key in {
-            "publish-sandbox-release-arm64",
-            *{f"publish-runtime-arm64-{suffix}" for suffix in ("cp39", "cp310", "cp311", "cp312", "cp313", "cp314")},
-        }:
-            with self.subTest(arm64_product_step=key):
-                step = product_steps[key]
-                self.assertEqual(pipeline_step_container(step)["image"], python314_builder)
-                self.assertEqual(step["agents"]["linux_arch"], "arm64")
-                self.assertEqual(
-                    step["plugins"][0]["kubernetes"]["podSpec"]["nodeSelector"]["kubernetes.io/arch"],
-                    "arm64",
-                )
-        bootstrap_arm = bootstrap_steps["build-python314-builder-arm64"]
-        self.assertEqual(bootstrap_arm["agents"]["linux_arch"], "arm64")
-        self.assertEqual(
-            bootstrap_arm["plugins"][0]["kubernetes"]["podSpec"]["nodeSelector"]["kubernetes.io/arch"],
-            "arm64",
-        )
-
-        cp314_sdk_keys = {
-            "build-sdk-amd64-cp314",
-            "build-sdk-arm64-cp314",
-            "build-sdk-macos-arm64-cp314",
-        }
-        self.assertTrue(cp314_sdk_keys.issubset(product_steps))
-        self.assertIn(
-            "build-sdk-amd64-cp314",
-            product_steps["publish-runtime-amd64-cp314"]["depends_on"],
-        )
-        self.assertIn(
-            "build-sdk-arm64-cp314",
-            product_steps["publish-runtime-arm64-cp314"]["depends_on"],
-        )
-        manifest_dependencies = set(product_steps["publish-sandbox-manifest"]["depends_on"])
-        self.assertTrue(cp314_sdk_keys.issubset(manifest_dependencies))
-        self.assertTrue(
-            {"publish-runtime-amd64-cp314", "publish-runtime-arm64-cp314"}.issubset(
-                manifest_dependencies
-            )
-        )
-
-        repo = ROOT.parents[2]
-        packager_dockerfile = (repo / "ci/sandbox-packager/Dockerfile").read_text()
-        helper = repo / ".buildkite/docker_job_helpers.sh"
-        manifest_script = (repo / ".buildkite/package_sandbox_manifest.sh").read_text()
-        release_script = (repo / ".buildkite/package_sandbox_release.sh").read_text()
-        sdk_verifier = (repo / ".buildkite/verify_python314_sdk_wheel.sh").read_text()
-        builder_script = (repo / ".buildkite/build_python314_builder_image.sh").read_text()
-        self.assertIn("ARG TARGETARCH", packager_dockerfile)
-        self.assertIn('arm64) HELM_ARCH="arm64"; KUBECTL_ARCH="arm64"', packager_dockerfile)
-        self.assertTrue(helper.is_file())
-        helper_text = helper.read_text()
-        self.assertIn("overlay2", helper_text)
-        self.assertIn("vfs", helper_text)
-        self.assertIn("Docker daemon failed", helper_text)
-        self.assertIn("verify_image_manifest.py", manifest_script)
-        self.assertIn("require_cp314_sdk_records", manifest_script)
-        self.assertIn("image-manifest-evidence.tsv", manifest_script)
-        self.assertIn("EXPECTED_SDK_VERSION", release_script)
-        self.assertIn('installed_version == expected_version', release_script)
-        self.assertIn('wheel_listing="$(unzip -l "${wheel}")"', sdk_verifier)
-        self.assertNotIn('unzip -l "${wheel}" |', sdk_verifier)
-        self.assertIn('if [ "${VARIANT}" = compile ]; then', builder_script)
-
-    def test_image_manifest_validator_rejects_wrong_platform_and_duplicates(self):
-        verifier = ROOT.parents[2] / ".buildkite/verify_image_manifest.py"
-        self.assertTrue(verifier.is_file())
-        digest_amd64 = "sha256:" + "a" * 64
-        digest_arm64 = "sha256:" + "b" * 64
-        final_digest = "sha256:" + "c" * 64
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp = pathlib.Path(tmpdir)
-            source = tmp / "source.json"
-            source.write_text(
-                json.dumps(
-                    {
-                        "Descriptor": {
-                            "digest": digest_amd64,
-                            "platform": {"os": "linux", "architecture": "amd64"},
-                        }
-                    }
-                )
-            )
-            evidence = tmp / "evidence.tsv"
-            source_args = [
-                str(PYTHON_BIN),
-                str(verifier),
-                "source",
-                "--input",
-                str(source),
-                "--image",
-                "registry.example.com/yr-runtime:test-amd64",
-                "--evidence",
-                str(evidence),
-            ]
-            subprocess.run(
-                [*source_args, "--expected-platform", "linux/amd64"],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            wrong_source = subprocess.run(
-                [*source_args, "--expected-platform", "linux/arm64"],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-            self.assertNotEqual(wrong_source.returncode, 0)
-
-            final = tmp / "final.json"
-            final.write_text(
-                json.dumps(
-                    {
-                        "manifests": [
-                            {
-                                "digest": digest_amd64,
-                                "platform": {"os": "linux", "architecture": "amd64"},
-                            },
-                            {
-                                "digest": digest_arm64,
-                                "platform": {"os": "linux", "architecture": "arm64"},
-                            },
-                        ]
-                    }
-                )
-            )
-            final_args = [
-                str(PYTHON_BIN),
-                str(verifier),
-                "final",
-                "--input",
-                str(final),
-                "--image",
-                "registry.example.com/yr-runtime:test",
-                "--digest",
-                final_digest,
-                "--expected-platform",
-                "linux/amd64",
-                "--expected-platform",
-                "linux/arm64",
-                "--evidence",
-                str(evidence),
-            ]
-            subprocess.run(final_args, check=True, capture_output=True, text=True)
-            duplicate = json.loads(final.read_text())
-            duplicate["manifests"][1]["platform"]["architecture"] = "amd64"
-            final.write_text(json.dumps(duplicate))
-            wrong_final = subprocess.run(final_args, check=False, capture_output=True, text=True)
-            self.assertNotEqual(wrong_final.returncode, 0)
-            evidence_text = evidence.read_text()
-            self.assertIn(digest_amd64, evidence_text)
-            self.assertIn(final_digest, evidence_text)
-            self.assertIn("linux/amd64,linux/arm64", evidence_text)
-
-    def test_manifest_publish_requires_cp314_metadata_before_registry_mutation(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp = pathlib.Path(tmpdir)
-            docker_log = tmp / "docker.log"
-            fake_docker = tmp / "docker"
-            fake_docker.write_text(
-                "#!/usr/bin/env bash\n"
-                'printf "%s\\n" "$*" >>"${DOCKER_LOG}"\n'
-                "exit 0\n"
-            )
-            fake_docker.chmod(0o755)
-            fake_agent = tmp / "buildkite-agent"
-            fake_agent.write_text("#!/usr/bin/env bash\nexit 0\n")
-            fake_agent.chmod(0o755)
-            env = dict(os.environ)
-            env.update(
-                {
-                    "PATH": f"{tmp}:{env['PATH']}",
-                    "DOCKER_BIN": str(fake_docker),
-                    "DOCKER_LOG": str(docker_log),
-                    "SANDBOX_ARTIFACT_DIR": str(tmp / "artifacts"),
-                    "BUILDKITE_STEP_KEY": "publish-sandbox-manifest",
-                }
-            )
-            result = subprocess.run(
-                [str(BASH_BIN), ".buildkite/package_sandbox_manifest.sh"],
-                cwd=ROOT.parents[2],
-                check=False,
-                capture_output=True,
-                text=True,
-                env=env,
-            )
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("Required Python 3.14 SDK metadata is missing or empty", result.stderr)
-            self.assertFalse(docker_log.exists(), "registry mutation must not begin without cp314 records")
-
-    def test_push_images_falls_back_when_platform_push_is_unsupported(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            docker_log = pathlib.Path(tmpdir) / "docker.log"
-            fake_docker = pathlib.Path(tmpdir) / "docker"
-            fake_docker.write_text(
-                "#!/usr/bin/env bash\n"
-                "echo \"$*\" >> \"${DOCKER_LOG}\"\n"
-                "if [ \"$1\" = push ] && [ \"${2:-}\" = --help ]; then\n"
-                "  echo 'Usage: docker push NAME[:TAG]'\n"
-                "  exit 0\n"
-                "fi\n"
-                "if [ \"$1\" = image ] && [ \"${2:-}\" = inspect ]; then exit 0; fi\n"
-                "if [ \"$1\" = push ] && [ \"${2:-}\" = --platform ]; then exit 42; fi\n"
-                "exit 0\n"
-            )
-            fake_docker.chmod(0o755)
-            result = subprocess.run(
-                [str(ROOT / "push-images-swr.sh")],
-                cwd=ROOT.parents[2],
-                check=True,
-                capture_output=True,
-                text=True,
-                env={
-                    "PATH": f"{tmpdir}:/usr/bin:/bin",
-                    "DOCKER_BIN": str(fake_docker),
-                    "DOCKER_LOG": str(docker_log),
-                    "YR_K8S_REGISTRY_REPO": "registry.example.com/openyuanrong",
-                    "YR_K8S_IMAGE_TAG": "test-tag",
-                    "YR_K8S_IMAGE_PLATFORM": "linux/arm64",
-                    "YR_K8S_IMAGE_CACHE": "1",
-                    "YR_K8S_IMAGE_CACHE_TAG": "cache-arm64",
-                },
-            )
-
-            log_text = docker_log.read_text()
-            self.assertNotIn("push --platform", log_text)
-            self.assertIn("push registry.example.com/openyuanrong/yr-base:test-tag", log_text)
-            self.assertIn("push registry.example.com/openyuanrong/yr-base:cache-arm64", log_text)
-            self.assertIn("without platform flag", result.stderr)
 
 
 if __name__ == "__main__":

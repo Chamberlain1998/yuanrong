@@ -182,6 +182,28 @@ func TestValidEnvValuePath(t *testing.T) {
 	}
 }
 
+func TestBypassDataSystemEnabled(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+		want  bool
+	}{
+		{name: "missing", want: false},
+		{name: "true", value: "true", want: true},
+		{name: "one", value: "1", want: true},
+		{name: "yes with whitespace", value: " YES ", want: true},
+		{name: "on mixed case", value: "On", want: true},
+		{name: "false", value: "false", want: false},
+		{name: "invalid", value: "enabled", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv(BypassDataSystemEnvKey, tt.value)
+			assert.Equal(t, tt.want, BypassDataSystemEnabled())
+		})
+	}
+}
+
 func TestCopyDir(t *testing.T) {
 	convey.Convey("CopyDir", t, func() {
 		convey.Convey("CopyDir case 1", func() {

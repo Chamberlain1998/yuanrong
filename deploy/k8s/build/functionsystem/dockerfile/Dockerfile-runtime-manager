@@ -68,7 +68,7 @@ USER ${USER_NAME}
 
 RUN echo "install python wheel package"; \
     pip3.11 install -i https://mirrors.huaweicloud.com/repository/pypi/simple --trusted-host=mirrors.huaweicloud.com/pypi/simple --user \
-    cloudpickle==2.2.1 \
+    cloudpickle==3.1.2 \
     urllib3==1.26.5 \
     msgpack==1.0.5 \
     redis==3.5.3 \

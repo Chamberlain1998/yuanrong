@@ -28,7 +28,7 @@ from yr.config_manager import ConfigManager
 from yr.common import constants
 from yr.common.constants import META_PREFIX
 from yr.libruntime_pb2 import ApiType, FunctionMeta, LanguageType
-from yr.object_ref import ObjectRef
+from yr.object_ref import ObjectRef, ObjectRefDirect
 from yr.runtime_holder import global_runtime
 from yr.functionsdk.context import Context
 
@@ -190,7 +190,7 @@ class Function:
         call_req = CallReq(body=payload_str)
         args_list = [CallReq().encode(), call_req.encode()]
 
-        invoke_options = ConfigManager().override_bypass_datasystem(
+        invoke_options = ConfigManager().apply_data_system_capability(
             _convert_invoke_options(self.invoke_options, self.context))
         obj_list = global_runtime.get_runtime().invoke_by_name(
             func_meta=func_meta,
@@ -198,7 +198,8 @@ class Function:
             opt=invoke_options,
             return_nums=FAAS_FUNCTION_RETURN_NUM)
 
-        return ObjectRef(obj_list[constants.INDEX_FIRST])
+        ref_cls = ObjectRefDirect if invoke_options.bypass_datasystem else ObjectRef
+        return ref_cls(obj_list[constants.INDEX_FIRST])
 
 
 def _check_payload(payload: Union[str, dict]) -> str:

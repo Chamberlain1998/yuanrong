@@ -96,7 +96,8 @@ func (handler *FunctionHandler) Invoke(args ...any) (refs []*ObjectRef) {
 
 // InvokeDirect invokes the function bypassing datasystem.
 // Returns ObjectRefDirect which does not require IncreaseRef/DecreaseRef.
-// Return values exceeding the truncation threshold will be truncated.
+// The aggregate serialized arguments and aggregate serialized return values are each limited to 100 MiB.
+// Oversized payloads fail with ERR_PARAM_INVALID and are never truncated.
 func (handler *FunctionHandler) InvokeDirect(args ...any) (refs []*ObjectRefDirect) {
 	packedArgs, err := PackInvokeArgs(args...)
 	if err != nil {

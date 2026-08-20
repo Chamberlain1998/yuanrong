@@ -16,7 +16,8 @@
 import collections
 import time
 import unittest
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from threading import Event
 from unittest.mock import patch, Mock
 
 import cloudpickle
@@ -31,8 +32,11 @@ from yr.config_manager import ConfigManager
 from yr.config import FunctionGroupOptions
 from yr.decorator import function_proxy, instance_proxy
 from yr.base_runtime import AlarmInfo
-from yr.object_ref import ObjectRef
+from yr.object_ref import ObjectRef, ObjectRefDirect
 from yr.config import InvokeOptions
+from yr.datasystem_capability import DataSystemCapability
+from yr.err_type import ErrorCode, ModuleCode
+from yr.exception import YRRuntimeError
 from yr.runtime_holder import RuntimeHolder
 
 
@@ -82,7 +86,259 @@ class Counter:
 
 class TestApi(unittest.TestCase):
     def setUp(self) -> None:
-        pass
+        ConfigManager().data_system_capability = DataSystemCapability()
+        self.capability_patcher = patch(
+            "yr.apis.resolve_data_system_capability", return_value=DataSystemCapability())
+        self.capability_patcher.start()
+
+    def tearDown(self) -> None:
+        self.capability_patcher.stop()
+        ConfigManager().data_system_capability = DataSystemCapability()
+
+    @patch("yr.runtime_holder.global_runtime.get_runtime")
+    @patch("yr.apis.is_initialized", return_value=True)
+    def test_direct_get_uses_inline_callback_without_datasystem(self, _, get_runtime):
+        mock_runtime = Mock()
+
+        def return_direct_result(_object_id, callback):
+            callback({"value": 7})
+
+        mock_runtime.set_get_callback.side_effect = return_direct_result
+        get_runtime.return_value = mock_runtime
+        ConfigManager().data_system_capability = DataSystemCapability(False, True, "environment")
+
+        result = yr.get(ObjectRefDirect("direct-result"))
+
+        self.assertEqual(result, {"value": 7})
+        mock_runtime.get.assert_not_called()
+
+    @patch("yr.runtime_holder.global_runtime.get_runtime")
+    @patch("yr.apis.is_initialized", return_value=True)
+    def test_direct_wait_uses_inline_callbacks_without_datasystem(self, _, get_runtime):
+        callbacks = {}
+        callbacks_registered = Event()
+        mock_runtime = Mock()
+
+        def register_callback(object_id, callback):
+            callbacks[object_id] = callback
+            if len(callbacks) == 2:
+                callbacks_registered.set()
+
+        mock_runtime.set_get_callback.side_effect = register_callback
+        get_runtime.return_value = mock_runtime
+        ConfigManager().data_system_capability = DataSystemCapability(False, True, "environment")
+        first = ObjectRefDirect("first")
+        second = ObjectRefDirect("second")
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            result = executor.submit(yr.wait, [first, second], 1, 2)
+            self.assertTrue(callbacks_registered.wait(timeout=1))
+            callbacks["second"]("done")
+            ready, unready = result.result(timeout=2)
+
+        self.assertEqual(ready, [second])
+        self.assertEqual(unready, [first])
+        mock_runtime.wait.assert_not_called()
+
+    @patch("yr.runtime_holder.global_runtime.get_runtime")
+    @patch("yr.apis.is_initialized", return_value=True)
+    def test_mixed_get_registers_direct_callbacks_before_datasystem_get(self, _, get_runtime):
+        callbacks = {}
+        mock_runtime = Mock()
+
+        def register_callback(object_id, callback):
+            callbacks.setdefault(object_id, callback)
+
+        mock_runtime.set_get_callback.side_effect = register_callback
+
+        def get_normal(object_ids, timeout, allow_partial):
+            self.assertEqual(object_ids, ["normal"])
+            self.assertIn("direct", callbacks)
+            direct_callback = callbacks.get("direct")
+            self.assertIsNotNone(direct_callback)
+            direct_callback("direct-value")
+            return ["normal-value"]
+
+        mock_runtime.get.side_effect = get_normal
+        get_runtime.return_value = mock_runtime
+        direct = ObjectRefDirect("direct")
+        normal = ObjectRef("normal", need_incre=False, need_decre=False)
+
+        self.assertEqual(yr.get([direct, normal]), ["direct-value", "normal-value"])
+
+    @patch("yr.runtime_holder.global_runtime.get_runtime")
+    @patch("yr.apis.is_initialized", return_value=True)
+    def test_mixed_get_uses_one_timeout_budget(self, _, get_runtime):
+        mock_runtime = Mock()
+        mock_runtime.set_get_callback.return_value = None
+
+        def slow_get(*_args):
+            time.sleep(0.6)
+            return ["normal-value"]
+
+        mock_runtime.get.side_effect = slow_get
+        get_runtime.return_value = mock_runtime
+        direct = ObjectRefDirect("direct")
+        second_direct = ObjectRefDirect("second-direct")
+        normal = ObjectRef("normal", need_incre=False, need_decre=False)
+
+        started = time.monotonic()
+        with self.assertRaises(FuturesTimeoutError):
+            yr.get([normal, direct, second_direct], timeout=1)
+        elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 1.4)
+
+    @patch("yr.runtime_holder.global_runtime.get_runtime")
+    @patch("yr.apis.is_initialized", return_value=True)
+    def test_direct_get_allow_partial_returns_none_on_timeout(self, _, get_runtime):
+        mock_runtime = Mock()
+        get_runtime.return_value = mock_runtime
+        direct = ObjectRefDirect("direct")
+        future = Mock()
+        future.result.side_effect = FuturesTimeoutError()
+        direct.get_future = Mock(return_value=future)
+
+        self.assertEqual(yr.get([direct], timeout=1, allow_partial=True), [None])
+
+    @patch("yr.runtime_holder.global_runtime.get_runtime")
+    @patch("yr.apis.is_initialized", return_value=True)
+    def test_direct_wait_never_returns_more_than_wait_num(self, _, get_runtime):
+        mock_runtime = Mock()
+        get_runtime.return_value = mock_runtime
+        first = ObjectRefDirect("first")
+        second = ObjectRefDirect("second")
+        first.set_data("first-value")
+        second.set_data("second-value")
+
+        ready, unready = yr.wait([first, second], wait_num=1, timeout=1)
+
+        self.assertEqual(ready, [first])
+        self.assertEqual(unready, [second])
+
+    @patch("yr.runtime_holder.global_runtime.get_runtime")
+    @patch("yr.apis.is_initialized", return_value=True)
+    def test_mixed_wait_sends_only_normal_ids_and_preserves_input_order(self, _, get_runtime):
+        callbacks = {}
+        mock_runtime = Mock()
+
+        def register_callback(object_id, callback):
+            callbacks.setdefault(object_id, callback)
+
+        mock_runtime.set_get_callback.side_effect = register_callback
+        mock_runtime.wait.return_value = (["normal"], [])
+        get_runtime.return_value = mock_runtime
+        direct_ready = ObjectRefDirect("direct-ready")
+        direct_ready.set_data("value")
+        normal = ObjectRef("normal", need_incre=False, need_decre=False)
+        direct_pending = ObjectRefDirect("direct-pending")
+
+        ready, unready = yr.wait([direct_ready, normal, direct_pending], wait_num=2, timeout=1)
+
+        self.assertEqual(ready, [direct_ready, normal])
+        self.assertEqual(unready, [direct_pending])
+        mock_runtime.wait.assert_called_once_with(["normal"], 1, 0)
+
+    @patch("yr.runtime_holder.global_runtime.get_runtime")
+    @patch("yr.apis.is_initialized", return_value=True)
+    def test_mixed_wait_never_returns_more_than_wait_num(self, _, get_runtime):
+        mock_runtime = Mock()
+        mock_runtime.wait.return_value = (["normal"], [])
+        get_runtime.return_value = mock_runtime
+        direct = ObjectRefDirect("direct")
+        direct.set_data("direct-value")
+        normal = ObjectRef("normal", need_incre=False, need_decre=False)
+
+        ready, unready = yr.wait([direct, normal], wait_num=1, timeout=1)
+
+        self.assertEqual(ready, [direct])
+        self.assertEqual(unready, [normal])
+
+    @patch("yr.runtime_holder.global_runtime.get_runtime")
+    @patch("yr.apis.is_initialized", return_value=True)
+    def test_mixed_wait_timeout_preserves_partial_ready(self, _, get_runtime):
+        mock_runtime = Mock()
+        mock_runtime.set_get_callback.return_value = None
+        mock_runtime.wait.return_value = ([], ["normal"])
+        get_runtime.return_value = mock_runtime
+        direct_ready = ObjectRefDirect("direct-ready")
+        direct_ready.set_data("value")
+        normal = ObjectRef("normal", need_incre=False, need_decre=False)
+        direct_pending = ObjectRefDirect("direct-pending")
+
+        started = time.monotonic()
+        ready, unready = yr.wait([normal, direct_ready, direct_pending], wait_num=2, timeout=1)
+        elapsed = time.monotonic() - started
+
+        self.assertEqual(ready, [direct_ready])
+        self.assertEqual(unready, [normal, direct_pending])
+        self.assertLess(elapsed, 1.4)
+        self.assertTrue(mock_runtime.wait.call_args_list)
+        self.assertTrue(all(call.args == (["normal"], 1, 0) for call in mock_runtime.wait.call_args_list))
+
+    @patch("yr.runtime_holder.global_runtime.get_runtime")
+    @patch("yr.apis.is_initialized", return_value=True)
+    def test_mixed_wait_timeout_returns_all_refs_unready(self, _, get_runtime):
+        mock_runtime = Mock()
+        mock_runtime.set_get_callback.return_value = None
+        mock_runtime.wait.return_value = ([], ["normal"])
+        get_runtime.return_value = mock_runtime
+        normal = ObjectRef("normal", need_incre=False, need_decre=False)
+        direct_pending = ObjectRefDirect("direct-pending")
+
+        ready, unready = yr.wait([normal, direct_pending], wait_num=1, timeout=1)
+
+        self.assertEqual(ready, [])
+        self.assertEqual(unready, [normal, direct_pending])
+
+    @patch("yr.runtime_holder.global_runtime.get_runtime")
+    @patch("yr.apis.is_initialized", return_value=True)
+    def test_datasystem_apis_fail_fast_when_capability_is_disabled(self, _, get_runtime):
+        mock_runtime = Mock()
+        get_runtime.return_value = mock_runtime
+        ConfigManager().data_system_capability = DataSystemCapability(False, True, "environment")
+        calls = [
+            ("put", lambda: yr.put("value")),
+            ("get", lambda: yr.get(ObjectRef("normal", need_incre=False))),
+            ("wait", lambda: yr.wait(ObjectRef("normal", need_incre=False))),
+            ("kv_write", lambda: yr.kv_write("key", b"value")),
+            ("kv_read", lambda: yr.kv_read("key")),
+            ("kv_del", lambda: yr.kv_del("key")),
+            ("create_stream_producer", lambda: yr.create_stream_producer("stream", yr.ProducerConfig())),
+            ("save_state", lambda: yr.save_state()),
+        ]
+
+        for operation, call in calls:
+            with self.subTest(operation=operation), self.assertRaises(YRRuntimeError) as raised:
+                call()
+            self.assertEqual(raised.exception.code, ErrorCode.ERR_DATASYSTEM_FAILED)
+            self.assertEqual(raised.exception.module_code, ModuleCode.DATASYSTEM)
+            self.assertIn(operation, str(raised.exception))
+
+        mock_runtime.put.assert_not_called()
+        mock_runtime.get.assert_not_called()
+        mock_runtime.wait.assert_not_called()
+        mock_runtime.kv_write.assert_not_called()
+        mock_runtime.kv_read.assert_not_called()
+        mock_runtime.kv_del.assert_not_called()
+        mock_runtime.create_stream_producer.assert_not_called()
+        mock_runtime.save_state.assert_not_called()
+
+    @patch("yr.runtime_holder.global_runtime.get_runtime")
+    @patch("yr.apis.is_initialized", return_value=True)
+    def test_datasystem_apis_remain_available_when_only_invoke_is_bypassed(self, _, get_runtime):
+        mock_runtime = Mock()
+        mock_runtime.put.return_value = "object-id"
+        mock_runtime.get.return_value = ["value"]
+        get_runtime.return_value = mock_runtime
+        ConfigManager().data_system_capability = DataSystemCapability(True, True, "environment")
+
+        ref = yr.put("value")
+        value = yr.get(ref)
+
+        self.assertEqual(value, "value")
+        mock_runtime.put.assert_called_once()
+        mock_runtime.get.assert_called_once()
 
     def test_yr_init_failed_when_input_invalid_address(self):
         conf = yr.Config()

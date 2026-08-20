@@ -22,6 +22,7 @@ from yr.object_ref import ObjectRef
 from yr.runtime_holder import global_runtime
 from yr.fnruntime import GeneratorEndError
 from yr.exception import GeneratorFinished
+from yr.datasystem_capability import require_data_system
 
 _logger = logging.getLogger(__name__)
 
@@ -30,6 +31,7 @@ class ObjectRefGenerator:
     """ ObjectRefGenerator streamming  return"""
 
     def __init__(self, object_ref: ObjectRef):
+        require_data_system("generator")
         self._obj_ref = object_ref
         self._generator_id = object_ref.id
         self._generator_task_exception = None

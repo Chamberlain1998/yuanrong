@@ -86,3 +86,8 @@ imagePullSecrets:
 {{- printf "http://%s" (include "yr-k8s.etcdAddrList" .) -}}
 {{- end -}}
 {{- end -}}
+{{- define "yr-k8s.validateDataSystem" -}}
+{{- if and (not .Values.global.dataSystem.enabled) (not .Values.global.dataSystem.bypass) -}}
+{{- fail "YR_BYPASS_DATASYSTEM must be true when YR_DATASYSTEM_DEPLOYED is false" -}}
+{{- end -}}
+{{- end -}}

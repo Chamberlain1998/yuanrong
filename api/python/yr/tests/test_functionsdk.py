@@ -24,6 +24,8 @@ from yr.functionsdk import utils
 from yr.functionsdk import logger as sdklogger
 from yr.functionsdk import logger_manager
 from yr.config_manager import ConfigManager
+from yr.datasystem_capability import DataSystemCapability
+from yr.object_ref import ObjectRefDirect
 from unittest import TestCase, main
 from unittest.mock import Mock, patch
 import os
@@ -39,10 +41,10 @@ logger = logging.getLogger(__name__)
 class TestFunctionSdk(TestCase):
 
     def setUp(self):
-        ConfigManager().bypass_datasystem = None
+        ConfigManager().data_system_capability = DataSystemCapability()
 
     def tearDown(self):
-        ConfigManager().bypass_datasystem = None
+        ConfigManager().data_system_capability = DataSystemCapability()
 
     @patch("yr.log.get_logger")
     def test_context(self, mock_logger):
@@ -115,9 +117,10 @@ class TestFunctionSdk(TestCase):
         obj = f.options(opt).invoke(args)
         self.assertEqual(obj.id, "obj_abcd", obj.id)
 
-        ConfigManager().bypass_datasystem = True
-        f.options(opt).invoke(args)
+        ConfigManager().data_system_capability = DataSystemCapability(False, True, "environment")
+        direct_result = f.options(opt).invoke(args)
         self.assertTrue(mock_runtime.invoke_by_name.call_args.kwargs["opt"].bypass_datasystem)
+        self.assertIsInstance(direct_result, ObjectRefDirect)
 
         args = [1, 2, 3]
         with self.assertRaises(TypeError):

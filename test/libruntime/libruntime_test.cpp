@@ -182,6 +182,62 @@ TEST_F(LibruntimeTest, KVDelReturnsErrorWhenStateStoreIsMissing)
     EXPECT_NO_THROW(localRuntime->Finalize(true));
 }
 
+TEST_F(LibruntimeTest, NoDsRuntimeInitializesWithoutDatasystemClients)
+{
+    auto localConfig = std::make_shared<LibruntimeConfig>();
+    localConfig->jobId = YR::utility::IDGenerator::GenApplicationId();
+    localConfig->tenantId = "";
+    localConfig->inCluster = true;
+    localConfig->dataSystemDeployed = false;
+    auto clientsMgr = std::make_shared<ClientsManager>();
+    auto metricsAdaptor = MetricsAdaptor::GetInstance();
+    auto socketClient = std::make_shared<DomainSocketClient>("/home/snuser/socket/runtime.sock");
+    auto localRuntime =
+        std::make_shared<YR::Libruntime::Libruntime>(localConfig, clientsMgr, metricsAdaptor, sec_, socketClient);
+    auto fsClient = std::make_shared<YR::Libruntime::FSClient>(gwClient_);
+    auto finalizeHandler = []() { return; };
+    DatasystemClients dsclients{nullptr, nullptr, nullptr, nullptr};
+
+    auto initResult = localRuntime->Init(fsClient, dsclients, finalizeHandler);
+
+    EXPECT_TRUE(initResult.OK()) << initResult.Msg();
+    EXPECT_EQ(localRuntime->SetTenantId("", true).Code(), ErrorCode::ERR_PARAM_INVALID);
+    auto dataObject = std::make_shared<DataObject>(0, 16);
+    auto [putError, objectId] = localRuntime->Put(dataObject, {});
+    EXPECT_EQ(putError.Code(), ErrorCode::ERR_DATASYSTEM_FAILED);
+    EXPECT_THAT(putError.Msg(), HasSubstr("Put"));
+    EXPECT_TRUE(objectId.empty());
+
+    auto getStart = std::chrono::steady_clock::now();
+    auto [getError, objects] = localRuntime->Get({"missing-object"}, 60 * 1000, false);
+    auto getElapsed = std::chrono::steady_clock::now() - getStart;
+    EXPECT_EQ(getError.Code(), ErrorCode::ERR_DATASYSTEM_FAILED);
+    EXPECT_THAT(getError.Msg(), HasSubstr("Get"));
+    EXPECT_TRUE(objects.empty());
+    EXPECT_LT(getElapsed, std::chrono::seconds(1));
+
+    auto [generatorError, generatorObjectId] = localRuntime->PeekObjectRefStream("generator", true);
+    EXPECT_EQ(generatorError.Code(), ErrorCode::ERR_DATASYSTEM_FAILED);
+    EXPECT_TRUE(generatorObjectId.empty());
+
+    auto waitResult = localRuntime->Wait({"missing-object"}, 1, 60);
+    ASSERT_EQ(waitResult->exceptionIds.size(), 1);
+    EXPECT_EQ(waitResult->exceptionIds.at("missing-object").Code(), ErrorCode::ERR_DATASYSTEM_FAILED);
+    EXPECT_THAT(waitResult->exceptionIds.at("missing-object").Msg(), HasSubstr("Wait"));
+
+    std::shared_ptr<Buffer> dataBuffer;
+    auto [bufferError, bufferId] = localRuntime->CreateBuffer(16, dataBuffer);
+    EXPECT_EQ(bufferError.Code(), ErrorCode::ERR_DATASYSTEM_FAILED);
+    EXPECT_THAT(bufferError.Msg(), HasSubstr("CreateBuffer"));
+    EXPECT_TRUE(bufferId.empty());
+
+    EXPECT_EQ(localRuntime->KVDel("key").Code(), ErrorCode::ERR_DATASYSTEM_FAILED);
+    EXPECT_TRUE(localRuntime->IncreaseReferenceRaw({"object-id"}).OK());
+    EXPECT_TRUE(localRuntime->ReleaseGRefs("remote-id").OK());
+    EXPECT_NO_THROW(localRuntime->ReInit());
+    EXPECT_NO_THROW(localRuntime->Finalize(true));
+}
+
 TEST_F(LibruntimeTest, InvokeArgTest)
 {
     std::string testStr = "1234567890/func";
@@ -496,6 +552,54 @@ TEST_F(LibruntimeTest, CheckSpec)
     errorInfo4 = lr->CheckSpec(spec);
     ASSERT_EQ(errorInfo4.Code(), ErrorCode::ERR_PARAM_INVALID);
     EXPECT_THAT(errorInfo4.Msg(), testing::HasSubstr("please set the timeout >= -1"));
+}
+
+TEST_F(LibruntimeTest, PreProcessArgsRejectsOversizedBypassDataSystemPayload)
+{
+    constexpr uint64_t mib = 1024 * 1024;
+    auto spec = std::make_shared<InvokeSpec>();
+    spec->requestId = "oversized-bypass-request";
+    spec->opts.bypassDatasystem = true;
+
+    InvokeArg first;
+    first.dataObj = std::make_shared<DataObject>();
+    first.dataObj->totalSize = 51 * mib;
+    spec->invokeArgs.emplace_back(std::move(first));
+
+    InvokeArg second;
+    second.dataObj = std::make_shared<DataObject>();
+    second.dataObj->totalSize = 50 * mib;
+    spec->invokeArgs.emplace_back(std::move(second));
+
+    auto err = lr->PreProcessArgs(spec);
+
+    EXPECT_EQ(err.Code(), ErrorCode::ERR_PARAM_INVALID);
+    EXPECT_THAT(err.Msg(), HasSubstr("request payload size (105906176 bytes) exceeds the 104857600 bytes limit"));
+}
+
+TEST_F(LibruntimeTest, PreProcessArgsForcesBypassWhenDataSystemIsDisabled)
+{
+    constexpr uint64_t mib = 1024 * 1024;
+    lr->config->dataSystemDeployed = false;
+    auto spec = std::make_shared<InvokeSpec>();
+    spec->requestId = "implicit-bypass-request";
+    spec->opts.bypassDatasystem = false;
+
+    InvokeArg first;
+    first.dataObj = std::make_shared<DataObject>();
+    first.dataObj->totalSize = 51 * mib;
+    spec->invokeArgs.emplace_back(std::move(first));
+
+    InvokeArg second;
+    second.dataObj = std::make_shared<DataObject>();
+    second.dataObj->totalSize = 50 * mib;
+    spec->invokeArgs.emplace_back(std::move(second));
+
+    auto err = lr->PreProcessArgs(spec);
+
+    EXPECT_TRUE(spec->opts.bypassDatasystem);
+    EXPECT_EQ(err.Code(), ErrorCode::ERR_PARAM_INVALID);
+    EXPECT_THAT(err.Msg(), HasSubstr("request payload size (105906176 bytes) exceeds the 104857600 bytes limit"));
 }
 
 TEST_F(LibruntimeTest, CheckSpecRGOption)

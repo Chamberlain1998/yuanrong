@@ -422,9 +422,11 @@ void ClusterModeRuntime::Init()
                 libConfig.functionSystemPort);
     ParseIpAddr(ConfigManager::Singleton().grpcAddress, libConfig.functionSystemRtServerIpAddr,
                 libConfig.functionSystemRtServerPort);
+    libConfig.dataSystemDeployed = YR::Libruntime::Config::Instance().YR_DATASYSTEM_DEPLOYED();
     ParseIpAddr(ConfigManager::Singleton().dataSystemAddr, libConfig.dataSystemIpAddr, libConfig.dataSystemPort);
     if (libConfig.functionSystemIpAddr.empty() || libConfig.functionSystemPort == 0 ||
-        ((libConfig.dataSystemIpAddr.empty() || libConfig.dataSystemPort == 0) && libConfig.inCluster)) {
+        (libConfig.dataSystemDeployed &&
+         (libConfig.dataSystemIpAddr.empty() || libConfig.dataSystemPort == 0) && libConfig.inCluster)) {
         std::stringstream ss;
         ss << "Invalid address of datasystem or function system, " << ConfigManager::Singleton().dataSystemAddr << " "
            << ConfigManager::Singleton().functionSystemAddr;

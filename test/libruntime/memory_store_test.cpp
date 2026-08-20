@@ -138,6 +138,55 @@ TEST_F(MemoryStoreTest, InitPutGetTest)
     ASSERT_EQ(errInfo.Code(), ErrorCode::ERR_PARAM_INVALID);
 }
 
+TEST_F(MemoryStoreTest, NoDsSkipsReferenceCountingAndFailsUserOperations)
+{
+    memoryStore->Init(nullptr, wom);
+    const std::string objectId = "no-ds-object";
+    auto data = std::make_shared<NativeBuffer>(16);
+
+    EXPECT_TRUE(memoryStore->IncreGlobalReference({objectId}).OK());
+    EXPECT_TRUE(memoryStore->IncreDSGlobalReference({objectId}).OK());
+    EXPECT_TRUE(memoryStore->IncreaseObjRef({objectId}).OK());
+    EXPECT_EQ(memoryStore->QueryGlobalReference({objectId}), std::vector<int>({2}));
+    EXPECT_TRUE(memoryStore->DecreGlobalReference({objectId}).OK());
+    EXPECT_TRUE(memoryStore->ReleaseGRefs("remote-id").OK());
+
+    auto putError = memoryStore->Put(data, objectId, {});
+    EXPECT_EQ(putError.Code(), ErrorCode::ERR_DATASYSTEM_FAILED);
+    EXPECT_THAT(putError.Msg(), HasSubstr("Put"));
+
+    auto [getError, getResult] = memoryStore->Get("missing-object", 0);
+    EXPECT_EQ(getError.Code(), ErrorCode::ERR_DATASYSTEM_FAILED);
+    EXPECT_THAT(getError.Msg(), HasSubstr("Get"));
+    EXPECT_EQ(getResult, nullptr);
+
+    std::shared_ptr<Buffer> buffer;
+    auto createBufferError = memoryStore->CreateBuffer("buffer-id", 16, buffer);
+    EXPECT_EQ(createBufferError.Code(), ErrorCode::ERR_DATASYSTEM_FAILED);
+    EXPECT_THAT(createBufferError.Msg(), HasSubstr("CreateBuffer"));
+    EXPECT_EQ(buffer, nullptr);
+}
+
+TEST_F(MemoryStoreTest, NoDsReadyCallbackCompletesWithExplicitError)
+{
+    memoryStore->Init(nullptr, wom);
+    const std::string objectId = "no-ds-return-object";
+    ASSERT_TRUE(memoryStore->AddReturnObject(objectId));
+
+    bool callbackCalled = false;
+    ErrorInfo callbackError;
+    ASSERT_TRUE(memoryStore->AddReadyCallbackWithData(
+        objectId, [&callbackCalled, &callbackError](const ErrorInfo &error, const std::shared_ptr<Buffer> &) {
+            callbackCalled = true;
+            callbackError = error;
+        }));
+
+    EXPECT_TRUE(memoryStore->SetReady(objectId));
+    EXPECT_TRUE(callbackCalled);
+    EXPECT_EQ(callbackError.Code(), ErrorCode::ERR_DATASYSTEM_FAILED);
+    EXPECT_THAT(callbackError.Msg(), HasSubstr("Get"));
+}
+
 bool is_timeout(std::future<bool> &f, int seconds)
 {
     return f.wait_for(std::chrono::seconds(seconds)) == std::future_status::timeout;

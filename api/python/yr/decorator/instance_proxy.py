@@ -40,6 +40,7 @@ from yr.runtime_holder import global_runtime, save_real_instance_id
 from yr.serialization import register_pack_hook, register_unpack_hook
 from yr.accelerate.shm_broadcast import MessageQueue, STOP_EVENT
 from yr.serialization import Serialization
+from yr.datasystem_capability import require_data_system, require_data_system_for_object_refs
 
 _logger = logging.getLogger(__name__)
 
@@ -427,14 +428,11 @@ class InstanceCreator:
     def _invoke(self, name=None, args=None, kwargs=None, invoke_options=None):
         if invoke_options is None:
             invoke_options = self.__invoke_options__
-        # rootfs (sandbox) instances run on runtimes without datasystem mounted,
-        # so results must be returned inline. Therefore create and later method
-        # calls default to bypass_datasystem; ConfigManager global overrides
-        # still take precedence.
+        # Rootfs instances always return inline because DataSystem is not mounted.
         is_sandbox = "rootfs" in invoke_options.custom_extensions
         if is_sandbox and not invoke_options.bypass_datasystem:
             invoke_options = replace(invoke_options, bypass_datasystem=True)
-        invoke_options = ConfigManager().override_bypass_datasystem(invoke_options)
+        invoke_options = ConfigManager().apply_data_system_capability(invoke_options)
         if invoke_options.idle_timeout >= 0:
             # todo(Lwy_Robb): should be remove, refactor use dposix fileds to pass it
             invoke_options.custom_extensions["idle_timeout"] = str(invoke_options.idle_timeout)
@@ -468,6 +466,7 @@ class InstanceCreator:
 
     def _create_instance_inner(self, name, args, kwargs, invoke_options):
         """Serialize code, package args, create the instance, and return an InstanceProxy."""
+        require_data_system_for_object_refs("ObjectRef instance arguments", args, kwargs)
         is_sandbox = "rootfs" in invoke_options.custom_extensions
         is_cross_invoke = self.__user_class_descriptor__.target_language != LanguageType.Python
         skip_serialize = getattr(invoke_options, "skip_serialize", False)
@@ -489,6 +488,7 @@ class InstanceCreator:
                         self.__user_class__.__qualname__,
                     )
                 else:
+                    require_data_system("serialized instance code")
                     runtime = global_runtime.get_runtime()
                     code_id = runtime.put_serialized(serialized_object)
                     if not isinstance(code_id, str):
@@ -500,6 +500,8 @@ class InstanceCreator:
                 # For pre-deployed classes, skip serialization
                 class_path = f"{self.__user_class__.__module__}.{self.__user_class__.__qualname__}"
                 _logger.debug("[Reference Counting] skip serialization for pre-deployed class: %s", class_path)
+        if self._code_ref is not None:
+            require_data_system("serialized instance code")
         # __init__ existed when user-defined
         if self.__user_class_methods__ is not None and '__init__' in self.__user_class_methods__:
             sig = signature.get_signature(self.__user_class_methods__.get('__init__'),
@@ -527,7 +529,7 @@ class InstanceCreator:
                              self.__is_async__,
                              name if name is not None else invoke_options.name,
                              invoke_options.namespace, self._code_ref,
-                             bypass_datasystem_default=is_sandbox)
+                             bypass_datasystem_default=invoke_options.bypass_datasystem)
 
     def _options_wrapper(self, **actor_options):
         """
@@ -1153,7 +1155,10 @@ class MethodProxy:
             raise RuntimeError("this instance is terminated")
         if getattr(instance, "_bypass_datasystem_default", False) and not invoke_options.bypass_datasystem:
             invoke_options = replace(invoke_options, bypass_datasystem=True)
-        invoke_options = ConfigManager().override_bypass_datasystem(invoke_options)
+        invoke_options = ConfigManager().apply_data_system_capability(invoke_options)
+        require_data_system_for_object_refs("ObjectRef invoke arguments", args, kwargs)
+        if self._method_descriptor.is_generator:
+            require_data_system("generator invoke")
         if self._method_descriptor.target_language == LanguageType.Python:
             args_list = signature.package_args(self._signature, args, kwargs)
         else:
@@ -1181,6 +1186,8 @@ class MethodProxy:
         if self._return_nums == 0:
             return None
         objref_list = []
+        if ref_cls is None and invoke_options.bypass_datasystem:
+            ref_cls = ObjectRefDirect
         if ref_cls is not None:
             for i in obj_list:
                 objref_list.append(ref_cls(i))

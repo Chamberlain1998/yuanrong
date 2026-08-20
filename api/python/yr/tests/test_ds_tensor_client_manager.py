@@ -14,8 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import sys
+import importlib
 import os
+import sys
 import unittest
 from unittest import mock
 
@@ -28,31 +29,49 @@ sys.modules['torch'] = torch_mock
 sys.modules['torch_npu'] = torch_npu_mock
 sys.modules['torch.npu'] = torch_npu_module
 sys.modules['datasystem'] = datasystem_mock
-from yr.config_manager import ConfigManager
-from yr.ds_tensor_client_manager import get_tensor_client, _global_tensor_client, data_system_import
+
+config_manager = importlib.import_module("yr.config_manager")
+capability_module = importlib.import_module("yr.datasystem_capability")
+tensor_client_manager = importlib.import_module("yr.ds_tensor_client_manager")
+error_type = importlib.import_module("yr.err_type")
+yr_exception = importlib.import_module("yr.exception")
 
 
 class TestGetTensorClient(unittest.TestCase):
 
     def setUp(self):
         # 清理全局状态和环境变量
-        global _global_tensor_client
-        _global_tensor_client = None
+        setattr(tensor_client_manager, "_global_tensor_client", None)
         if 'YR_DS_ADDRESS' in os.environ:
             del os.environ['YR_DS_ADDRESS']
+        config_manager.ConfigManager().data_system_capability = capability_module.DataSystemCapability()
+
+    def tearDown(self):
+        config_manager.ConfigManager().data_system_capability = capability_module.DataSystemCapability()
+
+    def test_disabled_datasystem_fails_before_import_or_address_checks(self):
+        config_manager.ConfigManager().data_system_capability = capability_module.DataSystemCapability(
+            False, True, "environment")
+
+        with self.assertRaises(yr_exception.YRRuntimeError) as raised:
+            tensor_client_manager.get_tensor_client()
+
+        self.assertEqual(raised.exception.code, error_type.ErrorCode.ERR_DATASYSTEM_FAILED)
+        self.assertEqual(raised.exception.module_code, error_type.ModuleCode.DATASYSTEM)
+        self.assertIn("tensor", str(raised.exception))
 
     @mock.patch('yr.ds_tensor_client_manager.data_system_import', False)
     @mock.patch('yr.ds_tensor_client_manager._import_error', Exception("Mock import error"))
     def test_import_failure_raises_runtime_error(self):
         with self.assertRaises(RuntimeError) as cm:
-            get_tensor_client()
+            tensor_client_manager.get_tensor_client()
         self.assertIn("import err", str(cm.exception))
 
     @mock.patch('yr.ds_tensor_client_manager.data_system_import', True)
     @mock.patch('yr.config_manager.ConfigManager')
     def test_no_address_in_env_or_config_raises_error(self, mock_config_manager):
         with self.assertRaises(RuntimeError) as cm:
-            get_tensor_client()
+            tensor_client_manager.get_tensor_client()
         self.assertIn("cannot inspect data system address", str(cm.exception))
 
     @mock.patch('yr.ds_tensor_client_manager.os.getenv', return_value="123")
@@ -61,7 +80,7 @@ class TestGetTensorClient(unittest.TestCase):
             self, mock_logger, mock_getenv
     ):
         with self.assertRaises(ValueError) as cm:
-            get_tensor_client()
+            tensor_client_manager.get_tensor_client()
         self.assertIn("expect 'ip:port'", str(cm.exception))
 
     @mock.patch('yr.ds_tensor_client_manager.data_system_import', True)
@@ -72,8 +91,8 @@ class TestGetTensorClient(unittest.TestCase):
     def test_successful_client_creation_from_env(
             self, mock_cunrrent_device, mock_logger, mock_ds_client, mock_getenv
     ):
-        result = get_tensor_client()
-        result2 = get_tensor_client()
+        result = tensor_client_manager.get_tensor_client()
+        result2 = tensor_client_manager.get_tensor_client()
         self.assertIs(result2, result)  # 同一个实例
 
     @mock.patch('yr.ds_tensor_client_manager.data_system_import', True)
@@ -84,9 +103,9 @@ class TestGetTensorClient(unittest.TestCase):
     def test_successful_client_creation_from_config(
             self, mock_current_device, mock_logger, mock_ds_client, mock_get_env
     ):
-        ConfigManager().ds_address = "10.0.0.5:9000"
-        result = get_tensor_client()
-        result2 = get_tensor_client()
+        config_manager.ConfigManager().ds_address = "10.0.0.5:9000"
+        result = tensor_client_manager.get_tensor_client()
+        result2 = tensor_client_manager.get_tensor_client()
         self.assertEqual(result, result2)
 
 

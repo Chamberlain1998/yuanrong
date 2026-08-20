@@ -13,6 +13,24 @@ etcd_addr_list="${YR_ETCD_ADDR_LIST:?Set YR_ETCD_ADDR_LIST for external etcd, e.
 services_path="${YR_SERVICES_PATH:-/home/sn/service-config/services.yaml}"
 controlplane_cpu_num="${YR_CONTROLPLANE_CPU_NUM:-100}"
 meta_service_port="${YR_META_SERVICE_PORT:-31111}"
+data_system_deployed="${YR_DATASYSTEM_DEPLOYED:-true}"
+
+ds_worker_args=()
+data_system_capability_args=(
+  -s "function_master.env.YR_DATASYSTEM_DEPLOYED=\"${data_system_deployed}\""
+  -s "function_master.env.YR_BYPASS_DATASYSTEM=\"${YR_BYPASS_DATASYSTEM:-false}\""
+  -s "function_proxy.env.YR_DATASYSTEM_DEPLOYED=\"${data_system_deployed}\""
+  -s "function_proxy.env.YR_BYPASS_DATASYSTEM=\"${YR_BYPASS_DATASYSTEM:-false}\""
+  -s "function_scheduler.env.YR_DATASYSTEM_DEPLOYED=\"${data_system_deployed}\""
+  -s "function_scheduler.env.YR_BYPASS_DATASYSTEM=\"${YR_BYPASS_DATASYSTEM:-false}\""
+)
+case "${data_system_deployed}" in
+  false|FALSE|0|no|NO|off|OFF)
+    ds_worker_args=(
+      -s 'mode.master.ds_worker=false'
+    )
+    ;;
+esac
 
 function resolve_host() {
   python3 - "$1" <<'PY'
@@ -52,6 +70,8 @@ exec /usr/local/bin/yr start \
   -s 'mode.master.function_scheduler=true' \
   -s 'mode.master.meta_service=true' \
   -s 'mode.master.iam_server=true' \
+  "${ds_worker_args[@]}" \
+  "${data_system_capability_args[@]}" \
   -s "values.host_ip=\"${master_ip}\"" \
   -s "values.cpu_num=\"${controlplane_cpu_num}\"" \
   -s 'values.etcd.enable_multi_master=true' \

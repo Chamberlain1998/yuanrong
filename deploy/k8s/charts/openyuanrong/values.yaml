@@ -578,6 +578,10 @@ global:
 
   ##dataSystem config
   dataSystem:
+    # Whether DataSystem is deployed and available to the cluster.
+    enabled: true
+    # Whether ordinary invoke bypasses DataSystem object reference accounting.
+    bypass: false
     # Specifies whether auth is enable
     authEnabled: false
     # auth ak

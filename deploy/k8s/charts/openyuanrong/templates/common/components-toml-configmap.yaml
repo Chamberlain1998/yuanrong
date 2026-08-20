@@ -1,8 +1,14 @@
+{{- $dsEnabled := .Values.global.dataSystem.enabled -}}
+{{- $dsBypass := .Values.global.dataSystem.bypass -}}
+{{- if and (not $dsEnabled) (not $dsBypass) -}}
+{{- fail "YR_BYPASS_DATASYSTEM must be true when YR_DATASYSTEM_DEPLOYED is false" -}}
+{{- end -}}
+{{- $stateStorageType := ternary .Values.global.common.stateStorageType "disable" $dsEnabled -}}
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: components-toml-config
-  namespace: default
+  namespace: {{ .Values.global.namespace }}
 data:
   config.toml: |-
     [function_master]
@@ -21,8 +27,10 @@ data:
     RUNTIME_MICROSERVICE_AZ="cn-north-4g"
     TZ="Asia/Shanghai"
     STS_ENABLE="false"
+    YR_DATASYSTEM_DEPLOYED={{ quote $dsEnabled }}
+    YR_BYPASS_DATASYSTEM={{ quote $dsBypass }}
     MAX_STORAGE_OPERATE_RETRY_TIMES="60"
-    DS_HEALTH_CHECK_PATH="/home/sn/datasystem/health"
+    DS_HEALTH_CHECK_PATH={{ ternary "/home/sn/datasystem/health" "" $dsEnabled | quote }}
     DS_HEALTH_CHECK_INTERVAL="1000"
     MAX_DS_HEALTH_CHECK_TIMES="12"
     CLUSTER_NAME="cn-dev"
@@ -114,6 +122,8 @@ data:
     HOME="/home/sn"
     ResourcePath="/home/sn/resource"
     SSL_PWD_FILE="cert_pwd"
+    YR_DATASYSTEM_DEPLOYED={{ quote $dsEnabled }}
+    YR_BYPASS_DATASYSTEM={{ quote $dsBypass }}
     SCC_ENABLE={{ quote .Values.global.scc.enable }}
     SCC_ALGORITHM={{ quote .Values.global.scc.algorithm }}
     SCC_PRIMARY_FILE="primary.ks"
@@ -141,8 +151,8 @@ data:
     runtime_heartbeat_enable="true"
     runtime_max_heartbeat_timeout_times={{ quote .Values.global.runtime.runtimeMaxHeartbeatTimeoutTimes }}
     runtime_heartbeat_timeout_ms={{ quote .Values.global.runtime.runtimeHeartbeatTimeoutMS }}
-    cache_storage_host="{HOST_IP}"
-    cache_storage_port={{ quote .Values.global.port.worker }}
+    cache_storage_host={{ ternary "{HOST_IP}" "" $dsEnabled | quote }}
+    cache_storage_port={{ ternary (toString .Values.global.port.worker) "" $dsEnabled | quote }}
     ip="{HOST_IP}"
     grpc_listen_port={{ quote .Values.global.port.functionProxyGrpcPort }}
     enable_driver={{ quote .Values.global.common.driverEnable }}
@@ -150,7 +160,7 @@ data:
     runtime_recover_enable=""
     observability_agent_grpc_port="4317"
     enable_trace={{ quote .Values.global.observer.trace.enable }}
-    state_storage_type={{ quote .Values.global.common.stateStorageType }}
+    state_storage_type={{ quote $stateStorageType }}
     decrypt_algorithm={{ quote .Values.global.common.decryptAlgorithm }}
     cache_storage_auth_enable={{ quote .Values.global.dataSystem.authEnabled }}
     cache_storage_auth_type={{ quote .Values.global.dataSystem.authType}}
@@ -254,6 +264,8 @@ data:
     DELEGATE_ENV_VAR='{"DISABLE_APIG_FORMAT":"true"}'
     GOOGLE_LOG_DIR={{ quote .Values.global.log.functionSystem.path}}
     DATASYSTEM_CLIENT_LOG_DIR={{ quote .Values.global.log.functionSystem.path}}
+    YR_DATASYSTEM_DEPLOYED={{ quote $dsEnabled }}
+    YR_BYPASS_DATASYSTEM={{ quote $dsBypass }}
 
     [function_agent.args]
     ip="{POD_IP}"
@@ -302,8 +314,6 @@ data:
     code_aging_time={{ quote .Values.global.common.codeAgingTime }}
     system_auth_mode={{ quote .Values.global.common.systemAuthMode }}
     custom_resources=""
-
-
     [runtime_manager]
     bin_path = "/home/sn/bin/runtime_manager"
 
@@ -321,6 +331,8 @@ data:
     RUNTIME_TRACE_CONFIG={{ quote .Values.global.observer.trace.runtimeTraceConfig }}
     ENABLE_DS_CLIENT="0"
     RESOURCE_PATH="/home/sn/resource"
+    YR_DATASYSTEM_DEPLOYED={{ quote $dsEnabled }}
+    YR_BYPASS_DATASYSTEM={{ quote $dsBypass }}
 
     [runtime_manager.args]
     runtime_dir="/home/snuser/runtime"
@@ -490,7 +502,9 @@ data:
     NODE_IP="{RUNTIME_HOST_IP}"
     HOST_IP="{RUNTIME_HOST_IP}"
     POD_NAME="{RUNTIME_POD_NAME}"
-    DATASYSTEM_ADDR="{RUNTIME_HOST_IP}:31501"
+    DATASYSTEM_ADDR={{ ternary "{RUNTIME_HOST_IP}:31501" "" $dsEnabled | quote }}
+    YR_DATASYSTEM_DEPLOYED={{ quote $dsEnabled }}
+    YR_BYPASS_DATASYSTEM={{ quote $dsBypass }}
     YR_DATASYSTEM_DEFAULT_WRITE_MODE={{ quote .Values.global.runtime.defaultWriteMode }}
     ENABLE_SERVER_MODE={{ quote .Values.global.runtime.serverModeEnable }} # ${ENABLE_SERVER_MODE:-"true"} 原取值逻辑
     YR_FUNCTION_LIB_PATH="/home/sn/frontend/bin" # ${YR_FUNCTION_LIB_PATH:-"./"} 原取值逻辑
@@ -558,7 +572,9 @@ data:
     IAM_META_STORE_ADDRESS={{ quote .Values.global.etcdManagement.metcd }}
     {{ end }}
     SslTargetName="aaa.bbb"
+    {{- if $dsEnabled }}
     DS_WORKER_PORT={{ quote .Values.global.port.worker }}
+    {{- end }}
     ENABLE_TRACE={{ quote .Values.global.observer.enableTrace }}
     LOG_PATH={{ quote .Values.global.log.functionSystem.path}}
     LOG_LEVEL="DEBUG"
@@ -579,12 +595,12 @@ data:
     RUNTIME_HEARTBEAT_TIMEOUT_MS={{ quote .Values.global.runtime.runtimeHeartbeatTimeoutMS }}
     RUNTIME_RECOVER_ENABLE="false"
     DRIVER_ENABLE={{ quote .Values.global.common.driverEnable }}
-    STATE_STORAGE_TYPE={{ quote .Values.global.common.stateStorageType }}
+    STATE_STORAGE_TYPE={{ quote $stateStorageType }}
     ELECTION_MODE={{ quote .Values.global.common.electionMode }}
     MAX_GRPC_SIZE={{ quote .Values.global.common.maxGrpcSize }}
     DS_HEALTH_CHECK_INTERVAL="1000"
     MAX_DS_HEALTH_CHECK_TIMES="12"
-    DS_HEALTH_CHECK_PATH="/home/sn/datasystem/health"
+    DS_HEALTH_CHECK_PATH={{ ternary "/home/sn/datasystem/health" "" $dsEnabled | quote }}
     SERVICES_PATH="/home/sn/service-config/services.yaml"
     SYSTEM_TIMEOUT={{ quote .Values.global.common.systemTimeout }}
     SERVICE_TTL="60000"
@@ -688,6 +704,8 @@ data:
     NODE_IP="{RUNTIME_HOST_IP}"
     HOST_IP="{RUNTIME_HOST_IP}"
     POD_NAME="{RUNTIME_POD_NAME}"
+    YR_DATASYSTEM_DEPLOYED={{ quote $dsEnabled }}
+    YR_BYPASS_DATASYSTEM={{ quote $dsBypass }}
     ENABLE_SERVER_MODE={{ quote .Values.global.runtime.serverModeEnable }}
     YR_FUNCTION_LIB_PATH="/home/sn/manager/bin"
     LD_LIBRARY_PATH = "/home/sn/bin:/home/sn/lib:/home/sn/snlib:/home/sn/manager/bin"
@@ -753,7 +771,9 @@ data:
     IAM_META_STORE_ADDRESS={{ quote .Values.global.etcdManagement.metcd }}
     {{ end }}
     SslTargetName="aaa.bbb"
+    {{- if $dsEnabled }}
     DS_WORKER_PORT={{ quote .Values.global.port.worker }}
+    {{- end }}
     ENABLE_TRACE={{ quote .Values.global.observer.enableTrace }}
     LOG_PATH={{ quote .Values.global.log.functionSystem.path}}
     LOG_LEVEL="DEBUG"
@@ -774,12 +794,12 @@ data:
     RUNTIME_HEARTBEAT_TIMEOUT_MS={{ quote .Values.global.runtime.runtimeHeartbeatTimeoutMS }}
     RUNTIME_RECOVER_ENABLE="false"
     DRIVER_ENABLE={{ quote .Values.global.common.driverEnable }}
-    STATE_STORAGE_TYPE={{ quote .Values.global.common.stateStorageType }}
+    STATE_STORAGE_TYPE={{ quote $stateStorageType }}
     ELECTION_MODE={{ quote .Values.global.common.electionMode }}
     MAX_GRPC_SIZE={{ quote .Values.global.common.maxGrpcSize }}
     DS_HEALTH_CHECK_INTERVAL="1000"
     MAX_DS_HEALTH_CHECK_TIMES="12"
-    DS_HEALTH_CHECK_PATH="/home/sn/datasystem/health"
+    DS_HEALTH_CHECK_PATH={{ ternary "/home/sn/datasystem/health" "" $dsEnabled | quote }}
     SERVICES_PATH="/home/sn/service-config/services.yaml"
     SYSTEM_TIMEOUT={{ quote .Values.global.common.systemTimeout }}
     SERVICE_TTL="60000"
@@ -881,6 +901,8 @@ data:
     NODE_IP="{RUNTIME_HOST_IP}"
     HOST_IP="{RUNTIME_HOST_IP}"
     POD_NAME="{RUNTIME_POD_NAME}"
+    YR_DATASYSTEM_DEPLOYED={{ quote $dsEnabled }}
+    YR_BYPASS_DATASYSTEM={{ quote $dsBypass }}
     ENABLE_SERVER_MODE={{ quote .Values.global.runtime.serverModeEnable }}
     YR_DATASYSTEM_DEFAULT_WRITE_MODE={{ quote .Values.global.runtime.defaultWriteMode }}
     YR_FUNCTION_LIB_PATH="/home/sn/scheduler/bin"
@@ -947,7 +969,9 @@ data:
     IAM_META_STORE_ADDRESS={{ quote .Values.global.etcdManagement.metcd }}
     {{ end }}
     SslTargetName="aaa.bbb"
+    {{- if $dsEnabled }}
     DS_WORKER_PORT={{ quote .Values.global.port.worker }}
+    {{- end }}
     ENABLE_TRACE={{ quote .Values.global.observer.enableTrace }}
     LOG_PATH={{ quote .Values.global.log.functionSystem.path}}
     LOG_LEVEL="DEBUG"
@@ -968,12 +992,12 @@ data:
     RUNTIME_HEARTBEAT_TIMEOUT_MS={{ quote .Values.global.runtime.runtimeHeartbeatTimeoutMS }}
     RUNTIME_RECOVER_ENABLE="false"
     DRIVER_ENABLE={{ quote .Values.global.common.driverEnable }}
-    STATE_STORAGE_TYPE={{ quote .Values.global.common.stateStorageType }}
+    STATE_STORAGE_TYPE={{ quote $stateStorageType }}
     ELECTION_MODE={{ quote .Values.global.common.electionMode }}
     MAX_GRPC_SIZE={{ quote .Values.global.common.maxGrpcSize }}
     DS_HEALTH_CHECK_INTERVAL="1000"
     MAX_DS_HEALTH_CHECK_TIMES="12"
-    DS_HEALTH_CHECK_PATH="/home/sn/datasystem/health"
+    DS_HEALTH_CHECK_PATH={{ ternary "/home/sn/datasystem/health" "" $dsEnabled | quote }}
     SERVICES_PATH="/home/sn/service-config/services.yaml"
     SYSTEM_TIMEOUT={{ quote .Values.global.common.systemTimeout }}
     SERVICE_TTL="60000"

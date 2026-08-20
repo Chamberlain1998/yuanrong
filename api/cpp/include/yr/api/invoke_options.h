@@ -206,9 +206,10 @@ struct InvokeOptions {
 
     /*!
      * @var bool bypassDatasystem
-     * @brief Whether to bypass datasystem for the return path. When True, all return values
-     * are kept in native memory and no IncreaseRef/DecreaseRef is performed.
-     * Return values exceeding 100MB will be truncated.
+     * @brief Whether to bypass DataSystem for invoke arguments and return values. When true, payloads are
+     * transferred inline and no IncreaseRef/DecreaseRef is performed. The aggregate serialized arguments and
+     * aggregate serialized return values of each invocation are each limited to 100 MiB. Exceeding either limit
+     * returns ERR_PARAM_INVALID; payloads are never truncated.
      */
     bool bypassDatasystem = false;
 

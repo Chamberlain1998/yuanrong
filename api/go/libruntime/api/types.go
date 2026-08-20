@@ -262,8 +262,10 @@ type InvokeOptions struct {
 	TrafficLimited       bool
 	ForceInvoke          bool
 	IsInterrupted        bool
-	BypassDataSystem     bool
-	SessionCtxID         string
+	// BypassDataSystem transfers invoke payloads inline. Aggregate serialized arguments and aggregate serialized
+	// return values are each limited to 100 MiB and oversized payloads fail with ERR_PARAM_INVALID.
+	BypassDataSystem bool
+	SessionCtxID     string
 }
 
 // InstanceAllocation holds the allocation of instance

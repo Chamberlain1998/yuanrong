@@ -1,3 +1,4 @@
+{{- include "yr-k8s.validateDataSystem" . }}
 {{- if .Values.node.enabled }}
 apiVersion: apps/v1
 kind: DaemonSet
@@ -50,8 +51,14 @@ spec:
               value: {{ .Values.node.ports.functionProxy.containerPort | quote }}
             - name: FUNCTION_PROXY_GRPC_PORT
               value: {{ .Values.node.ports.functionProxyGrpc.containerPort | quote }}
+            - name: YR_DATASYSTEM_DEPLOYED
+              value: {{ .Values.global.dataSystem.enabled | quote }}
+            - name: YR_BYPASS_DATASYSTEM
+              value: {{ .Values.global.dataSystem.bypass | quote }}
+{{- if .Values.global.dataSystem.enabled }}
             - name: DS_WORKER_PORT
               value: {{ .Values.node.ports.dsWorker.containerPort | quote }}
+{{- end }}
             - name: DOCKER_DRIVER
               value: {{ .Values.node.docker.storageDriver | quote }}
           ports:
@@ -63,10 +70,12 @@ spec:
               containerPort: {{ .Values.node.ports.functionProxyGrpc.containerPort }}
               hostPort: {{ .Values.node.ports.functionProxyGrpc.hostPort }}
               protocol: TCP
+{{- if .Values.global.dataSystem.enabled }}
             - name: ds-worker
               containerPort: {{ .Values.node.ports.dsWorker.containerPort }}
               hostPort: {{ .Values.node.ports.dsWorker.hostPort }}
               protocol: TCP
+{{- end }}
 {{- with .Values.node.probes.readiness }}
           readinessProbe:
 {{ toYaml . | nindent 12 }}

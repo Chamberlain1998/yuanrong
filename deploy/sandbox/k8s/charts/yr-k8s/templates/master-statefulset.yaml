@@ -1,3 +1,4 @@
+{{- include "yr-k8s.validateDataSystem" . }}
 {{- if .Values.master.enabled }}
 apiVersion: apps/v1
 kind: StatefulSet
@@ -47,6 +48,10 @@ spec:
                   fieldPath: status.hostIP
             - name: YR_ETCD_ADDR_LIST
               value: {{ include "yr-k8s.etcdAddrList" . | quote }}
+            - name: YR_DATASYSTEM_DEPLOYED
+              value: {{ .Values.global.dataSystem.enabled | quote }}
+            - name: YR_BYPASS_DATASYSTEM
+              value: {{ .Values.global.dataSystem.bypass | quote }}
             - name: LITEBUS_DATA_KEY
               valueFrom:
                 secretKeyRef:

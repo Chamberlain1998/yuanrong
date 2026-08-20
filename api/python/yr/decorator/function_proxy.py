@@ -37,6 +37,7 @@ from yr.object_ref import ObjectRef, ObjectRefDirect
 from yr.runtime_holder import global_runtime
 from yr.generator import ObjectRefGenerator
 from yr.serialization import Serialization
+from yr.datasystem_capability import require_data_system, require_data_system_for_object_refs
 
 _logger = logging.getLogger(__name__)
 
@@ -292,7 +293,10 @@ class FunctionProxy:
         Raises:
             TypeError: This exception is thrown if the type of the passed parameter is incorrect.
         """
-        opts = ConfigManager().override_bypass_datasystem(opts)
+        opts = ConfigManager().apply_data_system_capability(opts)
+        require_data_system_for_object_refs("ObjectRef invoke arguments", args, kwargs)
+        if self._is_generator:
+            require_data_system("generator invoke")
         function_id = self.designated_urn
         if self.cross_language_info is None:
             args_list = signature.package_args(self.sig, args, kwargs)
@@ -310,6 +314,7 @@ class FunctionProxy:
                     self._code = serialized_object.to_bytes()
                     _logger.debug("[Reference Counting] pass code by request, functionName = %s", func.__qualname__)
                 else:
+                    require_data_system("serialized function code")
                     runtime = global_runtime.get_runtime()
                     code_id = runtime.put_serialized(serialized_object)
                     if not isinstance(code_id, str):
@@ -319,7 +324,11 @@ class FunctionProxy:
                                 self._code_ref.id, func.__qualname__)
         with self._lock:
             if self._initializer and self._initializer_code_ref is None:
+                require_data_system("function initializer")
                 self._initializer_code_ref = yr.put(self._initializer)
+
+        if self._code_ref is not None:
+            require_data_system("serialized function code")
 
         initializer_code_id = self._initializer_code_ref.id if self._initializer_code_ref is not None else ""
         func_meta = FunctionMeta(functionID=function_id,  # if designated_urn is not set,
@@ -346,6 +355,8 @@ class FunctionProxy:
         if self.return_nums == 0:
             return None
         objref_list = []
+        if ref_cls is None and opts.bypass_datasystem:
+            ref_cls = ObjectRefDirect
         if ref_cls is not None:
             for i in obj_list:
                 objref_list.append(ref_cls(i))

@@ -17,6 +17,8 @@
 - [可观测性](./observability.md) - OpenTelemetry、Prometheus、Loki、Tempo
 - [Traefik 路由重构](./traefik-routing.md) - HTTP 路径路由
 - [Sandbox 外部认证](./iam-auth.md#sandbox-外部认证) - Sandbox 与 IAM 集成
+- [DataSystem 可选部署](./datasystem-optional-deployment.md) - no-DS 部署、能力传播和 API 可用性
+- [Direct invoke](./direct-invoke.md) - 内联调用、引用语义和载荷限制
 
 ## 新增特性汇总
 
@@ -34,6 +36,8 @@
 | IAM 认证与授权 | Beta (TODO: 与函数系统对接) | functionsystem, frontend |
 | Sandbox 外部认证 | Beta | frontend |
 | Snapshot/Checkpoint | Beta | functionsystem, yuanrong |
+| DataSystem 可选部署 | Beta | yuanrong, frontend, functionsystem |
+| Direct invoke | Beta | yuanrong, functionsystem |
 
 ## 待办事项 (TODO)
 

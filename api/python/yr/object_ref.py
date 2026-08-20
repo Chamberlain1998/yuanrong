@@ -31,6 +31,7 @@ from yr.libruntime_pb2 import FunctionMeta
 import yr
 from yr.common import constants
 from yr.ds_tensor_client_manager import get_tensor_client
+from yr.datasystem_capability import require_data_system
 
 _logger = logging.getLogger(__name__)
 _runtime_holder_module = None
@@ -266,6 +267,7 @@ class ObjectRef:
         self.exception()
         if timeout <= constants.MIN_TIMEOUT_LIMIT and timeout != constants.NO_LIMIT:
             raise_yr_value_error("Parameter 'timeout' should be greater than 0 or equal to -1 (no timeout)")
+        require_data_system("ObjectRef.get")
 
         runtime_holder = _get_runtime_holder()
         objects = runtime_holder.global_runtime.get_runtime().get([self.id], timeout, False)
@@ -299,10 +301,18 @@ class ObjectRef:
 
 
 class ObjectRefDirect(ObjectRef):
-    """ObjectRefDirect bypasses datasystem — no IncreaseRef/DecreaseRef.
+    """A future-backed inline invoke result that does not use DataSystem reference counting.
 
-    Return values exceeding the truncation threshold (100MB) will be truncated.
+    Direct invoke requests and responses are each limited to an aggregate serialized size of
+    100 MiB. Oversized payloads fail with ``ERR_PARAM_INVALID`` and are never truncated.
     """
 
     def __init__(self, object_id: str, task_id=None, exception=None):
         super().__init__(object_id, task_id=task_id, need_incre=False, need_decre=False, exception=exception)
+
+    def get(self, timeout: int = constants.DEFAULT_GET_TIMEOUT) -> Any:
+        """Read an inline invoke result without issuing a DataSystem Get."""
+        self.exception()
+        if timeout <= constants.MIN_TIMEOUT_LIMIT and timeout != constants.NO_LIMIT:
+            raise_yr_value_error("Parameter 'timeout' should be greater than 0 or equal to -1 (no timeout)")
+        return self.get_future().result(timeout=None if timeout == constants.NO_LIMIT else timeout)

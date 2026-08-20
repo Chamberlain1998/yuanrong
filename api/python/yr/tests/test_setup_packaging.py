@@ -135,6 +135,24 @@ class SetupPackagingTest(unittest.TestCase):
                 setup_mod = load_setup_module(setup_type)
                 self.assertEqual(setup_mod.setup_spec.install_requires, expected)
 
+    def test_runtime_image_uses_sdk_cloudpickle_version(self):
+        sdk_cloudpickle = next(
+            requirement
+            for requirement in load_setup_module("sdk").setup_spec.install_requires
+            if requirement.startswith("cloudpickle==")
+        )
+        dockerfile = (
+            REPO_ROOT
+            / "deploy"
+            / "k8s"
+            / "build"
+            / "functionsystem"
+            / "dockerfile"
+            / "Dockerfile-runtime-manager"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(sdk_cloudpickle, dockerfile)
+
     def test_cli_config_uses_declared_tomli_fallback(self):
         config_source = (
             REPO_ROOT / "api" / "python" / "yr" / "cli" / "config.py"

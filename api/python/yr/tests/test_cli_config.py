@@ -176,6 +176,15 @@ class TestCliConfig(unittest.TestCase):
 
         self.assertIs(config["function_proxy"]["args"]["data_system_enable"], False)
         self.assertIs(config["function_agent"]["args"]["data_system_enable"], False)
+        self.assertEqual(
+            config["function_proxy"]["env"]["YR_DATASYSTEM_DEPLOYED"], "true"
+        )
+        self.assertEqual(
+            config["function_agent"]["env"]["YR_DATASYSTEM_DEPLOYED"], "true"
+        )
+        self.assertEqual(
+            config["function_agent"]["env"]["YR_BYPASS_DATASYSTEM"], "false"
+        )
 
     def test_function_agent_data_system_enable_override_reaches_both_modes(self):
         for enabled in (False, True):
@@ -191,6 +200,14 @@ class TestCliConfig(unittest.TestCase):
                 self.assertIs(
                     config["function_agent"]["args"]["data_system_enable"], enabled
                 )
+                self.assertEqual(
+                    config["function_agent"]["env"]["YR_DATASYSTEM_DEPLOYED"],
+                    "true",
+                )
+                self.assertEqual(
+                    config["function_agent"]["env"]["YR_BYPASS_DATASYSTEM"],
+                    "false",
+                )
 
     def test_function_agent_data_system_enable_rejects_non_boolean(self):
         with self.assertRaisesRegex(
@@ -199,6 +216,21 @@ class TestCliConfig(unittest.TestCase):
             self._resolve_real_config(
                 '[values.function_agent]\ndata_system_enable = "false"\n'
             )
+
+    def test_sandbox_capability_override_is_independent_from_agent_client(self):
+        config = self._resolve_real_config(
+            "[function_agent.env]\n"
+            'YR_DATASYSTEM_DEPLOYED = "false"\n'
+            'YR_BYPASS_DATASYSTEM = "true"\n'
+        )
+
+        self.assertIs(config["function_agent"]["args"]["data_system_enable"], False)
+        self.assertEqual(
+            config["function_agent"]["env"]["YR_DATASYSTEM_DEPLOYED"], "false"
+        )
+        self.assertEqual(
+            config["function_agent"]["env"]["YR_BYPASS_DATASYSTEM"], "true"
+        )
 
     def test_local_ip_defaults_to_host_ip_for_backward_compatibility(self):
         config = self._resolve_real_config('[values]\nhost_ip = "192.0.2.10"\n')

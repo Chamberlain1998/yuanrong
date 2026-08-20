@@ -18,6 +18,7 @@
 #include <algorithm>
 #include "datasystem_object_store.h"
 #include "src/dto/buffer.h"
+#include "src/libruntime/utils/datasystem_utils.h"
 #include "src/utility/id_generator.h"
 #include "src/utility/logger/logger.h"
 namespace YR {
@@ -34,6 +35,9 @@ void MemoryStore::Init(std::shared_ptr<ObjectStore> _dsObjectStore,
 
 ErrorInfo MemoryStore::GenerateKey(std::string &key, const std::string &prefix, bool isPut)
 {
+    if (!dsObjectStore) {
+        return MakeDataSystemUnavailableError("GenerateKey");
+    }
     return dsObjectStore->GenerateKey(key, prefix, isPut);
 }
 
@@ -48,6 +52,9 @@ ErrorInfo MemoryStore::GenerateReturnObjectIds(const std::string &requestId,
 
 ErrorInfo MemoryStore::GetPrefix(const std::string &key, std::string &prefix)
 {
+    if (!dsObjectStore) {
+        return MakeDataSystemUnavailableError("GetPrefix");
+    }
     return dsObjectStore->GetPrefix(key, prefix);
 }
 
@@ -62,6 +69,9 @@ ErrorInfo MemoryStore::Put(std::shared_ptr<Buffer> data, const std::string &objI
                            const std::unordered_set<std::string> &nestedID, bool toDataSystem,
                            const CreateParam &createParam, const ErrorInfo &err)
 {
+    if (toDataSystem && !dsObjectStore) {
+        return MakeDataSystemUnavailableError("Put");
+    }
     std::unique_lock<std::mutex> lock(mu);
     std::unique_lock<std::mutex> objectDetailLock;
     if (nestedID.find(objID) != nestedID.end()) {
@@ -144,6 +154,9 @@ SingleResult MemoryStore::Get(const std::string &objID, int timeoutMS)
             return std::make_pair(ErrorInfo(), buffer);
         } else {
             lock.unlock();
+            if (!dsObjectStore) {
+                return std::make_pair(MakeDataSystemUnavailableError("Get"), nullptr);
+            }
             return dsObjectStore->Get(objID, timeoutMS);
         }
     } else {
@@ -156,6 +169,9 @@ SingleResult MemoryStore::Get(const std::string &objID, int timeoutMS)
 // Without storeMap management. Directly Get from DS
 SingleResult MemoryStore::DSDirectGet(const std::string &objID, int timeoutMS)
 {
+    if (!dsObjectStore) {
+        return std::make_pair(MakeDataSystemUnavailableError("Get"), nullptr);
+    }
     return dsObjectStore->Get(objID, timeoutMS);
 }
 
@@ -168,6 +184,9 @@ MultipleResult MemoryStore::Get(const std::vector<std::string> &ids, int timeout
     lastErr = GetBuffersFromMem(ids, result, notInMemIndex, vecGetFromDS);
     if (vecGetFromDS.size() == 0) {
         return std::make_pair(lastErr, result);
+    }
+    if (!dsObjectStore) {
+        return std::make_pair(MakeDataSystemUnavailableError("Get"), result);
     }
     MultipleResult dsMultiRes = dsObjectStore->Get(vecGetFromDS, timeoutMS);
     if (dsMultiRes.first.Code() != ErrorCode::ERR_OK) {
@@ -191,6 +210,7 @@ ErrorInfo MemoryStore::IncreGlobalReference(const std::vector<std::string> &obje
 std::pair<ErrorInfo, std::vector<std::string>> MemoryStore::IncreaseGRefInMemoryAndDs(
     const std::vector<std::string> &objectIds, bool toDataSystem, const std::string &remoteId)
 {
+    toDataSystem = toDataSystem && dsObjectStore != nullptr;
     std::unique_lock<std::mutex> lock(mu);
     std::vector<std::string> shouldIncreInDS;
     std::vector<std::shared_ptr<ObjectDetail>> increseObjectDetails;
@@ -258,6 +278,9 @@ std::pair<ErrorInfo, std::vector<std::string>> MemoryStore::IncreaseGRefInMemory
 
 ErrorInfo MemoryStore::IncreDSGlobalReference(const std::vector<std::string> &objectIds)
 {
+    if (!dsObjectStore) {
+        return ErrorInfo();
+    }
     std::unique_lock<std::mutex> lock(mu);
     std::vector<std::string> shouldIncreInDS;
     std::vector<std::shared_ptr<ObjectDetail>> increaseObjectDetails;
@@ -369,6 +392,9 @@ ErrorInfo MemoryStore::DecreGlobalReference(const std::vector<std::string> &obje
     std::vector<std::string> shouldDecreInDS = DecreaseGRefInMemory(objectIds);
     // remove from datasystem
     if (!shouldDecreInDS.empty()) {
+        if (!dsObjectStore) {
+            return ErrorInfo();
+        }
         return dsObjectStore->DecreGlobalReference(shouldDecreInDS);
     }
     return ErrorInfo();
@@ -380,6 +406,9 @@ std::pair<ErrorInfo, std::vector<std::string>> MemoryStore::DecreGlobalReference
     std::vector<std::string> shouldDecreInDS = DecreaseGRefInMemory(objectIds);
     // remove from datasystem
     if (!shouldDecreInDS.empty()) {
+        if (!dsObjectStore) {
+            return std::make_pair(ErrorInfo(), std::vector<std::string>());
+        }
         return dsObjectStore->DecreGlobalReference(shouldDecreInDS, remoteId);
     }
     return std::make_pair(ErrorInfo(), std::vector<std::string>());
@@ -401,8 +430,10 @@ std::vector<int> MemoryStore::QueryGlobalReference(const std::vector<std::string
                 objDetail = it->second;
                 objectDetailLock = std::unique_lock<std::mutex>(objDetail->_mu);
             }
-            // not in storeMap, or local ref sum is 0
-            if (it == storeMap.end() || !(objDetail->storeInMemory) || objDetail->localRefCount == 0) {
+            if (!dsObjectStore && it != storeMap.end()) {
+                globalRef[i] = objDetail->localRefCount;
+            } else if (it == storeMap.end() || !(objDetail->storeInMemory) || objDetail->localRefCount == 0) {
+                // Not in memory, so the authoritative ref count is in DataSystem.
                 shouldQueryFromDS.push_back(id);
                 shouldQueryFromDSIndex.push_back(i);
             } else {
@@ -415,6 +446,9 @@ std::vector<int> MemoryStore::QueryGlobalReference(const std::vector<std::string
     if (shouldQueryFromDS.empty()) {
         return globalRef;
     }
+    if (!dsObjectStore) {
+        return globalRef;
+    }
     std::vector<int> dsGlobalRef = dsObjectStore->QueryGlobalReference(shouldQueryFromDS);
     for (i = 0; i < dsGlobalRef.size(); i++) {
         globalRef[shouldQueryFromDSIndex[i]] = dsGlobalRef[i];
@@ -424,6 +458,9 @@ std::vector<int> MemoryStore::QueryGlobalReference(const std::vector<std::string
 
 ErrorInfo MemoryStore::ReleaseGRefs(const std::string &remoteId)
 {
+    if (!dsObjectStore) {
+        return ErrorInfo();
+    }
     return dsObjectStore->ReleaseGRefs(remoteId);
 }
 
@@ -454,6 +491,9 @@ void MemoryStore::Clear()
 
 ErrorInfo MemoryStore::DoPutToDS(const std::string &id, const CreateParam &createParam)
 {
+    if (!dsObjectStore) {
+        return MakeDataSystemUnavailableError("Put");
+    }
     std::unique_lock<std::mutex> lock(mu);
     auto it = storeMap.find(id);
     if (it == storeMap.end()) {
@@ -539,6 +579,15 @@ ErrorInfo MemoryStore::IncreaseObjRef(const std::vector<std::string> &objectIds)
     ErrorInfo err = CheckObjectsExist(objectIds);
     if (err.Code() != ErrorCode::ERR_OK) {
         return err;
+    }
+
+    if (!dsObjectStore) {
+        for (const auto &objectId : objectIds) {
+            auto objectDetail = storeMap.at(objectId);
+            std::lock_guard<std::mutex> objectLock(objectDetail->_mu);
+            objectDetail->localRefCount++;
+        }
+        return ErrorInfo();
     }
 
     std::vector<std::string> objectIdsNeedIncre;
@@ -645,6 +694,9 @@ std::vector<std::string> MemoryStore::UnbindObjRefInReq(const std::string &reque
 ErrorInfo MemoryStore::CreateBuffer(const std::string &objectId, size_t dataSize, std::shared_ptr<Buffer> &dataBuf,
                                     const CreateParam &createParam)
 {
+    if (!dsObjectStore) {
+        return MakeDataSystemUnavailableError("CreateBuffer");
+    }
     return dsObjectStore->CreateBuffer(objectId, dataSize, dataBuf, createParam);
 }
 
@@ -667,6 +719,9 @@ std::pair<ErrorInfo, std::vector<std::shared_ptr<Buffer>>> MemoryStore::GetBuffe
     std::vector<std::shared_ptr<Buffer>> result(ids.size());
     lastErr = this->GetBuffersFromMem(ids, result, notInMemIndex, vecGetFromDS);
     if (vecGetFromDS.size() > 0) {
+        if (!dsObjectStore) {
+            return std::make_pair(MakeDataSystemUnavailableError("GetBuffer"), result);
+        }
         auto dsMultiRes = dsObjectStore->GetBuffers(vecGetFromDS, timeoutMS);
         if (dsMultiRes.first.Code() != ErrorCode::ERR_OK) {
             lastErr = dsMultiRes.first;
@@ -725,6 +780,11 @@ std::pair<RetryInfo, std::vector<std::shared_ptr<Buffer>>> MemoryStore::GetBuffe
     RetryInfo retryInfo;
     retryInfo.retryType = RetryType::UNLIMITED_RETRY;
     if (vecGetFromDS.size() > 0) {
+        if (!dsObjectStore) {
+            retryInfo.retryType = RetryType::NO_RETRY;
+            retryInfo.errorInfo = MakeDataSystemUnavailableError("GetBuffer");
+            return std::make_pair(retryInfo, result);
+        }
         auto dsResult = dsObjectStore->GetBuffersWithoutRetry(vecGetFromDS, timeoutMS);
         if (dsResult.second.empty()) {
             retryInfo = dsResult.first;
@@ -783,9 +843,13 @@ bool MemoryStore::SetReady(const std::string &id)
     }
     auto err = ErrorInfo();
     if (!callbacksWithData.empty() && !data) {
-        auto res = dsObjectStore->Get(id, -1);
-        err = res.first;
-        data = res.second;
+        if (!dsObjectStore) {
+            err = MakeDataSystemUnavailableError("Get");
+        } else {
+            auto res = dsObjectStore->Get(id, -1);
+            err = res.first;
+            data = res.second;
+        }
     }
     for (auto &f : callbacksWithData) {
         f(err, data);
@@ -1002,6 +1066,8 @@ bool MemoryStore::AddReadyCallbackWithData(const std::string &id, ObjectReadyCal
         ErrorInfo err;
         if (objDetail->storeInMemory) {
             data = objDetail->data;
+        } else if (!dsObjectStore) {
+            err = MakeDataSystemUnavailableError("Get");
         } else {
             auto res = dsObjectStore->Get(id, -1);
             err = res.first;

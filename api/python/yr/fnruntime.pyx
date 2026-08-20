@@ -39,6 +39,7 @@ from yr.common.types import GroupInfo, CommonStatus, Resource, Resources, Bundle
 from yr.common import constants
 from yr.common.utils import generate_random_id, create_new_event_loop, refresh_env
 from yr.config_manager import ConfigManager
+from yr.datasystem_capability import resolve_data_system_endpoint
 from yr.err_type import ErrorCode, ModuleCode, ErrorInfo
 from yr.executor.executor import Executor
 from yr.executor.instance_manager import InstanceManager, InstancePackage
@@ -1394,9 +1395,11 @@ cdef class Fnruntime:
         config.functionSystemPort = functionSystemPort
         config.functionSystemRtServerIpAddr = functionSystemRtServerIpAddr
         config.functionSystemRtServerPort = functionSystemRtServerPort
-        if ConfigManager().in_cluster:
-            config.dataSystemIpAddr = ConfigManager().ds_address.split(":")[0]
-            config.dataSystemPort = int(ConfigManager().ds_address.split(":")[1])
+        config.dataSystemDeployed = ConfigManager().data_system_capability.data_system_deployed
+        data_system_ip, data_system_port = resolve_data_system_endpoint(
+            ConfigManager().ds_address, ConfigManager().in_cluster, config.dataSystemDeployed)
+        config.dataSystemIpAddr = data_system_ip
+        config.dataSystemPort = data_system_port
         config.metaConfig = ConfigManager().meta_config.to_json()
         config.isDriver = ConfigManager().is_driver
         config.jobId = ConfigManager().job_id

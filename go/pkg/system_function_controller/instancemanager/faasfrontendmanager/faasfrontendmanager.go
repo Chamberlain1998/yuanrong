@@ -330,6 +330,7 @@ func (ffm *FrontendManager) CreateInstance(ctx context.Context, function string,
 		CreateOpt:          extraParams.CreateOpt,
 		Labels:             extraParams.Label,
 		Timeout:            150,
+		BypassDataSystem:   utils.BypassDataSystemEnabled(),
 	}
 	createCh := make(chan api.ErrorInfo, 1)
 	go func() {

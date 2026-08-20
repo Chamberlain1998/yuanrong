@@ -167,8 +167,11 @@ class Config:
     #: Whether to enable metric collection. ``False`` indicates disabled, and ``True`` indicates enabled.
     #: The default value is ``True``. This takes effect only when called in the cluster.
     enable_metrics: bool = True
-    #: Global override for ``InvokeOptions.bypass_datasystem``.
-    #: ``None`` keeps each invocation's option; ``True`` or ``False`` overrides it.
+    #: Process-level override for the default invoke transport. ``None`` uses the detected cluster default,
+    #: ``True`` uses inline transport, and ``False`` uses the DataSystem path when DataSystem is available.
+    #: This setting does not determine whether DataSystem APIs are available; that follows cluster capability.
+    #: The aggregate serialized arguments and aggregate serialized return values of each invocation are each
+    #: limited to 100 MiB. Exceeding either limit fails with ``ERR_PARAM_INVALID``.
     bypass_datasystem: Optional[bool] = None
     #: Used to set custom environment variables for the runtime. Currently, only `LD_LIBRARY_PATH` is supported.
     custom_envs: Dict[str, str] = field(default_factory=dict)
@@ -637,9 +640,11 @@ class InvokeOptions:
 
     idle_timeout: int = 300
     is_delete_remote_tensor: bool = False
-    #: Whether to bypass datasystem for the return path. When True, all return values
-    #: are kept in native memory and no IncreaseRef/DecreaseRef is performed.
-    #: Return values exceeding 100MB will be truncated.
+    #: Whether to explicitly bypass DataSystem for this invoke. ``True`` transfers payloads inline and performs no
+    #: IncreaseRef/DecreaseRef. ``False`` does not disable an effective process-level bypass default. The aggregate
+    #: serialized arguments and aggregate
+    #: serialized return values of each invocation are each limited to 100 MiB. Exceeding either limit raises
+    #: an ``ERR_PARAM_INVALID`` error; payloads are never truncated.
     #: Default: ``False``.
     bypass_datasystem: bool = False
 

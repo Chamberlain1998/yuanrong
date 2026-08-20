@@ -26,7 +26,7 @@ openYuanrong 集群由主节点 pod 和从节点 pod 组成。
 
 ### 从节点 pod
 
-从节点 pod 用于运行分布式任务，部署的 openYuanrong 组件有 function agent、function proxy、data worker 及 runtime manager。
+从节点 pod 用于运行分布式任务，部署的 openYuanrong 组件有 function agent、function proxy、runtime manager，以及默认启用但可选关闭的 data worker。
 
 ### 组件介绍
 
@@ -65,7 +65,7 @@ openYuanrong 集群由主节点 pod 和从节点 pod 组成。
   负责 cpu、memory 等资源采集和上报、函数进程生命周期管理等。部署形式为 [Deployment](https://kubernetes.io/zh-cn/docs/concepts/workloads/controllers/deployment/){target="_blank"}，它与 function agent 在一个 pod 内。
 - **data worker**
 
-  提供数据对象的存取等能力。部署形式为 [DaemonSet](https://kubernetes.io/zh-cn/docs/concepts/workloads/controllers/daemonset/){target="_blank"}。
+  提供数据对象存取等能力。默认以 [DaemonSet](https://kubernetes.io/zh-cn/docs/concepts/workloads/controllers/daemonset/){target="_blank"} 部署；仅使用 direct invoke 时可按 [DataSystem 可选部署](./production/optional-datasystem.md) 关闭。
 
 ### Pod 资源池
 

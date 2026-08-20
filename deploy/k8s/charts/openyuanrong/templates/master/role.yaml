@@ -1,7 +1,7 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: function-master
+  name: function-master-{{ .Values.global.namespace }}
   namespace: {{ .Values.global.namespace }}
 rules:
   - apiGroups:
