@@ -461,6 +461,8 @@ class SandboxCreateOptions:
     upstream: Optional[str] = None
     proxy_port: int = 8766
     sandbox_type: str = ""
+    # Docker stop grace period (seconds) before SIGKILL. None -> docker default "0".
+    graceful_shutdown_time: Optional[int] = None
     before_checkpoint_func: Optional[Callable[..., Any]] = None
     after_restore_func: Optional[Callable[..., Any]] = None
 
@@ -484,6 +486,7 @@ def create(
     sandbox_type: str = "",
     before_checkpoint_func: Optional[Callable[..., Any]] = None,
     after_restore_func: Optional[Callable[..., Any]] = None,
+    graceful_shutdown_time: Optional[int] = None,
 ):
     """
     Create a new Sandbox instance.
@@ -508,6 +511,11 @@ def create(
             Only effective when sandbox_type="docker".
         workdir (Optional[str]): Working directory inside the Docker sandbox.
             Only effective when sandbox_type="docker".
+        graceful_shutdown_time (Optional[int]): Graceful shutdown timeout in seconds
+            passed to the backend as the GRACEFUL_SHUTDOWN_TIME create-option.
+            Controls how long the executor waits before force-killing the
+            instance (e.g. Docker stop?t= for docker). None (default) uses "0"
+            for docker sandboxes so terminate is immediate.
 
     Returns:
         Sandbox wrapper instance.
@@ -549,6 +557,7 @@ def create(
             sandbox_type=sandbox_type,
             before_checkpoint_func=before_checkpoint_func,
             after_restore_func=after_restore_func,
+            graceful_shutdown_time=graceful_shutdown_time,
         )
     except Exception as e:
         print(f"failed to create, exception: {e}")
@@ -635,6 +644,7 @@ class Sandbox:
         sandbox_type: str = "",
         before_checkpoint_func: Optional[Callable[..., Any]] = None,
         after_restore_func: Optional[Callable[..., Any]] = None,
+        graceful_shutdown_time: Optional[int] = None,
     ):
         """
         Initialize the Sandbox wrapper.
@@ -666,6 +676,12 @@ class Sandbox:
                 Only effective when sandbox_type="docker".
             before_checkpoint_func (Optional[Callable]): Hook called before checkpoint.
             after_restore_func (Optional[Callable]): Hook called after restore.
+            graceful_shutdown_time (Optional[int]): Graceful shutdown timeout in
+                seconds passed to the backend as the GRACEFUL_SHUTDOWN_TIME
+                create-option. Controls how long the executor waits before
+                force-killing the instance (e.g. Docker stop?t= for docker).
+                None (default) uses "0" for docker sandboxes so terminate is
+                immediate.
         """
         self._forwarded_ports = set()
         self._tunnel_client = None
@@ -691,6 +707,7 @@ class Sandbox:
                 sandbox_type=sandbox_type,
                 before_checkpoint_func=before_checkpoint_func,
                 after_restore_func=after_restore_func,
+                graceful_shutdown_time=graceful_shutdown_time,
             ))
         else:
             self.restore_instance(checkpoint_id=checkpoint_id)
@@ -768,6 +785,9 @@ class Sandbox:
         opt.idle_timeout = idle_timeout
         if sandbox_type:
             opt.custom_extensions["sandbox_type"] = sandbox_type
+
+        if options.graceful_shutdown_time is not None:
+            opt.custom_extensions["GRACEFUL_SHUTDOWN_TIME"] = str(options.graceful_shutdown_time)
 
         if name is not None:
             opt.name = name

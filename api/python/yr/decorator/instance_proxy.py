@@ -438,6 +438,11 @@ class InstanceCreator:
         if invoke_options.idle_timeout >= 0:
             # todo(Lwy_Robb): should be remove, refactor use dposix fileds to pass it
             invoke_options.custom_extensions["idle_timeout"] = str(invoke_options.idle_timeout)
+        # Docker PID-1 often ignores SIGTERM; default to 0 for immediate SIGKILL.
+        if (is_sandbox
+                and invoke_options.custom_extensions.get("sandbox_type") == "docker"
+                and "GRACEFUL_SHUTDOWN_TIME" not in invoke_options.custom_extensions):
+            invoke_options.custom_extensions["GRACEFUL_SHUTDOWN_TIME"] = "0"
         invoke_options.check_options_valid()
         if invoke_options.get_if_exists:
             if invoke_options.name is None or len(invoke_options.name) == 0:
