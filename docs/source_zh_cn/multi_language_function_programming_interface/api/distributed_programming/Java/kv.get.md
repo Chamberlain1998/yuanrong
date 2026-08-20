@@ -19,7 +19,7 @@
 
 ```java
 
-byte[] result = YR.kv().get(key)
+byte[] result = YR.kv().get(key);
 ```
 
 - 参数：

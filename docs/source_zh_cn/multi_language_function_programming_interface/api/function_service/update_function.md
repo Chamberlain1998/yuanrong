@@ -118,7 +118,7 @@
 
 ## 请求示例
 
-POST {[meta service endpoint](api-meta-service-endpoint)}/serverless/v1/functions/{name}
+PUT {[meta service endpoint](api-meta-service-endpoint)}/serverless/v1/functions/{name}
 
 ```json
 {

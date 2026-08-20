@@ -8,6 +8,7 @@
 
 - InstanceCreator
 - CppInstanceCreator
+- JavaInstanceCreator
 
 为以下实例的内置方法时，将调用指定方法：
 
@@ -145,11 +146,11 @@ java 函数调用接口。
 
 #### public ObjectRef JavaInstanceFunctionHandler.invoke(Object... args) throws YRException
 
-[JavaInstanceFunctionHandler](JavaInstanceFunctionHandler.md) 类的成员方法，用于创建 java 类实例。
+[JavaInstanceFunctionHandler](JavaInstanceFunctionHandler.md) 类的成员方法，用于调用 Java 类实例的成员函数。
 
 - 参数：
 
-   - **args** - 调用类实例创建所需的入参。
+   - **args** - invoke 调用指定方法所需的入参。
 
 - 抛出：
 
@@ -200,7 +201,7 @@ int result = YR.get(ref, 15);
 
 #### public ObjectRef CppInstanceFunctionHandler.invoke(Object... args) throws YRException
 
-[CppInstanceFunctionHandler](CppInstanceFunctionHandler.md) 类的成员方法，用于创建 cpp 类实例。
+[CppInstanceFunctionHandler](CppInstanceFunctionHandler.md) 类的成员方法，用于调用 cpp 类实例的成员函数。
 
 ```java
 
@@ -212,7 +213,7 @@ int res = (int)YR.get(ref, 100);
 
 - 参数：
 
-   - **args** - 调用类实例创建所需的入参。
+   - **args** - invoke 调用指定方法所需的入参。
 
 - 抛出：
 
