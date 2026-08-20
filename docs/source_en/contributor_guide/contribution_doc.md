@@ -137,7 +137,6 @@ It is recommended to use [VS Code](https://code.visualstudio.com/){target="_blan
 
 ### Install Dependencies
 
-- Refer to [Compile openYuanrong from Source Code](source_code_build.md) to install tools needed for compiling runtime.
 - Download and install [Doxygen](https://github.com/doxygen/doxygen){target="_blank"} (version 1.12.0 or above).
 - Execute the following command in the code `docs` directory:
 

@@ -26,7 +26,7 @@ pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.
 pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.10.0/openeuler/x86_64/openyuanrong_faas-0.10.0-cp39-cp39-manylinux_2_34_x86_64.whl
 # 需要使用Dashboard能力时安装
 pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.10.0/openeuler/x86_64/openyuanrong_dashboard-0.10.0-cp39-cp39-manylinux_2_34_x86_64.whl
-# 需要使用agentruntime能力时安装
+# 需要使用agentexecutor能力时安装
 pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.10.0/openeuler/x86_64/agent_dx_cli-0.10.0-py3-none-any.whl
 pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.10.0/openeuler/x86_64/agent_dx_sdk-0.10.0-py3-none-any.whl
 # 需要使用ray-adapter能力时安装

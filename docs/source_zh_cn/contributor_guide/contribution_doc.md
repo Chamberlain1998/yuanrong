@@ -137,7 +137,6 @@ openYuanrong 文档基于 [Sphinx](https://www.sphinx-doc.org/en/master/){target
 
 ### 安装依赖
 
-- 参考[源码编译 openYuanrong](./source_code_build.md) 安装编译 runtime 所需工具。
 - 下载并安装 [Doxygen](https://github.com/doxygen/doxygen){target="_blank"}（1.12.0 及以上版本）。
 - 在代码 `docs` 目录下执行如下命令：
 
