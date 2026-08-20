@@ -1,3 +1,7 @@
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+# Licensed under the Apache License, Version 2.0.
+# See the LICENSE file in this repository for the complete license text.
+
 # Default values for YuanRong.
 # This is a YAML-formatted file.
 # Declare variables to be passed into your templates.
@@ -556,6 +560,30 @@ global:
     protocol: "http"
     # credential type: credential_type_rotating_credentials / credential_type_permanent_credentials
     credentialType: "credential_type_permanent_credentials"
+
+  # Experimental sandbox Pause/Resume data plane. Disabled by default.
+  # FunctionAgent owns the remote snapshot client and shares checkpointRoot
+  # only with RuntimeManager/Sandboxd; FunctionProxy must not mount it.
+  pauseResume:
+    enabled: false
+    checkpointRoot: /home/sn/checkpoints
+    snapshotStorage:
+      # Supported values when enabled: obs, datasystem.
+      backend: ""
+      obs:
+        endpoint: ""
+        bucket: ""
+        useHttps: true
+        pathStyle: false
+        credentials:
+          # Existing Secret containing encrypted/ciphertext credentials.
+          secretName: ""
+          accessKeyKey: accesskey
+          secretKeyKey: secretkey
+          securityTokenKey: securitytoken
+      dataSystem:
+        host: 127.0.0.1
+        port: 31501
 
   # mutual ssl configuration
   mutualSSLConfig:

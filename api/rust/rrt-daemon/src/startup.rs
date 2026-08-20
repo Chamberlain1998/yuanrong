@@ -1,11 +1,30 @@
+// Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+// Licensed under the Apache License, Version 2.0.
+// See the LICENSE file in this repository for the complete license text.
+
 //! Runtime startup barrier used by fork-based warm starts.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const SEED_FILE_ENV: &str = "YR_SEED_FILE";
 const ENV_FILE_ENV: &str = "YR_ENV_FILE";
+const GVISOR_CHECKPOINT_FILE: &str = "/proc/gvisor/checkpoint";
+const GVISOR_SPEC_ENVIRON_FILE: &str = "/proc/gvisor/spec_environ";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CheckpointOutcome {
+    Resume,
+    Restore,
+    Error,
+}
+
+pub(crate) struct CheckpointHandoff {
+    path: PathBuf,
+    file: File,
+}
 
 /// Block on one read from a configured seed file, then refresh the process
 /// environment before any runtime configuration or Tokio worker is created.
@@ -37,8 +56,8 @@ fn wait_for_seed_file() -> io::Result<()> {
 }
 
 fn refresh_environment_from_file(path: &Path) {
-    let content = match std::fs::read_to_string(path) {
-        Ok(content) => content,
+    let environment = match read_environment_file(path) {
+        Ok(environment) => environment,
         Err(error) => {
             eprintln!(
                 "[rrt-runtime] failed to load environment file {}: {error}",
@@ -48,8 +67,89 @@ fn refresh_environment_from_file(path: &Path) {
         }
     };
 
-    for (index, raw_line) in content.lines().enumerate() {
+    for (key, value) in environment {
+        std::env::set_var(key, value);
+    }
+}
+
+pub(crate) fn restore_environment_file_path() -> Option<PathBuf> {
+    configured_or_gvisor_path(ENV_FILE_ENV, GVISOR_SPEC_ENVIRON_FILE)
+}
+
+pub(crate) fn checkpoint_handoff_file_path() -> Option<PathBuf> {
+    configured_or_gvisor_path(SEED_FILE_ENV, GVISOR_CHECKPOINT_FILE)
+}
+
+pub(crate) fn open_checkpoint_handoff() -> io::Result<Option<CheckpointHandoff>> {
+    let Some(path) = checkpoint_handoff_file_path() else {
+        return Ok(None);
+    };
+    let file = File::open(&path)?;
+    Ok(Some(CheckpointHandoff { path, file }))
+}
+
+fn configured_or_gvisor_path(environment_key: &str, gvisor_path: &str) -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os(environment_key)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+    {
+        // An explicit handoff path is configuration, not a best-effort hint.
+        // Keep it so readers fail closed if it is temporarily unavailable;
+        // silently falling back to restored in-process identity could reconnect
+        // to the source FunctionProxy.
+        return Some(path);
+    }
+    let path = PathBuf::from(gvisor_path);
+    path.exists().then_some(path)
+}
+
+pub(crate) async fn wait_for_checkpoint_handoff(
+    handoff: CheckpointHandoff,
+) -> io::Result<CheckpointOutcome> {
+    tokio::task::spawn_blocking(move || read_checkpoint_outcome(handoff))
+        .await
+        .map_err(|error| io::Error::other(format!("checkpoint barrier task failed: {error}")))?
+}
+
+fn read_checkpoint_outcome(mut handoff: CheckpointHandoff) -> io::Result<CheckpointOutcome> {
+    let mut content = String::new();
+    handoff.file.read_to_string(&mut content)?;
+    match content.trim() {
+        "resume" => Ok(CheckpointOutcome::Resume),
+        "restore" => Ok(CheckpointOutcome::Restore),
+        "error" => Ok(CheckpointOutcome::Error),
+        outcome => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "unexpected checkpoint outcome {:?} from {}",
+                outcome,
+                handoff.path.display()
+            ),
+        )),
+    }
+}
+
+pub(crate) fn read_environment_file(path: &Path) -> io::Result<HashMap<String, String>> {
+    let content = std::fs::read(path)?;
+    let nul_separated = content.contains(&0);
+    let entries: Vec<&[u8]> = if nul_separated {
+        content.split(|byte| *byte == 0).collect()
+    } else {
+        content.split(|byte| *byte == b'\n').collect()
+    };
+    let mut environment = HashMap::new();
+    for (index, raw_entry) in entries.into_iter().enumerate() {
         let line_number = index + 1;
+        let raw_line = std::str::from_utf8(raw_entry).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "invalid UTF-8 environment entry {}:{}: {error}",
+                    path.display(),
+                    line_number
+                ),
+            )
+        })?;
         let line = raw_line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
@@ -64,7 +164,11 @@ fn refresh_environment_from_file(path: &Path) {
             continue;
         };
         let key = raw_key.trim();
-        let value = strip_quotes(raw_value.trim());
+        let value = if nul_separated {
+            raw_value
+        } else {
+            strip_quotes(raw_value.trim())
+        };
         if key.is_empty() || key.contains('\0') || value.contains('\0') {
             eprintln!(
                 "[rrt-runtime] invalid environment entry {}:{}",
@@ -74,8 +178,9 @@ fn refresh_environment_from_file(path: &Path) {
             continue;
         }
 
-        std::env::set_var(key, value);
+        environment.insert(key.to_string(), value.to_string());
     }
+    Ok(environment)
 }
 
 fn strip_quotes(value: &str) -> &str {

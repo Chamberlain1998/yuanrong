@@ -1,3 +1,7 @@
+// Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+// Licensed under the Apache License, Version 2.0.
+// See the LICENSE file in this repository for the complete license text.
+
 //! RRT atomic-operation HTTP/1.1 server.
 //!
 //! Purpose: expose sandbox-embedded RRT atomic operations over HTTP through sandboxRouter as an L7 reverse proxy,
@@ -19,10 +23,13 @@ use std::collections::BTreeMap;
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::process::Command;
+use tokio::sync::watch;
 
 const IO_BUFFER_SIZE: usize = 256 * 1024;
 struct CachedResponse {
@@ -102,6 +109,82 @@ pub(crate) async fn bind(port: u16) -> std::io::Result<TcpListener> {
     TcpListener::bind(("0.0.0.0", port)).await
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct HttpServerControl {
+    inner: Arc<HttpServerControlInner>,
+}
+
+#[derive(Debug)]
+struct HttpServerControlInner {
+    // This descriptor owns the kernel socket but is never registered with a
+    // Tokio reactor. Each generation clones it and installs that clone in the
+    // current reactor, so restored epoll state is never the only accept path.
+    listener: std::net::TcpListener,
+    token: Option<String>,
+    accept_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    generation: AtomicU64,
+    ready_tx: watch::Sender<super::RuntimeReadyState>,
+}
+
+impl HttpServerControl {
+    pub(crate) fn start(
+        listener: TcpListener,
+        token: Option<String>,
+        ready_tx: watch::Sender<super::RuntimeReadyState>,
+    ) -> std::io::Result<Self> {
+        let listener = listener.into_std()?;
+        listener.set_nonblocking(true)?;
+        let control = Self {
+            inner: Arc::new(HttpServerControlInner {
+                listener,
+                token,
+                accept_task: Mutex::new(None),
+                generation: AtomicU64::new(0),
+                ready_tx,
+            }),
+        };
+        control.rearm()?;
+        Ok(control)
+    }
+
+    pub(crate) fn rearm(&self) -> std::io::Result<u64> {
+        let mut accept_task = self
+            .inner
+            .accept_task
+            .lock()
+            .map_err(|_| std::io::Error::other("RRT HTTP listener control lock is poisoned"))?;
+        let listener = self.inner.listener.try_clone()?;
+        listener.set_nonblocking(true)?;
+        let listener = TcpListener::from_std(listener)?;
+        let generation = self.inner.generation.load(Ordering::Relaxed) + 1;
+        let token = self.inner.token.clone();
+        self.inner.generation.store(generation, Ordering::Release);
+        // Publish the replacement generation before it can report a failure;
+        // a fast accept error must win over Ready rather than be overwritten.
+        let _ = self.inner.ready_tx.send(super::RuntimeReadyState::Ready);
+        let inner = Arc::downgrade(&self.inner);
+        let task = tokio::spawn(async move {
+            if let Err(error) = serve_listener(listener, token).await {
+                if let Some(inner) = inner.upgrade() {
+                    if inner.generation.load(Ordering::Acquire) == generation {
+                        let message =
+                            format!("RRT HTTP accept generation {generation} stopped: {error}");
+                        rrt_error!("[rrt-http] {message}");
+                        let _ = inner
+                            .ready_tx
+                            .send(super::RuntimeReadyState::Failed(message));
+                    }
+                }
+            }
+        });
+        if let Some(previous) = accept_task.replace(task) {
+            previous.abort();
+        }
+        rrt_info!("[rrt-http] listener generation installed generation={generation}");
+        Ok(generation)
+    }
+}
+
 pub(crate) async fn serve_listener(
     listener: TcpListener,
     token: Option<String>,
@@ -109,17 +192,11 @@ pub(crate) async fn serve_listener(
     let address = listener.local_addr()?;
     rrt_info!("[rrt-http] atomic-ops server listening on {address}");
     loop {
-        let (mut sock, _peer) = match listener.accept().await {
-            Ok(x) => x,
-            Err(e) => {
-                rrt_error!("[rrt-http] accept error: {e}");
-                continue;
-            }
-        };
+        let (mut sock, _peer) = listener.accept().await?;
         let token = token.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_conn(&mut sock, token).await {
-                rrt_error!("[rrt-http] conn error: {e}");
+            if let Err(error) = handle_conn(&mut sock, token).await {
+                rrt_error!("[rrt-http] conn error: {error}");
             }
         });
     }

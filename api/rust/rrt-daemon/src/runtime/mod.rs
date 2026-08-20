@@ -1,3 +1,7 @@
+// Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+// Licensed under the Apache License, Version 2.0.
+// See the LICENSE file in this repository for the complete license text.
+
 //! runtime-mode: rrt acts as the openYuanrong sandbox runtime.
 //! Connect to the rt server (the function-proxy POSIX port) and open the RuntimeRPC `MessageStream`.
 //! Dispatch received `CallReq`: `is_create` returns a create ack; `function` routes to akernel method dispatch;
@@ -7,6 +11,7 @@ use crate::posix::core_service::CallResult;
 use crate::posix::runtime_rpc::runtime_rpc_client::RuntimeRpcClient;
 use crate::posix::runtime_rpc::{streaming_message, StreamingMessage};
 use crate::posix::runtime_service::CallResponse;
+use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
@@ -79,6 +84,35 @@ enum RuntimeReadyState {
     Failed(String),
 }
 
+#[derive(Clone, Default)]
+struct RuntimeServiceControls {
+    http: Option<httpserver::HttpServerControl>,
+    tunnel: Option<tunnel::TunnelServerControl>,
+}
+
+impl RuntimeServiceControls {
+    fn rearm(&self) -> Result<Vec<(&'static str, u64)>, String> {
+        let mut generations = Vec::with_capacity(2);
+        if let Some(control) = &self.http {
+            generations.push((
+                "HTTP",
+                control
+                    .rearm()
+                    .map_err(|error| format!("HTTP listener rearm failed: {error}"))?,
+            ));
+        }
+        if let Some(control) = &self.tunnel {
+            generations.push((
+                "tunnel",
+                control
+                    .rearm()
+                    .map_err(|error| format!("tunnel listener rearm failed: {error}"))?,
+            ));
+        }
+        Ok(generations)
+    }
+}
+
 fn ready_runtime_receiver() -> watch::Receiver<RuntimeReadyState> {
     let (_tx, rx) = watch::channel(RuntimeReadyState::Ready);
     rx
@@ -104,9 +138,7 @@ fn combine_runtime_readiness(
                 tokio::spawn(async move {
                     loop {
                         let state = service.borrow_and_update().clone();
-                        if update_tx.send((index, state.clone())).is_err()
-                            || matches!(state, RuntimeReadyState::Failed(_))
-                        {
+                        if update_tx.send((index, state.clone())).is_err() {
                             return;
                         }
                         if service.changed().await.is_err() {
@@ -126,21 +158,25 @@ fn combine_runtime_readiness(
                 let mut states = vec![RuntimeReadyState::Starting; service_count];
                 while let Some((index, state)) = update_rx.recv().await {
                     states[index] = state;
-                    if let Some(message) = states.iter().find_map(|state| match state {
-                        RuntimeReadyState::Failed(message) => Some(message.clone()),
-                        _ => None,
-                    }) {
-                        let _ = ready_tx.send(RuntimeReadyState::Failed(message));
-                        return;
-                    }
-                    if states
+                    let combined = if let Some(message) =
+                        states.iter().find_map(|state| match state {
+                            RuntimeReadyState::Failed(message) => Some(message.clone()),
+                            _ => None,
+                        }) {
+                        RuntimeReadyState::Failed(message)
+                    } else if states
                         .iter()
                         .all(|state| *state == RuntimeReadyState::Ready)
                     {
-                        let _ = ready_tx.send(RuntimeReadyState::Ready);
+                        RuntimeReadyState::Ready
+                    } else {
+                        RuntimeReadyState::Starting
+                    };
+                    if *ready_tx.borrow() != combined {
+                        let _ = ready_tx.send(combined);
                     }
                 }
-                if *ready_tx.borrow() == RuntimeReadyState::Starting {
+                if !matches!(*ready_tx.borrow(), RuntimeReadyState::Failed(_)) {
                     let _ = ready_tx.send(RuntimeReadyState::Failed(
                         "RRT service readiness channels closed before startup completed"
                             .to_string(),
@@ -152,10 +188,16 @@ fn combine_runtime_readiness(
     }
 }
 
-async fn start_http_server(
+async fn start_http_server_with_control(
     port: u16,
     token: Option<String>,
-) -> Result<watch::Receiver<RuntimeReadyState>, std::io::Error> {
+) -> Result<
+    (
+        watch::Receiver<RuntimeReadyState>,
+        httpserver::HttpServerControl,
+    ),
+    std::io::Error,
+> {
     let listener = httpserver::bind(port).await.map_err(|err| {
         let message = format!("failed to bind RRT HTTP port {port}: {err}");
         rrt_error!("[rrt-http] readiness failed: {message}");
@@ -166,22 +208,30 @@ async fn start_http_server(
         .map(|address| address.to_string())
         .unwrap_or_else(|_| format!("0.0.0.0:{port}"));
     let (ready_tx, ready_rx) = watch::channel(RuntimeReadyState::Starting);
-    let _ = ready_tx.send(RuntimeReadyState::Ready);
+    let control = httpserver::HttpServerControl::start(listener, token, ready_tx)?;
     rrt_info!("[rrt-http] readiness ready address={address}");
-    tokio::spawn(async move {
-        if let Err(err) = httpserver::serve_listener(listener, token).await {
-            let message = format!("RRT HTTP server stopped on port {port}: {err}");
-            rrt_error!("[rrt-http] {message}");
-            let _ = ready_tx.send(RuntimeReadyState::Failed(message));
-        }
-    });
-    Ok(ready_rx)
+    Ok((ready_rx, control))
 }
 
-async fn start_tunnel_runtime_server(
+async fn start_http_server(
+    port: u16,
+    token: Option<String>,
+) -> Result<watch::Receiver<RuntimeReadyState>, std::io::Error> {
+    start_http_server_with_control(port, token)
+        .await
+        .map(|(ready, _control)| ready)
+}
+
+async fn start_tunnel_runtime_server_with_control(
     ws_port: u16,
     http_port: u16,
-) -> Result<watch::Receiver<RuntimeReadyState>, String> {
+) -> Result<
+    (
+        watch::Receiver<RuntimeReadyState>,
+        tunnel::TunnelServerControl,
+    ),
+    String,
+> {
     let bound = tunnel::BoundTunnelServers::bind(ws_port, http_port)
         .await
         .map_err(|message| {
@@ -189,16 +239,21 @@ async fn start_tunnel_runtime_server(
             message
         })?;
     let (ready_tx, ready_rx) = watch::channel(RuntimeReadyState::Starting);
-    let _ = ready_tx.send(RuntimeReadyState::Ready);
+    let control = tunnel::TunnelServerControl::start(bound, ready_tx).map_err(|message| {
+        rrt_error!("[rrt-tunnel] readiness failed: {message}");
+        message
+    })?;
     rrt_info!("[rrt-tunnel] readiness ready ws=0.0.0.0:{ws_port} http=127.0.0.1:{http_port}");
-    tokio::spawn(async move {
-        bound.serve().await;
-        let message =
-            format!("RRT tunnel server stopped on WS port {ws_port} and HTTP port {http_port}");
-        rrt_error!("[rrt-tunnel] {message}");
-        let _ = ready_tx.send(RuntimeReadyState::Failed(message));
-    });
-    Ok(ready_rx)
+    Ok((ready_rx, control))
+}
+
+async fn start_tunnel_runtime_server(
+    ws_port: u16,
+    http_port: u16,
+) -> Result<watch::Receiver<RuntimeReadyState>, String> {
+    start_tunnel_runtime_server_with_control(ws_port, http_port)
+        .await
+        .map(|(ready, _control)| ready)
 }
 
 async fn wait_for_runtime_ready(
@@ -270,10 +325,99 @@ pub fn load_args_from_env() -> Args {
     load_args_from(|key| std::env::var(key).ok())
 }
 
+fn invalid_target_identity(message: impl Into<String>) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, message.into())
+}
+
+fn allows_logical_instance_id_rebind(
+    environment: &std::collections::HashMap<String, String>,
+) -> std::io::Result<bool> {
+    let Some(raw_value) = environment.get("YR_ALLOW_LOGICAL_INSTANCE_ID_REBIND") else {
+        return Ok(false);
+    };
+    match raw_value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" => Ok(true),
+        "false" | "0" | "" => Ok(false),
+        value => Err(invalid_target_identity(format!(
+            "target logical instance ID rebind authorization has invalid value {value:?}"
+        ))),
+    }
+}
+
+fn load_reconnect_control_args(
+    source: &Args,
+    environment_file: Option<&Path>,
+) -> std::io::Result<Args> {
+    let Some(environment_file) = environment_file else {
+        return Ok(source.clone());
+    };
+    let environment = crate::startup::read_environment_file(environment_file)?;
+    let rt_server = ["POSIX_LISTEN_ADDR", "YR_SERVER_ADDRESS"]
+        .iter()
+        .find_map(|key| {
+            environment
+                .get(*key)
+                .map(String::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
+        .ok_or_else(|| invalid_target_identity("target RuntimeRPC address is missing"))?;
+    let runtime_id = environment
+        .get("YR_RUNTIME_ID")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| invalid_target_identity("target runtime ID is missing"))?;
+    let instance_id = environment
+        .get("INSTANCE_ID")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| invalid_target_identity("target logical instance ID is missing"))?;
+    if instance_id != source.instance_id && !allows_logical_instance_id_rebind(&environment)? {
+        return Err(invalid_target_identity(format!(
+            "target physical environment changed logical instance ID from {:?} to {:?}",
+            source.instance_id, instance_id
+        )));
+    }
+
+    Ok(Args {
+        rt_server: rt_server.to_string(),
+        runtime_id: runtime_id.to_string(),
+        instance_id: instance_id.to_string(),
+        job_id: source.job_id.clone(),
+        deploy_dir: source.deploy_dir.clone(),
+        log_level: source.log_level.clone(),
+    })
+}
+
+/// Tracks the last validated logical identity across RuntimeRPC reconnects.
+///
+/// A reusable Snapshot restore is allowed to change the logical instance ID
+/// exactly when the trusted target environment explicitly authorizes it. Once
+/// validated, that target identity becomes the baseline for later ordinary
+/// Pause/Resume reconnects of the cloned sandbox.
+struct ReconnectControlState {
+    baseline: Args,
+}
+
+impl ReconnectControlState {
+    fn new(baseline: Args) -> Self {
+        Self { baseline }
+    }
+
+    fn load(&mut self, environment_file: Option<&Path>) -> std::io::Result<Args> {
+        let target = load_reconnect_control_args(&self.baseline, environment_file)?;
+        self.baseline.instance_id.clone_from(&target.instance_id);
+        Ok(target)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::io::Write;
 
     fn args_from(pairs: &[(&str, &str)]) -> Args {
         let env: HashMap<String, String> = pairs
@@ -321,6 +465,180 @@ mod tests {
 
         assert_eq!(args.instance_id, "demo-sandbox");
         assert_eq!(args.log_level, "INFO");
+    }
+
+    fn reconnect_args_from(source: &Args, environment: &str) -> std::io::Result<Args> {
+        let mut file = tempfile::NamedTempFile::new().expect("create restore environment file");
+        file.write_all(environment.as_bytes())
+            .expect("write restore environment file");
+        load_reconnect_control_args(source, Some(file.path()))
+    }
+
+    #[test]
+    fn trusted_reusable_snapshot_restore_rebinds_logical_instance_id() {
+        let source = Args {
+            rt_server: "source-proxy:22773".to_string(),
+            runtime_id: "runtime-source-attempt".to_string(),
+            instance_id: "source-sandbox".to_string(),
+            ..Default::default()
+        };
+
+        let restored = reconnect_args_from(
+            &source,
+            "POSIX_LISTEN_ADDR=target-proxy:22773\n\
+             YR_RUNTIME_ID=runtime-clone-attempt\n\
+             INSTANCE_ID=clone-sandbox\n\
+             YR_ALLOW_LOGICAL_INSTANCE_ID_REBIND=true\n",
+        )
+        .expect("trusted reusable snapshot restore should permit the target logical identity");
+
+        assert_eq!(restored.rt_server, "target-proxy:22773");
+        assert_eq!(restored.runtime_id, "runtime-clone-attempt");
+        assert_eq!(restored.instance_id, "clone-sandbox");
+    }
+
+    #[test]
+    fn ordinary_resume_rejects_logical_instance_id_rebind() {
+        let source = Args {
+            rt_server: "source-proxy:22773".to_string(),
+            runtime_id: "runtime-source-attempt".to_string(),
+            instance_id: "source-sandbox".to_string(),
+            ..Default::default()
+        };
+
+        let error = reconnect_args_from(
+            &source,
+            "POSIX_LISTEN_ADDR=target-proxy:22773\n\
+             YR_RUNTIME_ID=runtime-resume-attempt\n\
+             INSTANCE_ID=other-sandbox\n",
+        )
+        .expect_err("ordinary pause/resume must keep the source logical identity");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("changed logical instance ID"));
+    }
+
+    #[test]
+    fn invalid_logical_instance_id_rebind_authorization_fails_closed() {
+        let source = Args {
+            rt_server: "source-proxy:22773".to_string(),
+            runtime_id: "runtime-source-attempt".to_string(),
+            instance_id: "source-sandbox".to_string(),
+            ..Default::default()
+        };
+
+        let error = reconnect_args_from(
+            &source,
+            "POSIX_LISTEN_ADDR=target-proxy:22773\n\
+             YR_RUNTIME_ID=runtime-clone-attempt\n\
+             INSTANCE_ID=clone-sandbox\n\
+             YR_ALLOW_LOGICAL_INSTANCE_ID_REBIND=maybe\n",
+        )
+        .expect_err("invalid authorization must never permit logical identity rebind");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("invalid value"));
+    }
+
+    #[test]
+    fn trusted_clone_identity_becomes_baseline_for_ordinary_resume() {
+        let source = Args {
+            rt_server: "source-proxy:22773".to_string(),
+            runtime_id: "runtime-source-attempt".to_string(),
+            instance_id: "source-sandbox".to_string(),
+            ..Default::default()
+        };
+        let mut state = ReconnectControlState::new(source);
+        let mut clone_environment =
+            tempfile::NamedTempFile::new().expect("create clone restore environment file");
+        clone_environment
+            .write_all(
+                b"POSIX_LISTEN_ADDR=clone-proxy:22773\n\
+                  YR_RUNTIME_ID=runtime-clone-attempt\n\
+                  INSTANCE_ID=clone-sandbox\n\
+                  YR_ALLOW_LOGICAL_INSTANCE_ID_REBIND=true\n",
+            )
+            .expect("write clone restore environment file");
+
+        let clone = state
+            .load(Some(clone_environment.path()))
+            .expect("trusted reusable restore should adopt the clone identity");
+        assert_eq!(clone.instance_id, "clone-sandbox");
+
+        let mut resume_environment =
+            tempfile::NamedTempFile::new().expect("create ordinary resume environment file");
+        resume_environment
+            .write_all(
+                b"POSIX_LISTEN_ADDR=resume-proxy:22773\n\
+                  YR_RUNTIME_ID=runtime-resume-attempt\n\
+                  INSTANCE_ID=clone-sandbox\n",
+            )
+            .expect("write ordinary resume environment file");
+
+        let resumed = state
+            .load(Some(resume_environment.path()))
+            .expect("ordinary resume of a cloned sandbox must retain the adopted identity");
+        assert_eq!(resumed.instance_id, "clone-sandbox");
+        assert_eq!(resumed.runtime_id, "runtime-resume-attempt");
+    }
+
+    #[test]
+    fn reconnect_stream_metadata_uses_validated_target_logical_identity() {
+        let target = Args {
+            runtime_id: "runtime-clone-attempt".to_string(),
+            instance_id: "clone-sandbox".to_string(),
+            ..Default::default()
+        };
+        let (_tx, rx) = mpsc::channel(1);
+
+        let request = build_stream_request(&target, rx).expect("build reconnect stream request");
+
+        assert_eq!(
+            request
+                .metadata()
+                .get("instance_id")
+                .expect("instance_id metadata"),
+            "clone-sandbox"
+        );
+        assert_eq!(
+            request
+                .metadata()
+                .get("source_id")
+                .expect("source_id metadata"),
+            "clone-sandbox"
+        );
+    }
+
+    #[tokio::test]
+    async fn trusted_clone_dispatch_uses_validated_target_logical_identity() {
+        let source = Args {
+            instance_id: "source-sandbox".to_string(),
+            ..Default::default()
+        };
+        let ctx = std::sync::Arc::new(dispatch::Ctx::new(source));
+        let (tx, mut rx) = mpsc::channel(2);
+        let inbound = StreamingMessage {
+            message_id: "transport-message-id".to_string(),
+            meta_data: Default::default(),
+            body: Some(streaming_message::Body::CallReq(
+                crate::posix::runtime_service::CallRequest {
+                    request_id: "clone-call".to_string(),
+                    ..Default::default()
+                },
+            )),
+        };
+        let (_ready_tx, ready_rx) = watch::channel(RuntimeReadyState::Ready);
+
+        assert!(
+            handle_inbound_message(inbound, "clone-sandbox", ctx, tx, ready_rx).await,
+            "the cloned runtime stream should remain usable"
+        );
+        rx.recv().await.expect("transport acknowledgement");
+        let result = rx.recv().await.expect("call result");
+        let Some(streaming_message::Body::CallResultReq(result)) = result.body else {
+            panic!("expected CallResultReq");
+        };
+        assert_eq!(result.instance_id, "clone-sandbox");
     }
 
     #[test]
@@ -872,8 +1190,13 @@ fn parse_runtime_port(name: &str, raw_port: String) -> Result<u16, String> {
     }
 }
 
-async fn start_configured_http_server() -> Result<Option<watch::Receiver<RuntimeReadyState>>, String>
-{
+async fn start_configured_http_server() -> Result<
+    Option<(
+        watch::Receiver<RuntimeReadyState>,
+        httpserver::HttpServerControl,
+    )>,
+    String,
+> {
     let raw_port = match std::env::var("RRT_HTTP_PORT") {
         Ok(raw_port) => raw_port,
         Err(std::env::VarError::NotPresent) => return Ok(None),
@@ -881,14 +1204,19 @@ async fn start_configured_http_server() -> Result<Option<watch::Receiver<Runtime
     };
     let port = parse_runtime_port("RRT_HTTP_PORT", raw_port)?;
     let token = std::env::var("RRT_HTTP_TOKEN").ok();
-    start_http_server(port, token)
+    start_http_server_with_control(port, token)
         .await
         .map(Some)
         .map_err(|err| err.to_string())
 }
 
-async fn start_configured_tunnel_server(
-) -> Result<Option<watch::Receiver<RuntimeReadyState>>, String> {
+async fn start_configured_tunnel_server() -> Result<
+    Option<(
+        watch::Receiver<RuntimeReadyState>,
+        tunnel::TunnelServerControl,
+    )>,
+    String,
+> {
     // RRT_TUNNEL_WS_PORT is the feature gate. Without it the tunnel is not part
     // of runtime readiness, even if the optional HTTP-port variable is present.
     let raw_ws_port = match std::env::var("RRT_TUNNEL_WS_PORT") {
@@ -904,7 +1232,7 @@ async fn start_configured_tunnel_server(
         })?,
         Err(err) => return Err(format!("failed to read RRT_TUNNEL_HTTP_PORT: {err}")),
     };
-    start_tunnel_runtime_server(ws_port, http_port)
+    start_tunnel_runtime_server_with_control(ws_port, http_port)
         .await
         .map(Some)
 }
@@ -935,12 +1263,22 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         start_configured_tunnel_server()
     );
     let mut configured_services = Vec::with_capacity(2);
-    for start in [http_start, tunnel_start] {
-        match start {
-            Ok(Some(ready)) => configured_services.push(ready),
-            Ok(None) => {}
-            Err(message) => configured_services.push(failed_runtime_receiver(message)),
+    let mut service_controls = RuntimeServiceControls::default();
+    match http_start {
+        Ok(Some((ready, control))) => {
+            configured_services.push(ready);
+            service_controls.http = Some(control);
         }
+        Ok(None) => {}
+        Err(message) => configured_services.push(failed_runtime_receiver(message)),
+    }
+    match tunnel_start {
+        Ok(Some((ready, control))) => {
+            configured_services.push(ready);
+            service_controls.tunnel = Some(control);
+        }
+        Ok(None) => {}
+        Err(message) => configured_services.push(failed_runtime_receiver(message)),
     }
     let runtime_ready = combine_runtime_readiness(configured_services);
 
@@ -948,43 +1286,60 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // busy/idle reports are emitted by activity::enter()/ActiveGuard drop on 0<->1 transitions.
     // function-proxy IdleMgr owns the actual idle timeout, avoiding inconsistent duplicate timers in RRT and proxy.
-    run_message_stream_loop(args, instance_id, ctx, tx, rx, runtime_ready).await
+    run_message_stream_loop(args, ctx, tx, rx, runtime_ready, service_controls).await
 }
 
 fn build_stream_request(
     args: &Args,
-    instance_id: &str,
     stream_rx: mpsc::Receiver<StreamingMessage>,
 ) -> Result<tonic::Request<ReceiverStream<StreamingMessage>>, Box<dyn std::error::Error>> {
     let outbound = ReceiverStream::new(stream_rx);
     let mut req = tonic::Request::new(outbound);
     let md = req.metadata_mut();
     md.insert("runtime_id", args.runtime_id.parse()?);
-    md.insert("instance_id", instance_id.parse()?);
-    md.insert("source_id", instance_id.parse()?);
+    md.insert("instance_id", args.instance_id.parse()?);
+    md.insert("source_id", args.instance_id.parse()?);
     md.insert("dst_id", "function-proxy".parse()?);
     Ok(req)
 }
 
 async fn run_message_stream_loop(
     args: Args,
-    instance_id: String,
     ctx: std::sync::Arc<dispatch::Ctx>,
     tx: mpsc::Sender<StreamingMessage>,
     mut rx: mpsc::Receiver<StreamingMessage>,
     runtime_ready: watch::Receiver<RuntimeReadyState>,
+    service_controls: RuntimeServiceControls,
 ) -> Result<(), Box<dyn std::error::Error>> {
     const STREAM_CHANNEL_SIZE: usize = 256;
     const RECONNECT_MIN: Duration = Duration::from_millis(200);
     const RECONNECT_MAX: Duration = Duration::from_secs(5);
 
-    let endpoint = format!("http://{}", args.rt_server);
+    let environment_file = crate::startup::restore_environment_file_path();
     let mut backoff = RECONNECT_MIN;
     let mut reconnect_seq: u64 = 0;
     let mut pending: Option<StreamingMessage> = None;
+    let mut reconnect_control = ReconnectControlState::new(args);
 
     loop {
         reconnect_seq += 1;
+        let connection_args = match reconnect_control.load(environment_file.as_deref()) {
+            Ok(connection_args) => connection_args,
+            Err(error) => {
+                rrt_error!(
+                    "[rrt-runtime] target physical environment refresh failed seq={} file={:?} error={} retry_ms={}",
+                    reconnect_seq,
+                    environment_file,
+                    error,
+                    backoff.as_millis()
+                );
+                checkpoint_resilient_delay(backoff).await;
+                backoff = next_backoff(backoff, RECONNECT_MAX);
+                continue;
+            }
+        };
+        let endpoint = format!("http://{}", connection_args.rt_server);
+        activity::rebind_reporter_instance_id(&connection_args.instance_id);
         let mut client = match RuntimeRpcClient::connect(endpoint.clone()).await {
             Ok(client) => client,
             Err(e) => {
@@ -995,14 +1350,14 @@ async fn run_message_stream_loop(
                     e,
                     backoff.as_millis()
                 );
-                tokio::time::sleep(backoff).await;
+                checkpoint_resilient_delay(backoff).await;
                 backoff = next_backoff(backoff, RECONNECT_MAX);
                 continue;
             }
         };
 
         let (stream_tx, stream_rx) = mpsc::channel::<StreamingMessage>(STREAM_CHANNEL_SIZE);
-        let req = build_stream_request(&args, &instance_id, stream_rx)?;
+        let req = build_stream_request(&connection_args, stream_rx)?;
         let mut inbound = match client.message_stream(req).await {
             Ok(stream) => stream.into_inner(),
             Err(e) => {
@@ -1013,7 +1368,7 @@ async fn run_message_stream_loop(
                     e,
                     backoff.as_millis()
                 );
-                tokio::time::sleep(backoff).await;
+                checkpoint_resilient_delay(backoff).await;
                 backoff = next_backoff(backoff, RECONNECT_MAX);
                 continue;
             }
@@ -1022,7 +1377,10 @@ async fn run_message_stream_loop(
         backoff = RECONNECT_MIN;
         let state = activity::current_state();
         if let Err(e) = stream_tx
-            .send(activity_report_msg(&instance_id, state.as_bytes().to_vec()))
+            .send(activity_report_msg(
+                &connection_args.instance_id,
+                state.as_bytes().to_vec(),
+            ))
             .await
         {
             drop(e);
@@ -1068,12 +1426,14 @@ async fn run_message_stream_loop(
                 inbound_msg = inbound.message() => {
                     match inbound_msg {
                         Ok(Some(msg)) => {
-                            if !handle_inbound_message(
+                            if !handle_inbound_message_with_control_sender(
                                 msg,
-                                &instance_id,
+                                &connection_args.instance_id,
                                 ctx.clone(),
                                 tx.clone(),
                                 runtime_ready.clone(),
+                                Some(&stream_tx),
+                                Some(&service_controls),
                             ).await {
                                 return Ok(());
                             }
@@ -1092,9 +1452,16 @@ async fn run_message_stream_loop(
             pending.is_some(),
             backoff.as_millis()
         );
-        tokio::time::sleep(backoff).await;
+        checkpoint_resilient_delay(backoff).await;
         backoff = next_backoff(backoff, RECONNECT_MAX);
     }
+}
+
+async fn checkpoint_resilient_delay(delay: Duration) {
+    // A restored control stream is detected as disconnected before this delay
+    // is created, so this timer belongs to the current runtime generation.
+    // Never block the executor: file, exec, HTTP and tunnel traffic share it.
+    tokio::time::sleep(delay).await;
 }
 
 fn next_backoff(current: Duration, max: Duration) -> Duration {
@@ -1167,6 +1534,85 @@ fn call_response_msg(message_id: String) -> StreamingMessage {
     }
 }
 
+async fn handle_prepare_snap_request(
+    message_id: String,
+    response_tx: &mpsc::Sender<StreamingMessage>,
+) -> bool {
+    // Open before acknowledging PrepareSnap. gVisor binds an open descriptor
+    // to the next checkpoint generation; opening after the response would race
+    // sandboxd completing the checkpoint before the runtime starts waiting.
+    let checkpoint_handoff = match crate::startup::open_checkpoint_handoff() {
+        Ok(handoff) => handoff,
+        Err(error) => {
+            rrt_error!("[rrt-runtime] failed to open checkpoint handoff barrier: {error}");
+            None
+        }
+    };
+    handle_prepare_snap_request_with_handoff(message_id, response_tx, checkpoint_handoff).await
+}
+
+async fn handle_prepare_snap_request_with_handoff(
+    message_id: String,
+    response_tx: &mpsc::Sender<StreamingMessage>,
+    checkpoint_handoff: Option<crate::startup::CheckpointHandoff>,
+) -> bool {
+    let barrier_ready = checkpoint_handoff.is_some();
+    let (code, message) = if barrier_ready {
+        (
+            crate::posix::common::ErrorCode::ErrNone,
+            "PrepareSnap completed successfully",
+        )
+    } else {
+        (
+            crate::posix::common::ErrorCode::ErrInnerSystemError,
+            "checkpoint handoff barrier is unavailable",
+        )
+    };
+    let response = StreamingMessage {
+        message_id,
+        meta_data: Default::default(),
+        body: Some(streaming_message::Body::PrepareSnapRsp(
+            crate::posix::runtime_service::PrepareSnapResponse {
+                code: code as i32,
+                message: message.to_string(),
+            },
+        )),
+    };
+    if response_tx.send(response).await.is_err() {
+        return false;
+    }
+
+    let Some(handoff) = checkpoint_handoff else {
+        rrt_warn!(
+            "[rrt-runtime] checkpoint handoff barrier is unavailable; PrepareSnap failed closed"
+        );
+        return true;
+    };
+    rrt_info!("[rrt-runtime] waiting for checkpoint handoff");
+    match crate::startup::wait_for_checkpoint_handoff(handoff).await {
+        Ok(crate::startup::CheckpointOutcome::Restore) => {
+            rrt_info!(
+                "[rrt-runtime] checkpoint handoff outcome=restore; target physical identity will be loaded before reconnect"
+            );
+        }
+        Ok(crate::startup::CheckpointOutcome::Resume) => {
+            rrt_warn!(
+                "[rrt-runtime] checkpoint handoff outcome=resume; source runtime remains active"
+            );
+        }
+        Ok(crate::startup::CheckpointOutcome::Error) => {
+            rrt_error!(
+                "[rrt-runtime] checkpoint handoff outcome=error; source runtime remains authoritative"
+            );
+        }
+        Err(error) => {
+            rrt_error!("[rrt-runtime] checkpoint handoff failed: {error}");
+        }
+    }
+    true
+}
+
+#[cfg(test)]
 async fn handle_inbound_message(
     msg: StreamingMessage,
     instance_id: &str,
@@ -1174,9 +1620,22 @@ async fn handle_inbound_message(
     tx: mpsc::Sender<StreamingMessage>,
     runtime_ready: watch::Receiver<RuntimeReadyState>,
 ) -> bool {
+    handle_inbound_message_with_control_sender(msg, instance_id, ctx, tx, runtime_ready, None, None)
+        .await
+}
+
+async fn handle_inbound_message_with_control_sender(
+    msg: StreamingMessage,
+    instance_id: &str,
+    ctx: std::sync::Arc<dispatch::Ctx>,
+    tx: mpsc::Sender<StreamingMessage>,
+    runtime_ready: watch::Receiver<RuntimeReadyState>,
+    control_tx: Option<&mpsc::Sender<StreamingMessage>>,
+    service_controls: Option<&RuntimeServiceControls>,
+) -> bool {
     let mid = msg.message_id.clone();
     match msg.body {
-        Some(streaming_message::Body::CallReq(call)) => {
+        Some(streaming_message::Body::CallReq(mut call)) => {
             if debug_on() {
                 rrt_debug!(
                     "[rrt-runtime] CallReq is_create={} function={:?} request_id={} args={}",
@@ -1186,16 +1645,16 @@ async fn handle_inbound_message(
                     call.args.len()
                 );
             }
-            if tx.send(call_response_msg(mid)).await.is_err() {
+            let response_tx = control_tx.unwrap_or(&tx);
+            if response_tx.send(call_response_msg(mid)).await.is_err() {
                 return false;
+            }
+            if call.sender_id.is_empty() {
+                call.sender_id = instance_id.to_string();
             }
             // Each call uses its own spawn_blocking task: long commands must not block the receive loop because heartbeats must keep responding.
             let request_id = call.request_id.clone();
-            let iid = if !call.sender_id.is_empty() {
-                call.sender_id.clone()
-            } else {
-                instance_id.to_string()
-            };
+            let iid = call.sender_id.clone();
             let ctx2 = ctx.clone();
             let tx2 = tx.clone();
             tokio::spawn(async move {
@@ -1281,6 +1740,52 @@ async fn handle_inbound_message(
                 let _ = tx2.send(shutdown_response_msg(mid, code, message)).await;
             });
         }
+        Some(streaming_message::Body::PrepareSnapReq(_)) => {
+            rrt_info!("[rrt-runtime] PrepareSnapReq accepted");
+            let response_tx = control_tx.unwrap_or(&tx);
+            if !handle_prepare_snap_request(mid, response_tx).await {
+                return false;
+            }
+        }
+        Some(streaming_message::Body::SnapStartedReq(_)) => {
+            rrt_info!("[rrt-runtime] SnapStartedReq accepted");
+            let rearm =
+                service_controls.map_or_else(|| Ok(Vec::new()), |controls| controls.rearm());
+            let (code, message) = match rearm {
+                Ok(generations) => {
+                    for (service, generation) in generations {
+                        rrt_info!(
+                            "[rrt-runtime] SnapStarted {service} listener rearmed generation={generation}"
+                        );
+                    }
+                    (
+                        crate::posix::common::ErrorCode::ErrNone,
+                        "SnapStarted handled successfully".to_string(),
+                    )
+                }
+                Err(error) => {
+                    rrt_error!("[rrt-runtime] SnapStarted listener rearm failed: {error}");
+                    (
+                        crate::posix::common::ErrorCode::ErrInnerSystemError,
+                        format!("SnapStarted listener rearm failed: {error}"),
+                    )
+                }
+            };
+            let response = StreamingMessage {
+                message_id: mid,
+                meta_data: Default::default(),
+                body: Some(streaming_message::Body::SnapStartedRsp(
+                    crate::posix::runtime_service::SnapStartedResponse {
+                        code: code as i32,
+                        message,
+                    },
+                )),
+            };
+            let response_tx = control_tx.unwrap_or(&tx);
+            if response_tx.send(response).await.is_err() {
+                return false;
+            }
+        }
         Some(streaming_message::Body::HeartbeatReq(_)) => {
             let rsp = StreamingMessage {
                 message_id: mid,
@@ -1289,7 +1794,8 @@ async fn handle_inbound_message(
                     crate::posix::runtime_service::HeartbeatResponse::default(),
                 )),
             };
-            let _ = tx.send(rsp).await;
+            let response_tx = control_tx.unwrap_or(&tx);
+            let _ = response_tx.send(rsp).await;
         }
         Some(other) => {
             rrt_debug!(

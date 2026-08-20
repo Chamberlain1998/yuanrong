@@ -1,3 +1,7 @@
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+# Licensed under the Apache License, Version 2.0.
+# See the LICENSE file in this repository for the complete license text.
+
 {{- $dsEnabled := .Values.global.dataSystem.enabled -}}
 {{- $dsBypass := .Values.global.dataSystem.bypass -}}
 {{- if and (not $dsEnabled) (not $dsBypass) -}}
@@ -176,7 +180,6 @@ data:
     max_ds_health_check_times=""
     election_mode={{ quote .Values.global.common.electionMode }}
     system_timeout={{ quote .Values.global.common.systemTimeout }}
-    checkpoint_dir="/home/sn/checkpoints"
     runtime_shutdown_timeout_seconds={{ quote .Values.global.runtime.runtimeShutdownTimeoutSeconds }}
     ssl_enable=""
     metrics_ssl_enable=""
@@ -282,7 +285,21 @@ data:
     s3_endpoint={{ quote .Values.global.obsManagement.s3Endpoint | default "{HOST_IP}:30110" }}
     decrypt_algorithm={{ quote .Values.global.common.decryptAlgorithm }}
     system_timeout={{ quote .Values.global.common.systemTimeout }}
-    checkpoint_dir="/home/sn/checkpoints"
+    enable_sandbox_pause_resume={{ quote .Values.global.pauseResume.enabled }}
+    checkpoint_dir={{ quote .Values.global.pauseResume.checkpointRoot }}
+    snapshot_storage_backend={{ quote .Values.global.pauseResume.snapshotStorage.backend }}
+    {{- if and .Values.global.pauseResume.enabled (eq .Values.global.pauseResume.snapshotStorage.backend "obs") }}
+    snapshot_obs_endpoint={{ quote .Values.global.pauseResume.snapshotStorage.obs.endpoint }}
+    snapshot_obs_bucket={{ quote .Values.global.pauseResume.snapshotStorage.obs.bucket }}
+    snapshot_obs_access_key="{SNAPSHOT_OBS_ACCESS_KEY}"
+    snapshot_obs_secret_key="{SNAPSHOT_OBS_SECRET_KEY}"
+    snapshot_obs_security_token="{SNAPSHOT_OBS_SECURITY_TOKEN}"
+    snapshot_obs_use_https={{ quote .Values.global.pauseResume.snapshotStorage.obs.useHttps }}
+    snapshot_obs_path_style={{ quote .Values.global.pauseResume.snapshotStorage.obs.pathStyle }}
+    {{- else if and .Values.global.pauseResume.enabled (eq .Values.global.pauseResume.snapshotStorage.backend "datasystem") }}
+    data_system_host={{ quote .Values.global.pauseResume.snapshotStorage.dataSystem.host }}
+    data_system_port={{ quote .Values.global.pauseResume.snapshotStorage.dataSystem.port }}
+    {{- end }}
     ssl_enable={{ quote .Values.global.mutualSSLConfig.sslEnable }}
     metrics_ssl_enable=""
     ssl_base_path={{ quote .Values.global.mutualSSLConfig.sslBasePath }}
@@ -337,7 +354,7 @@ data:
     [runtime_manager.args]
     runtime_dir="/home/snuser/runtime"
     runtime_logs_dir={{ quote .Values.global.log.runtime.path }}
-    checkpoint_dir="/home/sn/checkpoints"
+    checkpoint_dir={{ quote .Values.global.pauseResume.checkpointRoot }}
     runtime_ld_library_path="/opt/buildtools/python3.11/lib::/usr/lib:/usr/lib64"
     snuser_lib_dir={{ quote .Values.global.runtime.snuserLibPath }}
     virtual_env_idle_time_limit={{ quote .Values.global.runtime.virtualEnvIdleTimeLimit }}

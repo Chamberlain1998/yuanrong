@@ -1,9 +1,13 @@
+// Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+// Licensed under the Apache License, Version 2.0.
+// See the LICENSE file in this repository for the complete license text.
+
 //! Local busy/idle tracking for the HTTP atomic-operation server, tunnel WS, and RuntimeRPC call handling.
 //! The active counter reports via `KillRequest(signal=23)` only on `0 -> 1` / `1 -> 0` transitions,
 //! letting function-proxy reuse IdleMgr to start or stop the idle timer.
 
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 
 use tokio::sync::mpsc;
 
@@ -16,8 +20,31 @@ static REPORTER: OnceLock<ActivityReporter> = OnceLock::new();
 const IDLE_REPORT_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(800);
 
 struct ActivityReporter {
-    instance_id: String,
+    instance_id: RwLock<String>,
     tx: mpsc::Sender<StreamingMessage>,
+}
+
+impl ActivityReporter {
+    fn new(instance_id: String, tx: mpsc::Sender<StreamingMessage>) -> Self {
+        Self {
+            instance_id: RwLock::new(instance_id),
+            tx,
+        }
+    }
+
+    fn rebind_instance_id(&self, instance_id: &str) {
+        *self
+            .instance_id
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = instance_id.to_string();
+    }
+
+    fn instance_id(&self) -> String {
+        self.instance_id
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
 }
 
 /// Initialize the activity counter. This is a reserved init hook; the global counter naturally maintains the initial value.
@@ -25,7 +52,16 @@ pub fn init() {}
 
 /// Initialize the activity reporter before starting HTTP/tunnel servers so the first direct request can report busy.
 pub fn init_reporter(instance_id: String, tx: mpsc::Sender<StreamingMessage>) {
-    let _ = REPORTER.set(ActivityReporter { instance_id, tx });
+    let _ = REPORTER.set(ActivityReporter::new(instance_id, tx));
+}
+
+/// Adopt the target logical identity after the restore environment has been
+/// validated. Direct HTTP/tunnel activity survives checkpoint/restore, so its
+/// reports must follow the same identity as the reconnected RuntimeRPC stream.
+pub fn rebind_reporter_instance_id(instance_id: &str) {
+    if let Some(reporter) = REPORTER.get() {
+        reporter.rebind_instance_id(instance_id);
+    }
 }
 
 /// RAII guard: increments activity on creation and decrements on drop, including connection/call end and panic unwinding.
@@ -75,15 +111,16 @@ fn report_state_transition(busy: bool) -> bool {
     let Some(reporter) = REPORTER.get() else {
         return false;
     };
+    let instance_id = reporter.instance_id();
     let state = if busy { "busy" } else { "idle" };
-    let msg = super::activity_report_msg(&reporter.instance_id, state.as_bytes().to_vec());
+    let msg = super::activity_report_msg(&instance_id, state.as_bytes().to_vec());
     match reporter.tx.try_send(msg) {
         Ok(()) => {
             rrt_info!(
                 "[rrt-runtime] activity state={} report_signal={} instance={} active_count={}",
                 state,
                 super::IDLE_REPORT_SIGNAL,
-                reporter.instance_id,
+                instance_id,
                 ACTIVE.load(Ordering::SeqCst)
             );
             true
@@ -92,7 +129,7 @@ fn report_state_transition(busy: bool) -> bool {
             rrt_error!(
                 "[rrt-runtime] activity report failed state={} instance={} error={}",
                 state,
-                reporter.instance_id,
+                instance_id,
                 e
             );
             false
@@ -158,5 +195,15 @@ mod tests {
             assert_eq!(active_count(), base + 1);
         }
         assert_eq!(active_count(), base);
+    }
+
+    #[test]
+    fn reporter_uses_rebound_target_logical_identity() {
+        let (tx, _rx) = mpsc::channel(1);
+        let reporter = ActivityReporter::new("source-sandbox".to_string(), tx);
+
+        reporter.rebind_instance_id("clone-sandbox");
+
+        assert_eq!(reporter.instance_id(), "clone-sandbox");
     }
 }
