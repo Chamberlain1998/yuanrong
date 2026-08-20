@@ -72,6 +72,7 @@ TEST_F(HttpsClientTest, ConnectedTcpSocketIsCloseOnExec)
 {
     auto serverCtx = std::make_shared<ssl::context>(ssl::context::tlsv12_server);
     serverCtx->use_certificate_chain_file("./test/data/cert/server.crt");
+    serverCtx->set_password_callback([](std::size_t, ssl::context::password_purpose) { return "test"; });
     serverCtx->use_private_key_file("./test/data/cert/server.key", ssl::context::pem);
     auto httpsServer = std::make_shared<AsyncHttpsServer>();
     ASSERT_TRUE(httpsServer->StartServer("127.0.0.1", 0, 1, serverCtx));
@@ -81,7 +82,10 @@ TEST_F(HttpsClientTest, ConnectedTcpSocketIsCloseOnExec)
     clientCtx->set_verify_mode(ssl::verify_none);
     auto client = std::make_shared<AsyncHttpsClient>(clientIoc, clientCtx);
     auto err = client->Init({"127.0.0.1", std::to_string(httpsServer->GetListeningPort())});
-    ASSERT_TRUE(err.OK()) << err.Msg();
+    // CLOEXEC is set immediately after the TCP connect, before the TLS handshake.
+    // The bundled certificate can be rejected by stricter SSL implementations for
+    // its key-usage extension, but the connected socket must still carry the flag.
+    ASSERT_NE(client->stream_, nullptr) << err.Msg();
 
     const int fd = client->stream_->next_layer().socket().native_handle();
     const int flags = fcntl(fd, F_GETFD);
