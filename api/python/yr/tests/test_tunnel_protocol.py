@@ -231,6 +231,7 @@ class TestStreamingProtocol(unittest.TestCase):
             kind=BinaryKind.HTTP_REQUEST_DATA,
             payload=b"chunk",
             end_of_body=True,
+            offset=42,
         ).encode()
 
         decoded = BinaryEnvelope.decode(encoded)
@@ -238,6 +239,7 @@ class TestStreamingProtocol(unittest.TestCase):
         self.assertEqual(decoded.kind, BinaryKind.HTTP_REQUEST_DATA)
         self.assertEqual(decoded.payload, b"chunk")
         self.assertTrue(decoded.end_of_body)
+        self.assertEqual(decoded.offset, 42)
 
     def test_binary_envelope_rejects_malformed_and_oversized_data(self):
         request_id = "00112233-4455-6677-8899-aabbccddeeff"
@@ -257,6 +259,7 @@ class TestStreamingProtocol(unittest.TestCase):
         self.assertEqual(hello["stream_window_frames"], 16)
         self.assertEqual(hello["max_body_size"], 512 * 1024 * 1024)
         self.assertEqual(hello["max_ws_message_size"], 8 * 1024 * 1024)
+        self.assertTrue(hello["resume"])
 
 
 if __name__ == "__main__":

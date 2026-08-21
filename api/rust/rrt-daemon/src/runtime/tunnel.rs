@@ -27,23 +27,24 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use rmpv::Value;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::error::Error as StdError;
 use std::fmt::Write as _;
 use std::io;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot, Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::task::AbortHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
 
-const HTTP_TIMEOUT: Duration = Duration::from_secs(600);
+const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(600);
 const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// In-flight HTTP requests are cached this long for resend on client reconnect.
+/// Legacy V1 in-flight HTTP requests keep the historical bounded replay TTL.
+/// Resumable V2 uses the configured HTTP timeout instead.
 const PENDING_REQUEST_TTL: Duration = Duration::from_secs(120);
 const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
 const MAX_HTTP_HEADERS: usize = 200;
@@ -67,6 +68,7 @@ const MAX_CONFIGURED_INFLIGHT: usize = 1024;
 const MAX_CONFIGURED_WINDOW_FRAMES: usize = 1024;
 const BINARY_HEADER_BYTES: usize = 26;
 const BINARY_END_OF_BODY: u8 = 0x01;
+const BINARY_HAS_OFFSET: u8 = 0x02;
 const OUTBOUND_QUEUE_FRAMES: usize = 512;
 const OUTBOUND_CONTROL_RESERVE: usize = 32;
 const CONTROL_WS_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
@@ -88,6 +90,41 @@ fn positive_env_usize(name: &str, default: usize, maximum: usize) -> usize {
         },
         Err(_) => default,
     }
+}
+
+fn parse_positive_duration_seconds(raw: &str) -> Option<Duration> {
+    let seconds = raw.parse::<f64>().ok()?;
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return None;
+    }
+    let duration = Duration::try_from_secs_f64(seconds).ok()?;
+    (!duration.is_zero()).then_some(duration)
+}
+
+fn http_timeout_from_raw(raw: Option<&str>) -> Duration {
+    raw.and_then(parse_positive_duration_seconds)
+        .unwrap_or(DEFAULT_HTTP_TIMEOUT)
+}
+
+fn configured_http_timeout() -> Duration {
+    static VALUE: OnceLock<Duration> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        let raw = std::env::var("YR_TUNNEL_HTTP_TIMEOUT").ok();
+        let timeout = http_timeout_from_raw(raw.as_deref());
+        if raw
+            .as_deref()
+            .is_some_and(|value| parse_positive_duration_seconds(value).is_none())
+        {
+            rrt_warn!(
+                "[rrt-runtime] tunnel invalid_config name=YR_TUNNEL_HTTP_TIMEOUT; using default"
+            );
+        }
+        rrt_info!(
+            "[rrt-runtime] tunnel configured http_timeout_seconds={}",
+            timeout.as_secs_f64()
+        );
+        timeout
+    })
 }
 
 fn configured_protocol_version() -> u8 {
@@ -173,7 +210,13 @@ struct StreamingResponse {
     status: StatusCode,
     headers: HeaderList,
     content_length: Option<u64>,
-    body_rx: mpsc::Receiver<Result<Bytes, String>>,
+    body_rx: mpsc::Receiver<Result<ResponseChunk, String>>,
+    queued_frames: Arc<AtomicUsize>,
+}
+
+struct ResponseChunk {
+    offset: u64,
+    payload: Bytes,
 }
 
 struct StreamingHttpRequest {
@@ -190,8 +233,10 @@ enum TunnelResponse {
 }
 
 struct PendingHttpResponse {
-    /// V2 streams are scoped to one WS connection; V1 replayable requests use None.
+    /// Non-resumable exchanges are generation-scoped; resumable V2 also carries
+    /// a stable session id and is rebound to the new generation after reconnect.
     generation: Option<u64>,
+    session_id: Option<String>,
     sender: oneshot::Sender<Result<TunnelResponse, String>>,
 }
 
@@ -202,16 +247,189 @@ enum WsTunnelMessage {
 
 struct ResponseStreamSink {
     generation: u64,
-    sender: mpsc::Sender<Result<Bytes, String>>,
+    session_id: Option<String>,
+    sender: mpsc::Sender<Result<ResponseChunk, String>>,
     received: usize,
     expected: Option<usize>,
     max_body_size: usize,
+    queued_frames: Arc<AtomicUsize>,
+    window: usize,
 }
 
 struct StreamCredits {
-    generation: u64,
-    semaphore: Arc<Semaphore>,
+    generation: AtomicU64,
+    session_id: Option<String>,
+    connected: AtomicBool,
+    closed: AtomicBool,
+    semaphore: Mutex<Arc<Semaphore>>,
     window: usize,
+    ack_offset: AtomicU64,
+    unacked: Mutex<VecDeque<(u64, Bytes)>>,
+    ended: AtomicBool,
+    resuming: AtomicBool,
+    resume_notify: Notify,
+    send_lock: AsyncMutex<()>,
+}
+
+impl StreamCredits {
+    fn new(generation: u64, session_id: Option<String>, window: usize) -> Self {
+        Self {
+            generation: AtomicU64::new(generation),
+            session_id,
+            connected: AtomicBool::new(true),
+            closed: AtomicBool::new(false),
+            semaphore: Mutex::new(Arc::new(Semaphore::new(0))),
+            window,
+            ack_offset: AtomicU64::new(0),
+            unacked: Mutex::new(VecDeque::new()),
+            ended: AtomicBool::new(false),
+            resuming: AtomicBool::new(false),
+            resume_notify: Notify::new(),
+            send_lock: AsyncMutex::new(()),
+        }
+    }
+
+    fn is_resumable(&self) -> bool {
+        self.session_id.is_some()
+    }
+
+    fn disconnect(&self, generation: u64) {
+        if self.generation.load(Ordering::Acquire) != generation {
+            return;
+        }
+        self.connected.store(false, Ordering::Release);
+        self.resuming.store(self.is_resumable(), Ordering::Release);
+        self.semaphore.lock().unwrap().close();
+        self.resume_notify.notify_waiters();
+    }
+
+    fn rebind(&self, generation: u64) {
+        self.generation.store(generation, Ordering::Release);
+        self.connected.store(true, Ordering::Release);
+        self.resuming.store(true, Ordering::Release);
+        *self.semaphore.lock().unwrap() = Arc::new(Semaphore::new(0));
+        self.resume_notify.notify_waiters();
+    }
+
+    fn grant(&self, generation: u64, credits: usize, ack_offset: Option<u64>) -> bool {
+        if self.generation.load(Ordering::Acquire) != generation {
+            return false;
+        }
+        if let Some(ack_offset) = ack_offset {
+            let previous = self.ack_offset.fetch_max(ack_offset, Ordering::AcqRel);
+            if ack_offset > previous {
+                self.unacked.lock().unwrap().retain(|(offset, payload)| {
+                    offset.saturating_add(payload.len() as u64) > ack_offset
+                });
+            }
+        }
+        let semaphore = self.semaphore.lock().unwrap().clone();
+        let available = semaphore.available_permits();
+        let grant = credits.min(self.window.saturating_sub(available));
+        if grant > 0 {
+            semaphore.add_permits(grant);
+        }
+        self.resuming.load(Ordering::Acquire) && ack_offset.is_some()
+    }
+
+    async fn acquire(&self, allow_during_resume: bool) -> Result<u64, ()> {
+        loop {
+            let notified = self.resume_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.closed.load(Ordering::Acquire) {
+                return Err(());
+            }
+            if !allow_during_resume && self.resuming.load(Ordering::Acquire) {
+                notified.await;
+                continue;
+            }
+            if !self.connected.load(Ordering::Acquire) {
+                if !self.is_resumable() {
+                    return Err(());
+                }
+                notified.await;
+                continue;
+            }
+            let generation = self.generation.load(Ordering::Acquire);
+            let semaphore = self.semaphore.lock().unwrap().clone();
+            match semaphore.acquire_owned().await {
+                Ok(permit) => {
+                    permit.forget();
+                    if self.connected.load(Ordering::Acquire)
+                        && self.generation.load(Ordering::Acquire) == generation
+                    {
+                        return Ok(generation);
+                    }
+                }
+                Err(_) if !self.is_resumable() => return Err(()),
+                Err(_) => {}
+            }
+        }
+    }
+
+    fn record(&self, offset: u64, payload: Bytes) {
+        self.unacked.lock().unwrap().push_back((offset, payload));
+    }
+
+    fn unacked(&self) -> Vec<(u64, Bytes)> {
+        let ack_offset = self.ack_offset.load(Ordering::Acquire);
+        self.unacked
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(offset, payload)| offset.saturating_add(payload.len() as u64) > ack_offset)
+            .cloned()
+            .collect()
+    }
+
+    fn finish_resume(&self) {
+        self.resuming.store(false, Ordering::Release);
+        self.resume_notify.notify_waiters();
+    }
+
+    async fn wait_until_ready(&self) -> Result<u64, ()> {
+        loop {
+            let notified = self.resume_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.connected.load(Ordering::Acquire) && !self.resuming.load(Ordering::Acquire) {
+                return Ok(self.generation.load(Ordering::Acquire));
+            }
+            if self.closed.load(Ordering::Acquire) {
+                return Err(());
+            }
+            if !self.is_resumable() {
+                return Err(());
+            }
+            notified.await;
+        }
+    }
+
+    async fn wait_until_connected(&self) -> Result<u64, ()> {
+        loop {
+            let notified = self.resume_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.closed.load(Ordering::Acquire) {
+                return Err(());
+            }
+            if self.connected.load(Ordering::Acquire) {
+                return Ok(self.generation.load(Ordering::Acquire));
+            }
+            if !self.is_resumable() {
+                return Err(());
+            }
+            notified.await;
+        }
+    }
+}
+
+struct CachedRequest {
+    frame: Frame,
+    created_at: Instant,
+    session_id: Option<String>,
+    ttl: Duration,
 }
 
 #[derive(Clone)]
@@ -235,11 +453,12 @@ struct OutboundMessage {
 struct NegotiatedConnection {
     generation: u64,
     protocol: NegotiatedProtocol,
+    session_id: Option<String>,
     http: Arc<Semaphore>,
     websocket: Arc<Semaphore>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ConnectionProtocol {
     Disconnected,
     Legacy {
@@ -248,6 +467,7 @@ enum ConnectionProtocol {
     Streaming {
         generation: u64,
         protocol: NegotiatedProtocol,
+        session_id: Option<String>,
     },
 }
 
@@ -313,6 +533,10 @@ enum Frame {
         max_body_size: usize,
         #[serde(default = "configured_max_ws_message_bytes")]
         max_ws_message_size: usize,
+        #[serde(default)]
+        resume: bool,
+        #[serde(default)]
+        session_id: Option<String>,
     },
     #[serde(rename = "http_req")]
     HttpReq {
@@ -355,7 +579,14 @@ enum Frame {
     #[serde(rename = "http_resp_end")]
     HttpRespEnd { id: String },
     #[serde(rename = "window")]
-    Window { id: String, credits: usize },
+    Window {
+        id: String,
+        credits: usize,
+        #[serde(default)]
+        ack_offset: Option<u64>,
+        #[serde(default)]
+        complete: bool,
+    },
     #[serde(rename = "ws_connect")]
     WsConnect {
         id: String,
@@ -414,6 +645,7 @@ struct BinaryEnvelope {
     kind: BinaryKind,
     payload: Bytes,
     end_of_body: bool,
+    offset: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -423,6 +655,7 @@ struct NegotiatedProtocol {
     stream_window_frames: usize,
     max_body_size: usize,
     max_ws_message_size: usize,
+    resumable: bool,
 }
 
 impl BinaryEnvelope {
@@ -439,12 +672,24 @@ impl BinaryEnvelope {
         raw.push(self.kind as u8);
         raw.push(16);
         raw.extend_from_slice(&uuid_bytes_from_id(&self.id)?);
-        raw.push(if self.end_of_body {
+        let mut flags = if self.end_of_body {
             BINARY_END_OF_BODY
         } else {
             0
-        });
-        raw.extend_from_slice(&(self.payload.len() as u32).to_be_bytes());
+        };
+        let wire_payload_len = self
+            .payload
+            .len()
+            .checked_add(if self.offset.is_some() { 8 } else { 0 })
+            .ok_or_else(|| "binary payload size overflow".to_string())?;
+        if self.offset.is_some() {
+            flags |= BINARY_HAS_OFFSET;
+        }
+        raw.push(flags);
+        raw.extend_from_slice(&(wire_payload_len as u32).to_be_bytes());
+        if let Some(offset) = self.offset {
+            raw.extend_from_slice(&offset.to_be_bytes());
+        }
         raw.extend_from_slice(&self.payload);
         Ok(Message::Binary(raw))
     }
@@ -466,13 +711,14 @@ impl BinaryEnvelope {
         let raw_id: [u8; 16] = raw[5..21].try_into().unwrap();
         let id = id_from_uuid_bytes(&raw_id);
         let flags = raw[21];
-        if flags & !BINARY_END_OF_BODY != 0 {
+        if flags & !(BINARY_END_OF_BODY | BINARY_HAS_OFFSET) != 0 {
             return Err(format!("unknown binary envelope flags: {flags:#x}"));
         }
         let payload_len = u32::from_be_bytes(raw[22..26].try_into().unwrap()) as usize;
-        if payload_len > max_payload {
+        let wire_limit = max_payload + if flags & BINARY_HAS_OFFSET != 0 { 8 } else { 0 };
+        if payload_len > wire_limit {
             return Err(format!(
-                "binary payload exceeds negotiated chunk limit: {payload_len} > {max_payload}"
+                "binary payload exceeds negotiated chunk limit: {payload_len} > {wire_limit}"
             ));
         }
         if raw.len() - BINARY_HEADER_BYTES != payload_len {
@@ -481,11 +727,30 @@ impl BinaryEnvelope {
                 raw.len() - BINARY_HEADER_BYTES
             ));
         }
+        let wire_payload = &raw[BINARY_HEADER_BYTES..];
+        let (offset, payload) = if flags & BINARY_HAS_OFFSET != 0 {
+            if wire_payload.len() < 8 {
+                return Err("offset binary envelope payload is too short".into());
+            }
+            (
+                Some(u64::from_be_bytes(wire_payload[..8].try_into().unwrap())),
+                &wire_payload[8..],
+            )
+        } else {
+            (None, wire_payload)
+        };
+        if payload.len() > max_payload {
+            return Err(format!(
+                "binary payload exceeds negotiated chunk limit: {} > {max_payload}",
+                payload.len()
+            ));
+        }
         Ok(Self {
             id,
             kind,
-            payload: Bytes::copy_from_slice(&raw[BINARY_HEADER_BYTES..]),
+            payload: Bytes::copy_from_slice(payload),
             end_of_body: flags & BINARY_END_OF_BODY != 0,
+            offset,
         })
     }
 }
@@ -520,6 +785,8 @@ fn headers_within_limits(headers: &HeaderList) -> bool {
 
 // ───────────────────────── shared state ─────────────────────────
 struct State {
+    /// Maximum wait for one reverse-tunnel HTTP exchange.
+    http_timeout: Duration,
     /// Outbound bounded channel and generation of the active TunnelClient WS.
     active_client: Mutex<Option<ActiveClient>>,
     /// HTTP request id -> waiter accepting either a V1 response or V2 stream metadata.
@@ -527,11 +794,11 @@ struct State {
     /// WS channel id -> queue of frames from the client for that channel.
     pending_ws: Mutex<HashMap<String, PendingWsChannel>>,
     /// In-flight HTTP request frames, cached for resend when a client reconnects.
-    pending_requests: Mutex<HashMap<String, (Frame, Instant)>>,
+    pending_requests: Mutex<HashMap<String, CachedRequest>>,
     /// V2 response id -> bounded downstream body channel.
     response_streams: Mutex<HashMap<String, ResponseStreamSink>>,
     /// V2 stream id -> sender-side byte credits granted by the peer.
-    stream_credits: Mutex<HashMap<String, StreamCredits>>,
+    stream_credits: Mutex<HashMap<String, Arc<StreamCredits>>>,
     /// Recently closed response ids absorb the peer's already-granted window
     /// without turning a single downstream cancellation into a tunnel reset.
     terminated_streams: Mutex<HashMap<(u64, String), Instant>>,
@@ -549,6 +816,7 @@ struct State {
 impl Default for State {
     fn default() -> Self {
         Self {
+            http_timeout: configured_http_timeout(),
             active_client: Mutex::new(None),
             pending_http: Mutex::new(HashMap::new()),
             pending_ws: Mutex::new(HashMap::new()),
@@ -567,6 +835,14 @@ impl Default for State {
 }
 
 impl State {
+    #[cfg(test)]
+    fn with_http_timeout(http_timeout: Duration) -> Self {
+        Self {
+            http_timeout,
+            ..Self::default()
+        }
+    }
+
     fn send_message_for_generation(&self, generation: u64, message: Message) -> Result<(), ()> {
         let guard = self.active_client.lock().unwrap();
         match guard
@@ -674,6 +950,16 @@ impl State {
             .map(|connection| (generation, connection.protocol))
     }
 
+    fn active_session_id(&self) -> Option<String> {
+        let generation = self.active_generation.load(Ordering::Acquire);
+        self.negotiated
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|connection| connection.generation == generation)
+            .and_then(|connection| connection.session_id.clone())
+    }
+
     fn select_legacy_if_unnegotiated(&self, generation: u64) -> bool {
         if self.active_client_generation() != Some(generation) {
             return false;
@@ -702,6 +988,7 @@ impl State {
             return ConnectionProtocol::Streaming {
                 generation: candidate,
                 protocol,
+                session_id: self.active_session_id(),
             };
         }
         if self.legacy_generation.load(Ordering::Acquire) == generation {
@@ -715,6 +1002,7 @@ impl State {
             return ConnectionProtocol::Streaming {
                 generation: candidate,
                 protocol,
+                session_id: self.active_session_id(),
             };
         }
         if self.select_legacy_if_unnegotiated(generation) {
@@ -724,43 +1012,50 @@ impl State {
             ConnectionProtocol::Streaming {
                 generation: candidate,
                 protocol,
+                session_id: self.active_session_id(),
             }
         } else {
             ConnectionProtocol::Disconnected
         }
     }
 
-    fn register_stream_credits(&self, id: &str, generation: u64, window: usize) -> Arc<Semaphore> {
-        let semaphore = Arc::new(Semaphore::new(0));
-        self.stream_credits.lock().unwrap().insert(
-            id.to_string(),
-            StreamCredits {
-                generation,
-                semaphore: semaphore.clone(),
-                window,
-            },
-        );
-        semaphore
+    fn register_stream_credits(
+        &self,
+        id: &str,
+        generation: u64,
+        session_id: Option<String>,
+        window: usize,
+    ) -> Arc<StreamCredits> {
+        let credits = Arc::new(StreamCredits::new(generation, session_id, window));
+        self.stream_credits
+            .lock()
+            .unwrap()
+            .insert(id.to_string(), credits.clone());
+        credits
     }
 
-    fn grant_stream_credits(&self, id: &str, generation: u64, credits: usize) {
+    fn grant_stream_credits(
+        &self,
+        id: &str,
+        generation: u64,
+        credits: usize,
+        ack_offset: Option<u64>,
+    ) -> Option<Arc<StreamCredits>> {
         let guard = self.stream_credits.lock().unwrap();
         let Some(entry) = guard.get(id) else {
-            return;
+            return None;
         };
-        if entry.generation != generation {
-            return;
-        }
-        let available = entry.semaphore.available_permits();
-        let grant = credits.min(entry.window.saturating_sub(available));
-        if grant > 0 {
-            entry.semaphore.add_permits(grant);
-        }
+        entry
+            .grant(generation, credits, ack_offset)
+            .then(|| entry.clone())
     }
 
     fn remove_stream_credits(&self, id: &str) -> bool {
         if let Some(entry) = self.stream_credits.lock().unwrap().remove(id) {
-            entry.semaphore.close();
+            entry.closed.store(true, Ordering::Release);
+            entry.connected.store(false, Ordering::Release);
+            entry.semaphore.lock().unwrap().close();
+            entry.resume_notify.notify_waiters();
             true
         } else {
             false
@@ -806,18 +1101,20 @@ impl State {
             return;
         }
         *self.negotiated.lock().unwrap() = None;
-        self.fail_streams_for_generation(generation, message);
+        self.disconnect_streams_for_generation(generation, message);
         self.close_ws_for_generation(generation, message);
         self.protocol_notify.notify_waiters();
     }
 
-    fn fail_streams_for_generation(&self, generation: u64, message: &str) {
+    fn disconnect_streams_for_generation(&self, generation: u64, message: &str) {
         let pending_ids: Vec<String> = self
             .pending_http
             .lock()
             .unwrap()
             .iter()
-            .filter(|(_, pending)| pending.generation == Some(generation))
+            .filter(|(_, pending)| {
+                pending.generation == Some(generation) && pending.session_id.is_none()
+            })
             .map(|(id, _)| id.clone())
             .collect();
         let mut pending = self.pending_http.lock().unwrap();
@@ -833,7 +1130,7 @@ impl State {
             .lock()
             .unwrap()
             .iter()
-            .filter(|(_, sink)| sink.generation == generation)
+            .filter(|(_, sink)| sink.generation == generation && sink.session_id.is_none())
             .map(|(id, _)| id.clone())
             .collect();
         let mut responses = self.response_streams.lock().unwrap();
@@ -844,16 +1141,153 @@ impl State {
         }
         drop(responses);
 
+        let credit_entries: Vec<(String, Arc<StreamCredits>)> = self
+            .stream_credits
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, entry)| entry.generation.load(Ordering::Acquire) == generation)
+            .map(|(id, entry)| (id.clone(), entry.clone()))
+            .collect();
+        for (id, entry) in credit_entries {
+            entry.disconnect(generation);
+            if !entry.is_resumable() {
+                self.remove_stream_credits(&id);
+            }
+        }
+    }
+
+    fn fail_resumable_session(&self, session_id: &str, message: &str) {
+        let pending_ids: Vec<String> = self
+            .pending_http
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, pending)| pending.session_id.as_deref() == Some(session_id))
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut pending = self.pending_http.lock().unwrap();
+        for id in &pending_ids {
+            if let Some(pending) = pending.remove(id) {
+                let _ = pending.sender.send(Err(message.to_string()));
+            }
+        }
+        drop(pending);
+
+        let response_ids: Vec<String> = self
+            .response_streams
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, sink)| sink.session_id.as_deref() == Some(session_id))
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut responses = self.response_streams.lock().unwrap();
+        for id in &response_ids {
+            if let Some(sink) = responses.remove(id) {
+                let _ = sink.sender.try_send(Err(message.to_string()));
+            }
+        }
+        drop(responses);
+
         let credit_ids: Vec<String> = self
             .stream_credits
             .lock()
             .unwrap()
             .iter()
-            .filter(|(_, entry)| entry.generation == generation)
+            .filter(|(_, entry)| entry.session_id.as_deref() == Some(session_id))
             .map(|(id, _)| id.clone())
             .collect();
         for id in credit_ids {
             self.remove_stream_credits(&id);
+        }
+        self.pending_requests
+            .lock()
+            .unwrap()
+            .retain(|_, cached| cached.session_id.as_deref() != Some(session_id));
+    }
+
+    fn resumable_session_ids(&self) -> HashSet<String> {
+        let mut sessions = HashSet::new();
+        sessions.extend(
+            self.pending_http
+                .lock()
+                .unwrap()
+                .values()
+                .filter_map(|pending| pending.session_id.clone()),
+        );
+        sessions.extend(
+            self.response_streams
+                .lock()
+                .unwrap()
+                .values()
+                .filter_map(|sink| sink.session_id.clone()),
+        );
+        sessions.extend(
+            self.stream_credits
+                .lock()
+                .unwrap()
+                .values()
+                .filter_map(|credits| credits.session_id.clone()),
+        );
+        sessions
+    }
+
+    fn rebind_resumable_session(
+        &self,
+        session_id: &str,
+        generation: u64,
+    ) -> Vec<(String, usize, u64)> {
+        for pending in self.pending_http.lock().unwrap().values_mut() {
+            if pending.session_id.as_deref() == Some(session_id) {
+                pending.generation = Some(generation);
+            }
+        }
+
+        let response_windows = {
+            let mut streams = self.response_streams.lock().unwrap();
+            streams
+                .iter_mut()
+                .filter_map(|(id, sink)| {
+                    if sink.session_id.as_deref() != Some(session_id) {
+                        return None;
+                    }
+                    sink.generation = generation;
+                    let queued = sink.queued_frames.load(Ordering::Acquire);
+                    Some((
+                        id.clone(),
+                        sink.window.saturating_sub(queued),
+                        sink.received as u64,
+                    ))
+                })
+                .collect()
+        };
+
+        for credits in self.stream_credits.lock().unwrap().values() {
+            if credits.session_id.as_deref() == Some(session_id) {
+                credits.rebind(generation);
+            }
+        }
+        response_windows
+    }
+
+    fn send_response_window(&self, id: &str, credits: usize, ack_offset: u64) {
+        let generation = self
+            .response_streams
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|sink| sink.generation);
+        if let Some(generation) = generation {
+            let _ = self.send_to_generation(
+                generation,
+                &Frame::Window {
+                    id: id.to_string(),
+                    credits,
+                    ack_offset: Some(ack_offset),
+                    complete: false,
+                },
+            );
         }
     }
 
@@ -1191,7 +1625,7 @@ async fn handle_client(stream: TcpStream, state: Arc<State>) -> Result<(), Strin
     if let Some(previous) = replaced {
         previous.data_permits.close();
         let _ = previous.shutdown.send(());
-        state.fail_streams_for_generation(previous.generation, "tunnel client replaced");
+        state.disconnect_streams_for_generation(previous.generation, "tunnel client replaced");
         state.close_ws_for_generation(previous.generation, "tunnel client replaced");
     }
     let _connection_guard = ActiveConnectionGuard {
@@ -1210,6 +1644,8 @@ async fn handle_client(stream: TcpStream, state: Arc<State>) -> Result<(), Strin
                 stream_window_frames: configured_stream_window_frames(),
                 max_body_size: configured_max_body_bytes(),
                 max_ws_message_size: configured_max_ws_message_bytes(),
+                resume: true,
+                session_id: None,
             },
         )
         .map_err(|_| "failed to queue tunnel hello".to_string())?;
@@ -1221,7 +1657,7 @@ async fn handle_client(stream: TcpStream, state: Arc<State>) -> Result<(), Strin
         tokio::time::sleep(Duration::from_millis(250)).await;
         if fallback_state.select_legacy_if_unnegotiated(generation) {
             fallback_state.protocol_notify.notify_waiters();
-            resend_pending_requests(&fallback_state, generation);
+            resend_pending_requests(&fallback_state, generation, None);
         }
     });
 
@@ -1286,7 +1722,7 @@ fn cleanup_expired_requests(state: &Arc<State>) {
         let mut pr = state.pending_requests.lock().unwrap();
         let ex: Vec<String> = pr
             .iter()
-            .filter(|(_, (_, ts))| now.duration_since(*ts) > PENDING_REQUEST_TTL)
+            .filter(|(_, cached)| now.duration_since(cached.created_at) > cached.ttl)
             .map(|(k, _)| k.clone())
             .collect();
         for k in &ex {
@@ -1302,14 +1738,15 @@ fn cleanup_expired_requests(state: &Arc<State>) {
 }
 
 /// On client (re)connect, resend any HTTP requests still in flight.
-fn resend_pending_requests(state: &Arc<State>, generation: u64) {
+fn resend_pending_requests(state: &Arc<State>, generation: u64, session_id: Option<&str>) {
     cleanup_expired_requests(state);
     let frames: Vec<Frame> = state
         .pending_requests
         .lock()
         .unwrap()
         .values()
-        .map(|(f, _)| f.clone())
+        .filter(|cached| cached.session_id.as_deref() == session_id)
+        .map(|cached| cached.frame.clone())
         .collect();
     if !frames.is_empty() {
         rrt_info!(
@@ -1334,6 +1771,8 @@ async fn dispatch_from_client(frame: Frame, state: &Arc<State>, generation: u64)
             stream_window_frames,
             max_body_size,
             max_ws_message_size,
+            resume,
+            session_id,
         } if configured_protocol_version() >= TUNNEL_PROTOCOL_VERSION
             && *protocol_version >= TUNNEL_PROTOCOL_VERSION
             && *max_stream_chunk >= MIN_STREAM_CHUNK_BYTES
@@ -1342,6 +1781,19 @@ async fn dispatch_from_client(frame: Frame, state: &Arc<State>, generation: u64)
             && *max_body_size > 0
             && *max_ws_message_size > 0 =>
         {
+            let negotiated_session = if *resume {
+                session_id
+                    .as_ref()
+                    .filter(|candidate| uuid_bytes_from_id(candidate).is_ok())
+                    .cloned()
+            } else {
+                None
+            };
+            if *resume && negotiated_session.is_none() {
+                rrt_warn!(
+                    "[rrt-runtime] tunnel ignored_invalid_resume_session generation={generation}"
+                );
+            }
             let negotiated_max_inflight = (*max_inflight).min(configured_max_inflight());
             let protocol = NegotiatedProtocol {
                 max_stream_chunk: (*max_stream_chunk).min(configured_stream_chunk_bytes()),
@@ -1357,6 +1809,7 @@ async fn dispatch_from_client(frame: Frame, state: &Arc<State>, generation: u64)
                     ),
                 max_body_size: (*max_body_size).min(configured_max_body_bytes()),
                 max_ws_message_size: (*max_ws_message_size).min(configured_max_ws_message_bytes()),
+                resumable: negotiated_session.is_some(),
             };
             let mut negotiated = state.negotiated.lock().unwrap();
             if let Some(existing) = negotiated.as_ref() {
@@ -1373,23 +1826,44 @@ async fn dispatch_from_client(frame: Frame, state: &Arc<State>, generation: u64)
             *negotiated = Some(NegotiatedConnection {
                 generation,
                 protocol,
+                session_id: negotiated_session.clone(),
                 http: Arc::new(Semaphore::new(protocol.max_inflight)),
                 websocket: Arc::new(Semaphore::new(protocol.max_inflight)),
             });
             drop(negotiated);
             state.protocol_notify.notify_waiters();
-            // A request already sent after the V1 fallback remains valid when
-            // a late hello upgrades subsequent traffic; do not replay it twice.
-            if !was_legacy {
-                resend_pending_requests(state, generation);
+            if let Some(session_id) = negotiated_session.as_deref() {
+                for stale in state.resumable_session_ids() {
+                    if stale != session_id {
+                        state.fail_resumable_session(&stale, "tunnel client session was replaced");
+                    }
+                }
+                let response_windows = state.rebind_resumable_session(session_id, generation);
+                resend_pending_requests(state, generation, Some(session_id));
+                for (id, credits, ack_offset) in response_windows {
+                    let _ = state.send_to_generation(
+                        generation,
+                        &Frame::Window {
+                            id,
+                            credits,
+                            ack_offset: Some(ack_offset),
+                            complete: false,
+                        },
+                    );
+                }
+            } else if !was_legacy {
+                // A request already sent after the V1 fallback remains valid
+                // when a late hello upgrades subsequent traffic.
+                resend_pending_requests(state, generation, None);
             }
             rrt_info!(
-                "[rrt-runtime] tunnel protocol_v2 negotiated chunk={} inflight={} window={} body={} ws_message={}",
+                "[rrt-runtime] tunnel protocol_v2 negotiated chunk={} inflight={} window={} body={} ws_message={} resume={}",
                 protocol.max_stream_chunk,
                 protocol.max_inflight,
                 protocol.stream_window_frames,
                 protocol.max_body_size,
-                protocol.max_ws_message_size
+                protocol.max_ws_message_size,
+                protocol.resumable
             );
         }
         Frame::Ping { id, timestamp } => {
@@ -1447,9 +1921,10 @@ async fn dispatch_from_client(frame: Frame, state: &Arc<State>, generation: u64)
                     );
                     return;
                 }
-                // A small request is replayable only until its response starts
-                // streaming; from this point the exchange is connection-scoped.
+                // The request frame is no longer needed once response metadata
+                // arrives. Response-body resume uses its own offset/window state.
                 state.pending_requests.lock().unwrap().remove(id);
+                state.remove_stream_credits(id);
                 let protocol = state
                     .active_protocol()
                     .map(|(_, protocol)| protocol)
@@ -1459,6 +1934,7 @@ async fn dispatch_from_client(frame: Frame, state: &Arc<State>, generation: u64)
                         stream_window_frames: configured_stream_window_frames(),
                         max_body_size: configured_max_body_bytes(),
                         max_ws_message_size: configured_max_ws_message_bytes(),
+                        resumable: false,
                     });
                 if content_length.is_some_and(|length| length > protocol.max_body_size as u64) {
                     let _ = pending
@@ -1475,14 +1951,18 @@ async fn dispatch_from_client(frame: Frame, state: &Arc<State>, generation: u64)
                     return;
                 }
                 let (body_tx, body_rx) = mpsc::channel(protocol.stream_window_frames);
+                let queued_frames = Arc::new(AtomicUsize::new(0));
                 state.response_streams.lock().unwrap().insert(
                     id.clone(),
                     ResponseStreamSink {
                         generation,
+                        session_id: pending.session_id.clone(),
                         sender: body_tx,
                         received: 0,
                         expected: content_length.map(|length| length as usize),
                         max_body_size: protocol.max_body_size,
+                        queued_frames: queued_frames.clone(),
+                        window: protocol.stream_window_frames,
                     },
                 );
                 let status = StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -1492,6 +1972,7 @@ async fn dispatch_from_client(frame: Frame, state: &Arc<State>, generation: u64)
                     headers: headers.clone(),
                     content_length: *content_length,
                     body_rx,
+                    queued_frames,
                 };
                 if pending
                     .sender
@@ -1503,6 +1984,8 @@ async fn dispatch_from_client(frame: Frame, state: &Arc<State>, generation: u64)
                         &Frame::Window {
                             id: id.clone(),
                             credits: protocol.stream_window_frames,
+                            ack_offset: Some(0),
+                            complete: false,
                         },
                     );
                 } else {
@@ -1520,10 +2003,10 @@ async fn dispatch_from_client(frame: Frame, state: &Arc<State>, generation: u64)
         }
         Frame::HttpRespEnd { id } => {
             if let Some(sink) = state.response_streams.lock().unwrap().remove(id) {
-                if sink
+                let length_mismatch = sink
                     .expected
-                    .is_some_and(|expected| expected != sink.received)
-                {
+                    .is_some_and(|expected| expected != sink.received);
+                if length_mismatch {
                     let message = "response content length mismatch";
                     let _ = sink.sender.try_send(Err(message.into()));
                     let _ = state.send_to_generation(
@@ -1533,12 +2016,34 @@ async fn dispatch_from_client(frame: Frame, state: &Arc<State>, generation: u64)
                             message: message.into(),
                         },
                     );
+                } else if sink.session_id.is_some() {
+                    let _ = state.send_to_generation(
+                        generation,
+                        &Frame::Window {
+                            id: id.clone(),
+                            credits: 0,
+                            ack_offset: Some(sink.received as u64),
+                            complete: true,
+                        },
+                    );
                 }
                 state.remember_terminated_stream(generation, id);
             }
         }
-        Frame::Window { id, credits } => {
-            state.grant_stream_credits(id, generation, *credits);
+        Frame::Window {
+            id,
+            credits,
+            ack_offset,
+            ..
+        } => {
+            if let Some(stream) = state.grant_stream_credits(id, generation, *credits, *ack_offset)
+            {
+                let state = state.clone();
+                let id = id.clone();
+                tokio::spawn(async move {
+                    resume_upload(state, id, stream).await;
+                });
+            }
         }
         Frame::Error { id, message } => {
             state.remove_stream_credits(id);
@@ -1600,7 +2105,9 @@ async fn dispatch_binary_from_client(
     match envelope.kind {
         BinaryKind::HttpResponse => {
             let id = envelope.id.to_string();
-            let sender = {
+            let mut duplicate_ack = None;
+            let mut queued_frames = None;
+            let (sender, chunk_offset) = {
                 let mut streams = state.response_streams.lock().unwrap();
                 let Some(sink) = streams.get_mut(&id) else {
                     if state.is_terminated_stream(generation, &id) {
@@ -1611,31 +2118,64 @@ async fn dispatch_binary_from_client(
                 if sink.generation != generation {
                     return Ok(());
                 }
-                let total = sink
-                    .received
-                    .checked_add(envelope.payload.len())
-                    .ok_or_else(|| format!("response size overflow for stream: {id}"))?;
-                if total > sink.max_body_size
-                    || sink.expected.is_some_and(|expected| total > expected)
-                {
-                    let message = "response body exceeds advertised or negotiated limit";
-                    let sink = streams.remove(&id).expect("stream exists");
-                    let _ = sink.sender.try_send(Err(message.into()));
-                    drop(streams);
-                    state.remember_terminated_stream(generation, &id);
-                    let _ = state.send_to_generation(
-                        generation,
-                        &Frame::Error {
-                            id,
-                            message: message.into(),
-                        },
-                    );
-                    return Ok(());
+                let chunk_offset = if sink.session_id.is_some() {
+                    envelope.offset.ok_or_else(|| {
+                        format!("resumable response chunk is missing offset: {id}")
+                    })?
+                } else {
+                    sink.received as u64
+                };
+                let chunk_end = chunk_offset
+                    .checked_add(envelope.payload.len() as u64)
+                    .ok_or_else(|| format!("response offset overflow for stream: {id}"))?;
+                if chunk_offset < sink.received as u64 {
+                    if chunk_end <= sink.received as u64 {
+                        duplicate_ack = Some(sink.received as u64);
+                        (sink.sender.clone(), chunk_offset)
+                    } else {
+                        return Err(format!("overlapping response chunk for stream: {id}"));
+                    }
+                } else if chunk_offset > sink.received as u64 {
+                    return Err(format!("response chunk gap for stream: {id}"));
+                } else {
+                    let total = usize::try_from(chunk_end)
+                        .map_err(|_| format!("response size overflow for stream: {id}"))?;
+                    if total > sink.max_body_size
+                        || sink.expected.is_some_and(|expected| total > expected)
+                    {
+                        let message = "response body exceeds advertised or negotiated limit";
+                        let sink = streams.remove(&id).expect("stream exists");
+                        let _ = sink.sender.try_send(Err(message.into()));
+                        drop(streams);
+                        state.remember_terminated_stream(generation, &id);
+                        let _ = state.send_to_generation(
+                            generation,
+                            &Frame::Error {
+                                id,
+                                message: message.into(),
+                            },
+                        );
+                        return Ok(());
+                    }
+                    sink.received = total;
+                    sink.queued_frames.fetch_add(1, Ordering::AcqRel);
+                    queued_frames = Some(sink.queued_frames.clone());
+                    (sink.sender.clone(), chunk_offset)
                 }
-                sink.received = total;
-                sink.sender.clone()
             };
-            if sender.try_send(Ok(envelope.payload)).is_err() {
+            if let Some(ack_offset) = duplicate_ack {
+                state.send_response_window(&id, 0, ack_offset);
+                return Ok(());
+            }
+            let queued_frames = queued_frames.expect("new response chunks track queue depth");
+            if sender
+                .try_send(Ok(ResponseChunk {
+                    offset: chunk_offset,
+                    payload: envelope.payload,
+                }))
+                .is_err()
+            {
+                queued_frames.fetch_sub(1, Ordering::AcqRel);
                 state.response_streams.lock().unwrap().remove(&id);
                 state.remember_terminated_stream(generation, &id);
                 let _ = state.send_to_generation(
@@ -1931,11 +2471,67 @@ fn build_response(
         .unwrap_or_else(|_| plain_response(StatusCode::BAD_GATEWAY, "Invalid response headers"))
 }
 
+async fn resume_upload(state: Arc<State>, id: String, credits: Arc<StreamCredits>) {
+    let _send_guard = credits.send_lock.lock().await;
+    if !credits.resuming.load(Ordering::Acquire) || credits.closed.load(Ordering::Acquire) {
+        return;
+    }
+
+    'resume: loop {
+        for (offset, payload) in credits.unacked() {
+            let generation = match credits.acquire(true).await {
+                Ok(generation) => generation,
+                Err(()) => return,
+            };
+            let message = match (BinaryEnvelope {
+                id: id.clone(),
+                kind: BinaryKind::HttpRequest,
+                payload,
+                end_of_body: false,
+                offset: Some(offset),
+            })
+            .encode(configured_stream_chunk_bytes())
+            {
+                Ok(message) => message,
+                Err(_) => {
+                    state.remove_stream_credits(&id);
+                    return;
+                }
+            };
+            if state
+                .send_data_message_for_generation_wait(generation, message)
+                .await
+                .is_err()
+            {
+                credits.disconnect(generation);
+                continue 'resume;
+            }
+        }
+
+        if credits.ended.load(Ordering::Acquire) {
+            let generation = match credits.wait_until_connected().await {
+                Ok(generation) => generation,
+                Err(()) => return,
+            };
+            if state
+                .send_to_generation(generation, &Frame::HttpReqEnd { id: id.clone() })
+                .is_err()
+            {
+                credits.disconnect(generation);
+                continue 'resume;
+            }
+        }
+        credits.finish_resume();
+        return;
+    }
+}
+
 async fn proxy_streaming_http_request(
     request: StreamingHttpRequest,
     state: Arc<State>,
     generation: u64,
     protocol: NegotiatedProtocol,
+    session_id: Option<String>,
     permit: OwnedSemaphorePermit,
 ) -> Response<TunnelBody> {
     let StreamingHttpRequest {
@@ -1948,13 +2544,20 @@ async fn proxy_streaming_http_request(
     if content_length.is_some_and(|length| length > protocol.max_body_size as u64) {
         return plain_response(StatusCode::PAYLOAD_TOO_LARGE, "request body exceeds limit");
     }
+    let session_id = protocol.resumable.then_some(session_id).flatten();
     let id = make_id();
-    let credits = state.register_stream_credits(&id, generation, protocol.stream_window_frames);
+    let credits = state.register_stream_credits(
+        &id,
+        generation,
+        session_id.clone(),
+        protocol.stream_window_frames,
+    );
     let (response_tx, response_rx) = oneshot::channel();
     state.pending_http.lock().unwrap().insert(
         id.clone(),
         PendingHttpResponse {
             generation: Some(generation),
+            session_id: session_id.clone(),
             sender: response_tx,
         },
     );
@@ -1966,11 +2569,23 @@ async fn proxy_streaming_http_request(
         headers,
         content_length,
     };
-    if state.send_to_generation(generation, &begin).is_err() {
+    if let Some(session_id) = session_id.clone() {
+        state.pending_requests.lock().unwrap().insert(
+            id.clone(),
+            CachedRequest {
+                frame: begin.clone(),
+                created_at: Instant::now(),
+                session_id: Some(session_id),
+                ttl: state.http_timeout,
+            },
+        );
+    }
+    if state.send_to_generation(generation, &begin).is_err() && session_id.is_none() {
         return plain_response(StatusCode::BAD_GATEWAY, "Tunnel client is not connected");
     }
 
     let mut received = 0usize;
+    let mut sent_offset = 0u64;
     while let Some(frame) = body.frame().await {
         let frame = match frame {
             Ok(frame) => frame,
@@ -1988,48 +2603,76 @@ async fn proxy_streaming_http_request(
             }
         };
         for chunk in data.chunks(protocol.max_stream_chunk) {
-            let permit = match tokio::time::timeout(HTTP_TIMEOUT, credits.acquire()).await {
-                Ok(Ok(permit)) => permit,
-                _ => {
-                    return plain_response(StatusCode::BAD_GATEWAY, "Tunnel request stream lost");
-                }
-            };
-            permit.forget();
+            let chunk = Bytes::copy_from_slice(chunk);
+            let chunk_offset = sent_offset;
+            let stream_generation =
+                match tokio::time::timeout(state.http_timeout, credits.acquire(false)).await {
+                    Ok(Ok(generation)) => generation,
+                    _ => {
+                        return plain_response(
+                            StatusCode::BAD_GATEWAY,
+                            "Tunnel request stream lost",
+                        );
+                    }
+                };
+            if session_id.is_some() {
+                credits.record(chunk_offset, chunk.clone());
+            }
             let message = BinaryEnvelope {
                 id: id.clone(),
                 kind: BinaryKind::HttpRequest,
-                payload: Bytes::copy_from_slice(chunk),
+                payload: chunk.clone(),
                 end_of_body: false,
+                offset: session_id.as_ref().map(|_| chunk_offset),
             }
             .encode(protocol.max_stream_chunk)
             .expect("request chunk is bounded by the negotiated size");
             if state
-                .send_data_message_for_generation_wait(generation, message)
+                .send_data_message_for_generation_wait(stream_generation, message)
                 .await
                 .is_err()
             {
-                return plain_response(
-                    StatusCode::BAD_GATEWAY,
-                    "Tunnel request stream disconnected",
-                );
+                credits.disconnect(stream_generation);
+                if session_id.is_none() {
+                    return plain_response(
+                        StatusCode::BAD_GATEWAY,
+                        "Tunnel request stream disconnected",
+                    );
+                }
             }
+            sent_offset = sent_offset.saturating_add(chunk.len() as u64);
         }
     }
     if content_length.is_some_and(|expected| expected != received as u64) {
         return plain_response(StatusCode::BAD_REQUEST, "Request content length mismatch");
     }
+    credits.ended.store(true, Ordering::Release);
+    let end_generation =
+        match tokio::time::timeout(state.http_timeout, credits.wait_until_ready()).await {
+            Ok(Ok(generation)) => generation,
+            _ => return plain_response(StatusCode::BAD_GATEWAY, "Tunnel request stream lost"),
+        };
     if state
-        .send_to_generation(generation, &Frame::HttpReqEnd { id: id.clone() })
+        .send_to_generation(end_generation, &Frame::HttpReqEnd { id: id.clone() })
         .is_err()
     {
-        return plain_response(
-            StatusCode::BAD_GATEWAY,
-            "Tunnel request stream disconnected",
-        );
+        credits.disconnect(end_generation);
+        if session_id.is_none()
+            || tokio::time::timeout(state.http_timeout, credits.wait_until_ready())
+                .await
+                .is_err()
+        {
+            return plain_response(
+                StatusCode::BAD_GATEWAY,
+                "Tunnel request stream disconnected",
+            );
+        }
     }
-    state.remove_stream_credits(&id);
+    if session_id.is_none() {
+        state.remove_stream_credits(&id);
+    }
 
-    let streaming_response = match tokio::time::timeout(HTTP_TIMEOUT, response_rx).await {
+    let streaming_response = match tokio::time::timeout(state.http_timeout, response_rx).await {
         Ok(Ok(Ok(TunnelResponse::Streaming(response)))) => response,
         Ok(Ok(Ok(TunnelResponse::Legacy(_)))) => {
             return plain_response(StatusCode::BAD_GATEWAY, "Invalid legacy tunnel response");
@@ -2062,6 +2705,8 @@ fn streaming_response_to_downstream(
         headers,
         content_length,
         body_rx,
+        queued_frames,
+        ..
     } = response;
     let downstream_headers = response_headers_for_stream(headers, &method, status, content_length);
     let suppress_body = method == Method::HEAD
@@ -2087,15 +2732,11 @@ fn streaming_response_to_downstream(
         let _hold_permit = &permit;
         let _hold_stream_guard = &stream_guard;
         match item {
-            Ok(bytes) => {
-                let _ = ack_state.send_to_generation(
-                    generation,
-                    &Frame::Window {
-                        id: ack_id.clone(),
-                        credits: 1,
-                    },
-                );
-                Ok(BodyFrame::data(bytes))
+            Ok(chunk) => {
+                queued_frames.fetch_sub(1, Ordering::AcqRel);
+                let ack_offset = chunk.offset.saturating_add(chunk.payload.len() as u64);
+                ack_state.send_response_window(&ack_id, 1, ack_offset);
+                Ok(BodyFrame::data(chunk.payload))
             }
             Err(message) => Err::<BodyFrame<Bytes>, BoxError>(Box::new(io::Error::new(
                 io::ErrorKind::ConnectionAborted,
@@ -2155,9 +2796,10 @@ async fn proxy_http_request(request: Request<Incoming>, state: Arc<State>) -> Re
     let permit = if let ConnectionProtocol::Streaming {
         generation,
         protocol,
-    } = connection
+        session_id,
+    } = &connection
     {
-        let negotiated_permit = match state.try_acquire_negotiated_permit(generation, false) {
+        let negotiated_permit = match state.try_acquire_negotiated_permit(*generation, false) {
             Ok(permit) => permit,
             Err(_) => {
                 return plain_response(
@@ -2177,8 +2819,9 @@ async fn proxy_http_request(request: Request<Incoming>, state: Arc<State>) -> Re
                     body,
                 },
                 state,
-                generation,
-                protocol,
+                *generation,
+                *protocol,
+                session_id.clone(),
                 negotiated_permit,
             )
             .await;
@@ -2187,7 +2830,7 @@ async fn proxy_http_request(request: Request<Incoming>, state: Arc<State>) -> Re
     } else {
         local_permit
     };
-    let body_limit = match connection {
+    let body_limit = match &connection {
         ConnectionProtocol::Legacy { .. } => MAX_V1_BODY_BYTES,
         ConnectionProtocol::Streaming { protocol, .. } => {
             protocol.max_body_size.min(MAX_V1_BODY_BYTES)
@@ -2224,36 +2867,60 @@ async fn proxy_http_request(request: Request<Incoming>, state: Arc<State>) -> Re
     state.pending_http.lock().unwrap().insert(
         id.clone(),
         PendingHttpResponse {
-            generation: match connection {
-                ConnectionProtocol::Streaming { generation, .. } => Some(generation),
+            generation: match &connection {
+                ConnectionProtocol::Streaming { generation, .. } => Some(*generation),
+                _ => None,
+            },
+            session_id: match &connection {
+                ConnectionProtocol::Streaming {
+                    protocol,
+                    session_id,
+                    ..
+                } if protocol.resumable => session_id.clone(),
                 _ => None,
             },
             sender: tx,
         },
     );
-    // Only V1 retains the historical at-least-once reconnect replay. V2 is
-    // generation-scoped so a disconnect cannot duplicate a completed POST.
-    if matches!(connection, ConnectionProtocol::Legacy { .. }) {
-        state
-            .pending_requests
-            .lock()
-            .unwrap()
-            .insert(id.clone(), (frame.clone(), Instant::now()));
+    // V1 keeps its historical replay behavior. Resumable V2 additionally
+    // relies on the client session to deduplicate this stable request id.
+    let cached_session = match &connection {
+        ConnectionProtocol::Streaming {
+            protocol,
+            session_id,
+            ..
+        } if protocol.resumable => session_id.clone(),
+        _ => None,
+    };
+    if matches!(connection, ConnectionProtocol::Legacy { .. }) || cached_session.is_some() {
+        state.pending_requests.lock().unwrap().insert(
+            id.clone(),
+            CachedRequest {
+                frame: frame.clone(),
+                created_at: Instant::now(),
+                session_id: cached_session.clone(),
+                ttl: if cached_session.is_some() {
+                    state.http_timeout
+                } else {
+                    PENDING_REQUEST_TTL
+                },
+            },
+        );
     }
-    let generation = match connection {
+    let generation = match &connection {
         ConnectionProtocol::Legacy { generation }
-        | ConnectionProtocol::Streaming { generation, .. } => generation,
+        | ConnectionProtocol::Streaming { generation, .. } => *generation,
         ConnectionProtocol::Disconnected => unreachable!(),
     };
     let mut request_guard = PendingRequestGuard::new(state.clone(), generation, id.clone());
-    if state.send_to_generation(generation, &frame).is_err() {
+    if state.send_to_generation(generation, &frame).is_err() && cached_session.is_none() {
         return plain_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "Tunnel client is not connected",
         );
     }
 
-    let result = tokio::time::timeout(HTTP_TIMEOUT, rx).await;
+    let result = tokio::time::timeout(state.http_timeout, rx).await;
 
     let (status, headers, response_body) = match result {
         Ok(Ok(Ok(TunnelResponse::Legacy(Frame::HttpResp {
@@ -2350,6 +3017,7 @@ async fn send_ws_binary_to_client(
                     kind: BinaryKind::WebSocket,
                     payload: Bytes::new(),
                     end_of_body: true,
+                    offset: None,
                 }
                 .encode(max_stream_chunk)
                 .map_err(|_| ())?,
@@ -2366,6 +3034,7 @@ async fn send_ws_binary_to_client(
                     kind: BinaryKind::WebSocket,
                     payload: Bytes::copy_from_slice(chunk),
                     end_of_body: index + 1 == chunk_count,
+                    offset: None,
                 }
                 .encode(max_stream_chunk)
                 .map_err(|_| ())?,
@@ -2600,6 +3269,34 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_tungstenite::connect_async;
 
+    #[test]
+    fn tunnel_http_timeout_accepts_positive_integer_and_fractional_seconds() {
+        assert_eq!(
+            parse_positive_duration_seconds("5"),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            parse_positive_duration_seconds("12.5"),
+            Some(Duration::from_millis(12_500))
+        );
+        assert_eq!(
+            parse_positive_duration_seconds("0.125"),
+            Some(Duration::from_millis(125))
+        );
+    }
+
+    #[test]
+    fn tunnel_http_timeout_falls_back_for_missing_or_invalid_values() {
+        assert_eq!(http_timeout_from_raw(None), DEFAULT_HTTP_TIMEOUT);
+        for raw in ["", "invalid", "0", "-1", "NaN", "inf", "1e500", "1e-20"] {
+            assert_eq!(
+                http_timeout_from_raw(Some(raw)),
+                DEFAULT_HTTP_TIMEOUT,
+                "raw={raw:?}"
+            );
+        }
+    }
+
     async fn spawn_test_server() -> (u16, u16) {
         let porta = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let portb = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2607,6 +3304,19 @@ mod tests {
         let hp = portb.local_addr().unwrap().port();
         tokio::spawn(serve(porta, portb, Arc::new(State::default())));
         (wp, hp)
+    }
+
+    async fn spawn_test_server_with_http_timeout(http_timeout: Duration) -> (u16, u16) {
+        let porta = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let portb = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ws_port = porta.local_addr().unwrap().port();
+        let http_port = portb.local_addr().unwrap().port();
+        tokio::spawn(serve(
+            porta,
+            portb,
+            Arc::new(State::with_http_timeout(http_timeout)),
+        ));
+        (ws_port, http_port)
     }
 
     async fn connect_client(
@@ -2638,6 +3348,31 @@ mod tests {
         connect_v2_client_with_max_inflight(ws_port, DEFAULT_MAX_INFLIGHT).await
     }
 
+    async fn connect_resumable_v2_client(
+        ws_port: u16,
+        session_id: &str,
+    ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>> {
+        let mut client = connect_client(ws_port).await;
+        client
+            .send(
+                Frame::Hello {
+                    protocol_version: TUNNEL_PROTOCOL_VERSION,
+                    max_stream_chunk: DEFAULT_STREAM_CHUNK_BYTES,
+                    max_inflight: DEFAULT_MAX_INFLIGHT,
+                    stream_window_frames: DEFAULT_STREAM_WINDOW_FRAMES,
+                    max_body_size: MAX_HTTP_BODY_BYTES,
+                    max_ws_message_size: DEFAULT_MAX_WS_MESSAGE_BYTES,
+                    resume: true,
+                    session_id: Some(session_id.to_string()),
+                }
+                .to_msg(),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        client
+    }
+
     async fn connect_v2_client_with_max_inflight(
         ws_port: u16,
         max_inflight: usize,
@@ -2652,6 +3387,8 @@ mod tests {
                     stream_window_frames: DEFAULT_STREAM_WINDOW_FRAMES,
                     max_body_size: MAX_HTTP_BODY_BYTES,
                     max_ws_message_size: DEFAULT_MAX_WS_MESSAGE_BYTES,
+                    resume: false,
+                    session_id: None,
                 }
                 .to_msg(),
             )
@@ -2723,6 +3460,74 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn configured_http_timeout_controls_slow_response_wait() {
+        let (ws_port, http_port) =
+            spawn_test_server_with_http_timeout(Duration::from_millis(100)).await;
+        let mut client = connect_v2_client(ws_port).await;
+        let request = tokio::spawn(async move { http_get(http_port, "/slow-timeout").await });
+        let timed_out_id = match next_frame(&mut client).await {
+            Frame::HttpReq { id, path, .. } => {
+                assert_eq!(path, "/slow-timeout");
+                id
+            }
+            other => panic!("expected http_req, got {other:?}"),
+        };
+        let response = tokio::time::timeout(Duration::from_secs(1), request)
+            .await
+            .expect("configured timeout should finish the downstream request")
+            .unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 504"),
+            "response={response:?}"
+        );
+        assert!(
+            response.ends_with("Tunnel timeout"),
+            "response={response:?}"
+        );
+        match tokio::time::timeout(Duration::from_secs(1), next_frame(&mut client))
+            .await
+            .expect("timeout should notify the upstream tunnel client")
+        {
+            Frame::Error { id, message } => {
+                assert_eq!(id, timed_out_id);
+                assert!(message.contains("downstream request closed"));
+            }
+            other => panic!("expected upstream cancellation, got {other:?}"),
+        }
+
+        let (ws_port, http_port) =
+            spawn_test_server_with_http_timeout(Duration::from_millis(500)).await;
+        let mut client = connect_v2_client(ws_port).await;
+        let request = tokio::spawn(async move { http_get(http_port, "/slow-success").await });
+        let id = match next_frame(&mut client).await {
+            Frame::HttpReq { id, path, .. } => {
+                assert_eq!(path, "/slow-success");
+                id
+            }
+            other => panic!("expected http_req, got {other:?}"),
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        client
+            .send(
+                Frame::HttpResp {
+                    id,
+                    status: 200,
+                    headers: Vec::new(),
+                    body: b64().encode(b"slow-ok"),
+                }
+                .to_msg(),
+            )
+            .await
+            .unwrap();
+        let response = request.await.unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "response={response:?}"
+        );
+        assert!(response.ends_with("slow-ok"), "response={response:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn legacy_peer_rejects_oversized_single_frame_request() {
         let (ws_port, http_port) = spawn_test_server().await;
         let mut client = connect_client(ws_port).await;
@@ -2764,10 +3569,13 @@ mod tests {
             id.clone(),
             ResponseStreamSink {
                 generation,
+                session_id: None,
                 sender: body_tx,
                 received: 0,
                 expected: None,
                 max_body_size: MAX_HTTP_BODY_BYTES,
+                queued_frames: Arc::new(AtomicUsize::new(0)),
+                window: DEFAULT_STREAM_WINDOW_FRAMES,
             },
         );
 
@@ -2777,6 +3585,7 @@ mod tests {
                 kind: BinaryKind::HttpResponse,
                 payload: Bytes::from_static(b"late"),
                 end_of_body: false,
+                offset: None,
             },
             &state,
             generation,
@@ -2800,6 +3609,7 @@ mod tests {
                 kind: BinaryKind::HttpResponse,
                 payload: Bytes::from_static(b"later"),
                 end_of_body: true,
+                offset: None,
             },
             &state,
             generation,
@@ -2816,6 +3626,7 @@ mod tests {
             kind: BinaryKind::HttpRequest,
             payload: Bytes::from_static(b"payload"),
             end_of_body: false,
+            offset: None,
         };
         let Message::Binary(raw) = envelope.encode(DEFAULT_STREAM_CHUNK_BYTES).unwrap() else {
             panic!("binary envelope must produce a binary WebSocket message")
@@ -2840,6 +3651,7 @@ mod tests {
             kind: BinaryKind::HttpResponse,
             payload: Bytes::from_static(b"last"),
             end_of_body: true,
+            offset: None,
         };
         let Message::Binary(raw) = envelope.encode(DEFAULT_STREAM_CHUNK_BYTES).unwrap() else {
             unreachable!()
@@ -2864,6 +3676,8 @@ mod tests {
             stream_window_frames: DEFAULT_STREAM_WINDOW_FRAMES,
             max_body_size: MAX_HTTP_BODY_BYTES,
             max_ws_message_size: DEFAULT_MAX_WS_MESSAGE_BYTES,
+            resume: false,
+            session_id: None,
         };
         let value: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&frame).unwrap()).unwrap();
@@ -3156,6 +3970,8 @@ mod tests {
                 Frame::Window {
                     id: id.clone(),
                     credits: DEFAULT_STREAM_WINDOW_FRAMES,
+                    ack_offset: None,
+                    complete: false,
                 }
                 .to_msg(),
             )
@@ -3201,6 +4017,7 @@ mod tests {
             Frame::Window {
                 id: window_id,
                 credits,
+                ..
             } => {
                 assert_eq!(window_id, id);
                 assert_eq!(credits, DEFAULT_STREAM_WINDOW_FRAMES);
@@ -3214,6 +4031,7 @@ mod tests {
                     kind: BinaryKind::HttpResponse,
                     payload: Bytes::from_static(b"ok"),
                     end_of_body: false,
+                    offset: None,
                 }
                 .encode(DEFAULT_STREAM_CHUNK_BYTES)
                 .unwrap(),
@@ -3343,6 +4161,8 @@ mod tests {
                 Frame::Window {
                     id: id.clone(),
                     credits: DEFAULT_STREAM_WINDOW_FRAMES,
+                    ack_offset: None,
+                    complete: false,
                 }
                 .to_msg(),
             )
@@ -3413,6 +4233,8 @@ mod tests {
                     stream_window_frames: DEFAULT_STREAM_WINDOW_FRAMES,
                     max_body_size: MAX_HTTP_BODY_BYTES,
                     max_ws_message_size: DEFAULT_MAX_WS_MESSAGE_BYTES,
+                    resume: false,
+                    session_id: None,
                 }
                 .to_msg(),
             )
@@ -3488,6 +4310,7 @@ mod tests {
             Frame::Window {
                 id: window_id,
                 credits,
+                ..
             } => {
                 assert_eq!(window_id, id);
                 assert_eq!(credits, DEFAULT_STREAM_WINDOW_FRAMES);
@@ -3505,6 +4328,7 @@ mod tests {
                         kind: BinaryKind::HttpResponse,
                         payload: Bytes::copy_from_slice(payload),
                         end_of_body: false,
+                        offset: None,
                     }
                     .encode(DEFAULT_STREAM_CHUNK_BYTES)
                     .unwrap(),
@@ -3559,6 +4383,7 @@ mod tests {
                     kind: BinaryKind::HttpResponse,
                     payload: Bytes::from_static(b"ok"),
                     end_of_body: false,
+                    offset: None,
                 }
                 .encode(DEFAULT_STREAM_CHUNK_BYTES)
                 .unwrap(),
@@ -3786,6 +4611,7 @@ mod tests {
                             kind: BinaryKind::WebSocket,
                             payload: Bytes::copy_from_slice(chunk),
                             end_of_body: (index + 1) * DEFAULT_STREAM_CHUNK_BYTES >= received.len(),
+                            offset: None,
                         }
                         .encode(DEFAULT_STREAM_CHUNK_BYTES)
                         .unwrap(),
@@ -3805,6 +4631,7 @@ mod tests {
                         kind: BinaryKind::WebSocket,
                         payload: Bytes::from_static(b"late"),
                         end_of_body: true,
+                        offset: None,
                     }
                     .encode(DEFAULT_STREAM_CHUNK_BYTES)
                     .unwrap(),
@@ -3903,5 +4730,228 @@ mod tests {
                 .is_err(),
             "V2 requests must not be replayed across connection generations"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resumable_v2_fast_request_survives_control_ws_reconnect() {
+        let (ws_port, http_port) = spawn_test_server().await;
+        let session_id = "00112233-4455-4677-8899-aabbccddeeff";
+        let mut first = connect_resumable_v2_client(ws_port, session_id).await;
+        let request = tokio::spawn(async move { http_get(http_port, "/resume-fast").await });
+        let request_id = match next_frame(&mut first).await {
+            Frame::HttpReq { id, path, .. } => {
+                assert_eq!(path, "/resume-fast");
+                id
+            }
+            other => panic!("expected fast-path request, got {other:?}"),
+        };
+        first.close(None).await.unwrap();
+
+        let mut resumed = connect_resumable_v2_client(ws_port, session_id).await;
+        match next_frame(&mut resumed).await {
+            Frame::HttpReq { id, path, .. } => {
+                assert_eq!(id, request_id);
+                assert_eq!(path, "/resume-fast");
+            }
+            other => panic!("expected stable-id replay after reconnect, got {other:?}"),
+        }
+        resumed
+            .send(
+                Frame::HttpResp {
+                    id: request_id,
+                    status: 200,
+                    headers: Vec::new(),
+                    body: b64().encode(b"resume-ok"),
+                }
+                .to_msg(),
+            )
+            .await
+            .unwrap();
+        let response = request.await.unwrap();
+        assert!(response.contains("200") && response.ends_with("resume-ok"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resumable_v2_response_chunks_are_deduplicated_after_reconnect() {
+        let (ws_port, http_port) = spawn_test_server().await;
+        let session_id = "10112233-4455-4677-8899-aabbccddeeff";
+        let mut first = connect_resumable_v2_client(ws_port, session_id).await;
+        let request = tokio::spawn(async move { http_get(http_port, "/resume-sse").await });
+        let id = match next_frame(&mut first).await {
+            Frame::HttpReq { id, .. } => id,
+            other => panic!("expected request, got {other:?}"),
+        };
+        first
+            .send(
+                Frame::HttpRespBegin {
+                    id: id.clone(),
+                    status: 200,
+                    headers: vec![("content-type".into(), "text/event-stream".into())],
+                    content_length: None,
+                }
+                .to_msg(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(next_frame(&mut first).await, Frame::Window { .. }));
+        first
+            .send(
+                BinaryEnvelope {
+                    id: id.clone(),
+                    kind: BinaryKind::HttpResponse,
+                    payload: Bytes::from_static(b"first"),
+                    end_of_body: false,
+                    offset: Some(0),
+                }
+                .encode(DEFAULT_STREAM_CHUNK_BYTES)
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        first.close(None).await.unwrap();
+
+        let mut resumed = connect_resumable_v2_client(ws_port, session_id).await;
+        match next_frame(&mut resumed).await {
+            Frame::Window {
+                id: window_id,
+                ack_offset,
+                ..
+            } => {
+                assert_eq!(window_id, id);
+                assert_eq!(ack_offset, Some(5));
+            }
+            other => panic!("expected resumed response window, got {other:?}"),
+        }
+        for (offset, payload) in [(0, b"first".as_slice()), (5, b"second".as_slice())] {
+            resumed
+                .send(
+                    BinaryEnvelope {
+                        id: id.clone(),
+                        kind: BinaryKind::HttpResponse,
+                        payload: Bytes::copy_from_slice(payload),
+                        end_of_body: false,
+                        offset: Some(offset),
+                    }
+                    .encode(DEFAULT_STREAM_CHUNK_BYTES)
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        resumed
+            .send(Frame::HttpRespEnd { id }.to_msg())
+            .await
+            .unwrap();
+        let response = request.await.unwrap();
+        assert!(
+            response.contains("200")
+                && response.matches("first").count() == 1
+                && response.matches("second").count() == 1,
+            "response={response:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resumable_v2_upload_restarts_from_acknowledged_offset() {
+        let (ws_port, http_port) = spawn_test_server().await;
+        let session_id = "20112233-4455-4677-8899-aabbccddeeff";
+        let payload = vec![b'u'; 100_000];
+        let mut raw = format!(
+            "POST /resume-upload HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+            payload.len()
+        )
+        .into_bytes();
+        raw.extend_from_slice(&payload);
+
+        let mut first = connect_resumable_v2_client(ws_port, session_id).await;
+        let request = tokio::spawn(async move { raw_http(http_port, &raw).await });
+        let id = match next_frame(&mut first).await {
+            Frame::HttpReqBegin { id, path, .. } => {
+                assert_eq!(path, "/resume-upload");
+                id
+            }
+            other => panic!("expected streaming request begin, got {other:?}"),
+        };
+        first
+            .send(
+                Frame::Window {
+                    id: id.clone(),
+                    credits: 1,
+                    ack_offset: Some(0),
+                    complete: false,
+                }
+                .to_msg(),
+            )
+            .await
+            .unwrap();
+        let first_chunk = match next_message(&mut first).await {
+            Message::Binary(raw) => {
+                BinaryEnvelope::decode(&raw, DEFAULT_STREAM_CHUNK_BYTES).unwrap()
+            }
+            other => panic!("expected first upload chunk, got {other:?}"),
+        };
+        assert_eq!(first_chunk.offset, Some(0));
+        first.close(None).await.unwrap();
+
+        let mut resumed = connect_resumable_v2_client(ws_port, session_id).await;
+        match next_frame(&mut resumed).await {
+            Frame::HttpReqBegin { id: resumed_id, .. } => assert_eq!(resumed_id, id),
+            other => panic!("expected replayed request begin, got {other:?}"),
+        }
+        resumed
+            .send(
+                Frame::Window {
+                    id: id.clone(),
+                    credits: DEFAULT_STREAM_WINDOW_FRAMES,
+                    ack_offset: Some(0),
+                    complete: false,
+                }
+                .to_msg(),
+            )
+            .await
+            .unwrap();
+
+        let mut received = Vec::new();
+        loop {
+            match next_message(&mut resumed).await {
+                Message::Binary(raw) => {
+                    let envelope =
+                        BinaryEnvelope::decode(&raw, DEFAULT_STREAM_CHUNK_BYTES).unwrap();
+                    assert_eq!(envelope.offset, Some(received.len() as u64));
+                    received.extend_from_slice(&envelope.payload);
+                }
+                Message::Text(raw) => match serde_json::from_str::<Frame>(&raw).unwrap() {
+                    Frame::HttpReqEnd { id: end_id } => {
+                        assert_eq!(end_id, id);
+                        break;
+                    }
+                    other => panic!("expected upload data/end, got {other:?}"),
+                },
+                other => panic!("expected upload data/end, got {other:?}"),
+            }
+        }
+        assert_eq!(received, payload);
+        resumed
+            .send(
+                Frame::HttpRespBegin {
+                    id: id.clone(),
+                    status: 200,
+                    headers: Vec::new(),
+                    content_length: Some(0),
+                }
+                .to_msg(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            next_frame(&mut resumed).await,
+            Frame::Window { .. }
+        ));
+        resumed
+            .send(Frame::HttpRespEnd { id }.to_msg())
+            .await
+            .unwrap();
+        let response = request.await.unwrap();
+        assert!(response.contains("200"), "response={response:?}");
     }
 }

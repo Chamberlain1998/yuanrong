@@ -21,6 +21,7 @@ import contextlib
 import json
 import logging
 import os
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -115,6 +116,8 @@ class _Connection:
     hello_received: asyncio.Event = field(default_factory=asyncio.Event)
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     hello_sent: bool = False
+    resumable: bool = False
+    session_id: Optional[str] = None
 
 
 @dataclass
@@ -125,6 +128,16 @@ class _HttpExchange:
     request_credits: asyncio.Queue
     streaming_response: bool = False
     response_received: int = 0
+    response_complete: bool = False
+    session_id: Optional[str] = None
+    request_frame: Optional[dict] = None
+    streaming_request: bool = False
+    request_unacked: list[tuple[int, bytes]] = field(default_factory=list)
+    request_next_offset: int = 0
+    request_end_sent: bool = False
+    upload_ready: asyncio.Event = field(default_factory=asyncio.Event)
+    upload_send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    upload_resuming: bool = False
 
 
 class TunnelServer:
@@ -174,6 +187,7 @@ class TunnelServer:
         self._ws_server = None
         self._http_runner = None
         self._connection_cleanup_tasks: set[asyncio.Task] = set()
+        self._connection_ready = asyncio.Event()
 
     async def start(self):
         self._loop = asyncio.get_running_loop()
@@ -204,6 +218,7 @@ class TunnelServer:
             self._ws_server.close()
         active = self._active
         self._active = None
+        self._connection_ready.clear()
         if active is not None:
             with contextlib.suppress(Exception, asyncio.TimeoutError):
                 await asyncio.wait_for(active.websocket.close(), timeout=1.0)
@@ -241,23 +256,15 @@ class TunnelServer:
             self._local_protocol(),
             asyncio.Semaphore(self._max_inflight),
         )
-        previous = self._active
-        self._active = conn
-        if previous is not None:
-            self._fail_generation(previous.generation, "TunnelClient reconnected")
-            cleanup_task = asyncio.create_task(
-                previous.websocket.close(code=1012, reason="replaced")
-            )
-            self._connection_cleanup_tasks.add(cleanup_task)
-            cleanup_task.add_done_callback(self._connection_cleanup_tasks.discard)
         logger.info("TunnelClient connected generation=%d", conn.generation)
         request = getattr(websocket, "request", None)
         request_headers = getattr(request, "headers", None) or getattr(
             websocket, "request_headers", None
         )
-        if request_headers is not None and request_headers.get(
+        advertised_v2 = request_headers is not None and request_headers.get(
             "X-YR-Tunnel-Protocol"
-        ) == str(PROTOCOL_VERSION):
+        ) == str(PROTOCOL_VERSION)
+        if advertised_v2:
             await self._send_json(
                 conn,
                 hello_frame(
@@ -269,6 +276,20 @@ class TunnelServer:
                 ),
             )
             conn.hello_sent = True
+        else:
+            # A V1 peer has no negotiation header and starts relaying
+            # immediately. V2 peers advertise the header, so reconnecting V2
+            # sessions are not exposed until their stable session id is known.
+            previous = self._active
+            self._active = conn
+            self._connection_ready.set()
+            if previous is not None and previous is not conn:
+                self._fail_generation(previous.generation, "TunnelClient replaced")
+                cleanup_task = asyncio.create_task(
+                    previous.websocket.close(code=1012, reason="replaced")
+                )
+                self._connection_cleanup_tasks.add(cleanup_task)
+                cleanup_task.add_done_callback(self._connection_cleanup_tasks.discard)
         try:
             async for message in websocket:
                 if isinstance(message, bytes):
@@ -284,7 +305,16 @@ class TunnelServer:
         finally:
             if self._active is conn:
                 self._active = None
-            self._fail_generation(conn.generation, "TunnelClient disconnected")
+                self._connection_ready.clear()
+            if conn.resumable:
+                for exchange in self._pending_http.values():
+                    if exchange.session_id == conn.session_id:
+                        exchange.upload_ready.clear()
+                        while not exchange.request_credits.empty():
+                            with contextlib.suppress(asyncio.QueueEmpty):
+                                exchange.request_credits.get_nowait()
+            else:
+                self._fail_generation(conn.generation, "TunnelClient disconnected")
 
     async def _dispatch_text(self, conn: _Connection, raw: str) -> None:
         if len(raw.encode("utf-8")) > MAX_TUNNEL_FRAME_SIZE:
@@ -295,7 +325,7 @@ class TunnelServer:
         frame_type = data.get("type")
         if frame_type == "hello":
             first_hello = not conn.hello_received.is_set()
-            self._negotiate(conn, data)
+            await self._negotiate(conn, data)
             if first_hello and not conn.hello_sent:
                 await self._send_json(
                     conn,
@@ -323,9 +353,19 @@ class TunnelServer:
             return
         request_id = data.get("id", "")
         exchange = self._pending_http.get(request_id)
-        if exchange is not None and exchange.generation == conn.generation:
+        if exchange is not None and self._exchange_matches(exchange, conn):
             if frame_type == "window":
-                self._grant_credits(exchange.request_credits, data.get("credits"), conn)
+                self._grant_credits(
+                    exchange,
+                    data.get("credits"),
+                    data.get("ack_offset"),
+                    conn,
+                )
+                if exchange.upload_resuming:
+                    exchange.upload_resuming = False
+                    task = asyncio.create_task(self._resume_upload(conn, exchange))
+                    self._connection_cleanup_tasks.add(task)
+                    task.add_done_callback(self._connection_cleanup_tasks.discard)
                 return
             if frame_type in ("http_resp", "http_resp_begin", "http_resp_end", "error"):
                 await self._dispatch_http_control(conn, exchange, data)
@@ -355,7 +395,7 @@ class TunnelServer:
             return
         parse_frame(raw)
 
-    def _negotiate(self, conn: _Connection, frame: dict) -> None:
+    async def _negotiate(self, conn: _Connection, frame: dict) -> None:
         if conn.hello_received.is_set():
             logger.warning("TunnelServer ignored duplicate hello")
             return
@@ -365,9 +405,19 @@ class TunnelServer:
         peer_window = frame.get("stream_window_frames")
         peer_body = frame.get("max_body_size")
         peer_ws = frame.get("max_ws_message_size")
+        peer_resume = frame.get("resume") is True
+        peer_session_id = frame.get("session_id")
         if not isinstance(peer_version, int) or peer_version <= 0:
             raise ProtocolError("invalid tunnel protocol version")
         if peer_version >= PROTOCOL_VERSION:
+            if not peer_resume:
+                raise ProtocolError("tunnel V2 peer must support resumable sessions")
+            try:
+                peer_session_id = str(uuid.UUID(peer_session_id))
+            except (ValueError, TypeError, AttributeError) as exc:
+                raise ProtocolError(
+                    "resumable tunnel V2 peer must provide a UUID session_id"
+                ) from exc
             if not (
                 isinstance(peer_chunk, int)
                 and peer_chunk >= MIN_STREAM_CHUNK_BYTES
@@ -390,6 +440,8 @@ class TunnelServer:
                 max_ws_message=min(self._max_ws_message_size, peer_ws),
             )
             conn.inflight = asyncio.Semaphore(conn.protocol.max_inflight)
+            conn.resumable = True
+            conn.session_id = peer_session_id
             logger.info(
                 "TunnelServer protocol v2 negotiated chunk=%d inflight=%d "
                 "window=%d body=%d ws_message=%d",
@@ -399,7 +451,28 @@ class TunnelServer:
                 conn.protocol.max_body,
                 conn.protocol.max_ws_message,
             )
+        previous = self._active
+        self._active = conn
+        self._connection_ready.set()
         conn.hello_received.set()
+        if previous is not None and previous is not conn:
+            if not (
+                previous.resumable
+                and conn.resumable
+                and previous.session_id == conn.session_id
+            ):
+                self._fail_generation(previous.generation, "TunnelClient replaced")
+            cleanup_task = asyncio.create_task(
+                previous.websocket.close(code=1012, reason="replaced")
+            )
+            self._connection_cleanup_tasks.add(cleanup_task)
+            cleanup_task.add_done_callback(self._connection_cleanup_tasks.discard)
+        if conn.resumable:
+            for exchange in list(self._pending_http.values()):
+                if exchange.session_id != conn.session_id:
+                    continue
+                exchange.generation = conn.generation
+                await self._resume_exchange(conn, exchange)
 
     async def _dispatch_http_control(
         self,
@@ -409,7 +482,7 @@ class TunnelServer:
     ) -> None:
         frame_type = frame["type"]
         if frame_type == "http_resp_begin":
-            if conn.protocol.version < PROTOCOL_VERSION or exchange.result.done():
+            if conn.protocol.version < PROTOCOL_VERSION:
                 raise ProtocolError("unexpected streaming response start")
             status = frame.get("status")
             headers = frame.get("headers")
@@ -424,6 +497,11 @@ class TunnelServer:
                 raise ProtocolError("invalid streaming response content length")
             if content_length is not None and content_length > conn.protocol.max_body:
                 raise ProtocolError("response body exceeds tunnel limit")
+            if exchange.streaming_response:
+                await self._send_response_window(conn, exchange, credits=0)
+                return
+            if exchange.result.done():
+                raise ProtocolError("unexpected streaming response start")
             exchange.streaming_response = True
             exchange.result.set_result(frame)
             await self._send_json(
@@ -432,12 +510,15 @@ class TunnelServer:
                     "type": "window",
                     "id": frame["id"],
                     "credits": conn.protocol.stream_window,
+                    "ack_offset": 0,
                 },
             )
         elif frame_type == "http_resp_end":
             if not exchange.streaming_response:
                 raise ProtocolError("response end without response start")
-            exchange.response_chunks.put_nowait(None)
+            if not exchange.response_complete:
+                exchange.response_complete = True
+                exchange.response_chunks.put_nowait(None)
         elif frame_type == "http_resp":
             if exchange.result.done():
                 raise ProtocolError("duplicate HTTP response")
@@ -478,10 +559,21 @@ class TunnelServer:
             if envelope.end_of_body:
                 raise ProtocolError("HTTP response data must end with http_resp_end")
             exchange = self._pending_http.get(envelope.request_id)
-            if exchange is None or exchange.generation != conn.generation:
+            if exchange is None or not self._exchange_matches(exchange, conn):
                 raise ProtocolError("response data for unknown stream")
             if not exchange.streaming_response:
                 raise ProtocolError("response data before response start")
+            if conn.resumable:
+                if envelope.offset is None:
+                    raise ProtocolError("resumable response chunk is missing offset")
+                chunk_end = envelope.offset + len(envelope.payload)
+                if envelope.offset < exchange.response_received:
+                    if chunk_end <= exchange.response_received:
+                        await self._send_response_window(conn, exchange, credits=0)
+                        return
+                    raise ProtocolError("overlapping response chunk")
+                if envelope.offset > exchange.response_received:
+                    raise ProtocolError("response chunk gap")
             exchange.response_received += len(envelope.payload)
             if exchange.response_received > conn.protocol.max_body:
                 raise ProtocolError("response body exceeds tunnel limit")
@@ -508,16 +600,39 @@ class TunnelServer:
         raise ProtocolError(f"unexpected binary frame kind: {envelope.kind.name}")
 
     @staticmethod
+    def _exchange_matches(exchange: _HttpExchange, conn: _Connection) -> bool:
+        if exchange.session_id is not None:
+            return conn.resumable and exchange.session_id == conn.session_id
+        return exchange.generation == conn.generation
+
+    @staticmethod
     def _grant_credits(
-        queue: asyncio.Queue,
+        exchange: _HttpExchange,
         credit_count: Any,
+        ack_offset: Any,
         conn: _Connection,
     ) -> None:
-        if not isinstance(credit_count, int) or credit_count <= 0:
-            raise ProtocolError("window credits must be a positive integer")
+        if (
+            not isinstance(credit_count, int)
+            or credit_count < 0
+            or (credit_count == 0 and not isinstance(ack_offset, int))
+            or (
+                ack_offset is not None
+                and (not isinstance(ack_offset, int) or ack_offset < 0)
+            )
+        ):
+            raise ProtocolError("window must carry credits or a valid ack_offset")
+        if isinstance(ack_offset, int):
+            if ack_offset > exchange.request_next_offset:
+                raise ProtocolError("request acknowledgement exceeds sent body")
+            exchange.request_unacked = [
+                (offset, payload)
+                for offset, payload in exchange.request_unacked
+                if offset + len(payload) > ack_offset
+            ]
         for _ in range(min(credit_count, conn.protocol.stream_window)):
             with contextlib.suppress(asyncio.QueueFull):
-                queue.put_nowait(None)
+                exchange.request_credits.put_nowait(conn.generation)
 
     async def _send_json(self, conn: _Connection, frame: dict) -> None:
         raw = json.dumps(frame)
@@ -530,6 +645,138 @@ class TunnelServer:
         async with conn.send_lock:
             await conn.websocket.send(envelope.encode(conn.protocol.stream_chunk))
 
+    async def _connection_for_exchange(self, exchange: _HttpExchange) -> _Connection:
+        while True:
+            await self._connection_ready.wait()
+            conn = self._active
+            if conn is not None and self._exchange_matches(exchange, conn):
+                return conn
+            await asyncio.sleep(0)
+
+    async def _send_json_exchange(
+        self, exchange: _HttpExchange, frame: dict
+    ) -> _Connection:
+        if exchange.session_id is None:
+            conn = self._active
+            if conn is None or conn.generation != exchange.generation:
+                raise ConnectionResetError("TunnelClient disconnected")
+            await self._send_json(conn, frame)
+            return conn
+        while True:
+            conn = await self._connection_for_exchange(exchange)
+            try:
+                await self._send_json(conn, frame)
+                return conn
+            except (websockets.ConnectionClosed, ConnectionError, OSError):
+                if self._active is conn:
+                    self._active = None
+                    self._connection_ready.clear()
+                exchange.upload_ready.clear()
+
+    async def _send_binary_exchange(
+        self,
+        exchange: _HttpExchange,
+        envelope: BinaryEnvelope,
+        *,
+        expected_generation: Optional[int] = None,
+    ) -> _Connection:
+        if exchange.session_id is None:
+            conn = self._active
+            if conn is None or conn.generation != exchange.generation:
+                raise ConnectionResetError("TunnelClient disconnected")
+            await self._send_binary(conn, envelope)
+            return conn
+        while True:
+            conn = await self._connection_for_exchange(exchange)
+            if (
+                expected_generation is not None
+                and conn.generation != expected_generation
+            ):
+                return conn
+            try:
+                await self._send_binary(conn, envelope)
+                return conn
+            except (websockets.ConnectionClosed, ConnectionError, OSError):
+                if self._active is conn:
+                    self._active = None
+                    self._connection_ready.clear()
+                exchange.upload_ready.clear()
+                # The chunk is retained in request_unacked. Reconnection
+                # replays it from the peer's cumulative ACK; do not race that
+                # replay with a second blind send from the producer task.
+                return conn
+
+    async def _send_response_window(
+        self,
+        conn: _Connection,
+        exchange: _HttpExchange,
+        *,
+        credits: int,
+        complete: bool = False,
+    ) -> None:
+        frame = {
+            "type": "window",
+            "id": self._request_id_for_exchange(exchange),
+            "credits": credits,
+            "ack_offset": exchange.response_received,
+        }
+        if complete:
+            frame["complete"] = True
+        await self._send_json(conn, frame)
+
+    def _request_id_for_exchange(self, exchange: _HttpExchange) -> str:
+        for request_id, pending in self._pending_http.items():
+            if pending is exchange:
+                return request_id
+        raise ProtocolError("HTTP exchange is no longer pending")
+
+    async def _resume_exchange(
+        self, conn: _Connection, exchange: _HttpExchange
+    ) -> None:
+        if exchange.request_frame is not None:
+            if exchange.streaming_request:
+                exchange.upload_ready.clear()
+                exchange.upload_resuming = True
+            await self._send_json(conn, exchange.request_frame)
+        if exchange.streaming_response:
+            queued = exchange.response_chunks.qsize()
+            credits = max(0, conn.protocol.stream_window - queued)
+            await self._send_response_window(conn, exchange, credits=credits)
+
+    async def _resume_upload(self, conn: _Connection, exchange: _HttpExchange) -> None:
+        async with exchange.upload_send_lock:
+            for offset, payload in list(exchange.request_unacked):
+                if (offset, payload) not in exchange.request_unacked:
+                    continue
+                while await exchange.request_credits.get() != conn.generation:
+                    pass
+                await self._send_binary_exchange(
+                    exchange,
+                    BinaryEnvelope(
+                        request_id=self._request_id_for_exchange(exchange),
+                        kind=BinaryKind.HTTP_REQUEST_DATA,
+                        payload=payload,
+                        offset=offset,
+                    ),
+                )
+            if exchange.request_end_sent:
+                await self._send_json_exchange(
+                    exchange,
+                    {
+                        "type": "http_req_end",
+                        "id": self._request_id_for_exchange(exchange),
+                    },
+                )
+        exchange.upload_ready.set()
+
+    async def _take_upload_credit(self, exchange: _HttpExchange) -> int:
+        while True:
+            await exchange.upload_ready.wait()
+            generation = await exchange.request_credits.get()
+            conn = await self._connection_for_exchange(exchange)
+            if generation == conn.generation and exchange.upload_ready.is_set():
+                return generation
+
     @staticmethod
     def _put_terminal(queue: asyncio.Queue, item: Any) -> None:
         """Deliver teardown even when all advertised data slots are occupied."""
@@ -539,10 +786,8 @@ class TunnelServer:
         queue.put_nowait(item)
 
     def _fail_generation(self, generation: Optional[int], message: str) -> None:
-        if generation is None:
-            return
         for request_id, exchange in list(self._pending_http.items()):
-            if exchange.generation != generation:
+            if generation is not None and exchange.generation != generation:
                 continue
             error = ErrorFrame(id=request_id, message=message)
             if not exchange.result.done():
@@ -550,7 +795,7 @@ class TunnelServer:
             else:
                 self._put_terminal(exchange.response_chunks, error)
         for request_id, (item_generation, queue) in list(self._pending_ws.items()):
-            if item_generation == generation:
+            if generation is None or item_generation == generation:
                 self._put_terminal(
                     queue,
                     {
@@ -591,7 +836,9 @@ class TunnelServer:
             result=self._loop.create_future(),
             response_chunks=asyncio.Queue(maxsize=conn.protocol.stream_window + 1),
             request_credits=asyncio.Queue(maxsize=conn.protocol.stream_window),
+            session_id=conn.session_id if conn.resumable else None,
         )
+        exchange.upload_ready.set()
         self._pending_http[request_id] = exchange
         upload_task: Optional[asyncio.Task] = None
         disconnect_task = asyncio.create_task(self._wait_downstream_disconnect(request))
@@ -619,17 +866,16 @@ class TunnelServer:
                     for name, value in headers
                     if name.lower() != "content-length"
                 ]
-                await self._send_json(
-                    conn,
-                    {
-                        "type": "http_req_begin",
-                        "id": request_id,
-                        "method": request.method,
-                        "path": str(request.rel_url),
-                        "headers": headers,
-                        "content_length": content_length,
-                    },
-                )
+                exchange.streaming_request = True
+                exchange.request_frame = {
+                    "type": "http_req_begin",
+                    "id": request_id,
+                    "method": request.method,
+                    "path": str(request.rel_url),
+                    "headers": headers,
+                    "content_length": content_length,
+                }
+                await self._send_json_exchange(exchange, exchange.request_frame)
                 upload_task = asyncio.create_task(
                     self._stream_request_body(
                         conn,
@@ -667,17 +913,15 @@ class TunnelServer:
                     )
                 headers = rebuilt_request_header_items(_raw_headers(request), len(body))
                 if conn.protocol.version >= PROTOCOL_VERSION:
-                    await self._send_json(
-                        conn,
-                        {
-                            "type": "http_req",
-                            "id": request_id,
-                            "method": request.method,
-                            "path": str(request.rel_url),
-                            "headers": headers,
-                            "body": base64.b64encode(body).decode("ascii"),
-                        },
-                    )
+                    exchange.request_frame = {
+                        "type": "http_req",
+                        "id": request_id,
+                        "method": request.method,
+                        "path": str(request.rel_url),
+                        "headers": headers,
+                        "body": base64.b64encode(body).decode("ascii"),
+                    }
+                    await self._send_json_exchange(exchange, exchange.request_frame)
                 else:
                     frame = HttpReqFrame(
                         id=request_id,
@@ -687,7 +931,8 @@ class TunnelServer:
                         header_items=headers,
                         body=body,
                     )
-                    await self._send_json(conn, json.loads(frame.to_json()))
+                    exchange.request_frame = json.loads(frame.to_json())
+                    await self._send_json_exchange(exchange, exchange.request_frame)
             if upload_task is not None:
                 done, _ = await asyncio.wait(
                     {upload_task, exchange.result, disconnect_task},
@@ -820,33 +1065,50 @@ class TunnelServer:
             total += len(chunk)
             if total > conn.protocol.max_body:
                 raise ProtocolError("request body exceeds tunnel limit")
-            await exchange.request_credits.get()
-            await self._send_binary(
-                conn,
-                BinaryEnvelope(
-                    request_id=request_id,
-                    kind=BinaryKind.HTTP_REQUEST_DATA,
-                    payload=chunk,
-                ),
-            )
+            credit_generation = await self._take_upload_credit(exchange)
+            offset = exchange.request_next_offset
+            exchange.request_next_offset += len(chunk)
+            if exchange.session_id is not None:
+                exchange.request_unacked.append((offset, chunk))
+            async with exchange.upload_send_lock:
+                await self._send_binary_exchange(
+                    exchange,
+                    BinaryEnvelope(
+                        request_id=request_id,
+                        kind=BinaryKind.HTTP_REQUEST_DATA,
+                        payload=chunk,
+                        offset=offset if exchange.session_id is not None else None,
+                    ),
+                    expected_generation=credit_generation,
+                )
         async for raw_chunk in request.content.iter_chunked(conn.protocol.stream_chunk):
             for offset in range(0, len(raw_chunk), conn.protocol.stream_chunk):
                 chunk = raw_chunk[offset : offset + conn.protocol.stream_chunk]
                 total += len(chunk)
                 if total > conn.protocol.max_body:
                     raise ProtocolError("request body exceeds tunnel limit")
-                await exchange.request_credits.get()
-                await self._send_binary(
-                    conn,
-                    BinaryEnvelope(
-                        request_id=request_id,
-                        kind=BinaryKind.HTTP_REQUEST_DATA,
-                        payload=chunk,
-                    ),
-                )
+                credit_generation = await self._take_upload_credit(exchange)
+                offset = exchange.request_next_offset
+                exchange.request_next_offset += len(chunk)
+                if exchange.session_id is not None:
+                    exchange.request_unacked.append((offset, chunk))
+                async with exchange.upload_send_lock:
+                    await self._send_binary_exchange(
+                        exchange,
+                        BinaryEnvelope(
+                            request_id=request_id,
+                            kind=BinaryKind.HTTP_REQUEST_DATA,
+                            payload=chunk,
+                            offset=offset if exchange.session_id is not None else None,
+                        ),
+                        expected_generation=credit_generation,
+                    )
         if request.content_length is not None and total != request.content_length:
             raise ProtocolError("request content length mismatch")
-        await self._send_json(conn, {"type": "http_req_end", "id": request_id})
+        exchange.request_end_sent = True
+        await self._send_json_exchange(
+            exchange, {"type": "http_req_end", "id": request_id}
+        )
 
     async def _stream_http_response(
         self,
@@ -897,16 +1159,27 @@ class TunnelServer:
             received += len(item)
             if _body_allowed(request.method, status):
                 await response.write(item)
-            await self._send_json(
-                conn,
-                {"type": "window", "id": request_id, "credits": 1},
-            )
+            window = {"type": "window", "id": request_id, "credits": 1}
+            if exchange.session_id is not None:
+                window["ack_offset"] = exchange.response_received
+            await self._send_json_exchange(exchange, window)
         if content_length is not None and _body_allowed(request.method, status):
             if received != content_length:
                 if request.transport is not None:
                     request.transport.close()
                 raise ProtocolError("response content length mismatch")
         await response.write_eof()
+        if exchange.session_id is not None:
+            await self._send_json_exchange(
+                exchange,
+                {
+                    "type": "window",
+                    "id": request_id,
+                    "credits": 0,
+                    "ack_offset": exchange.response_received,
+                    "complete": True,
+                },
+            )
         return response
 
     async def _cancel_exchange(
@@ -915,11 +1188,12 @@ class TunnelServer:
         request_id: str,
         message: str,
     ) -> None:
-        if self._active is not conn:
-            return
         with contextlib.suppress(Exception):
-            await self._send_json(
-                conn,
+            exchange = self._pending_http.get(request_id)
+            if exchange is None:
+                return
+            await self._send_json_exchange(
+                exchange,
                 {"type": "error", "id": request_id, "message": message},
             )
 

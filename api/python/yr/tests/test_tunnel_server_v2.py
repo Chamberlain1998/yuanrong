@@ -7,6 +7,7 @@ import contextlib
 import json
 import socket
 import unittest
+import uuid
 
 import aiohttp
 import websockets
@@ -44,6 +45,7 @@ async def _recv_json(websocket):
 class TunnelServerV2Tests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.ws_port, self.http_port = _unused_ports(2)
+        self.session_id = str(uuid.uuid4())
         self.server = TunnelServer(self.ws_port, self.http_port)
         await self.server.start()
 
@@ -54,9 +56,10 @@ class TunnelServerV2Tests(unittest.IsolatedAsyncioTestCase):
         websocket = await websockets.connect(
             f"ws://127.0.0.1:{self.ws_port}",
             max_size=8 * 1024 * 1024,
+            additional_headers={"X-YR-Tunnel-Protocol": "2"},
         )
-        await websocket.send(json.dumps(hello_frame()))
         peer_hello = await _recv_json(websocket)
+        await websocket.send(json.dumps(hello_frame(session_id=self.session_id)))
         self.assertEqual(peer_hello["type"], "hello")
         self.assertEqual(peer_hello["max_body_size"], 512 * 1024 * 1024)
         self.assertEqual(peer_hello["max_ws_message_size"], 8 * 1024 * 1024)
@@ -178,6 +181,7 @@ class TunnelServerV2Tests(unittest.IsolatedAsyncioTestCase):
                             request_id=request_id,
                             kind=BinaryKind.HTTP_RESPONSE_DATA,
                             payload=chunk,
+                            offset=offset,
                         ).encode()
                     )
                     remaining_credits -= 1
