@@ -167,6 +167,110 @@ class TestIntegration(unittest.TestCase):
             client.stop()
             self._stop_upstream(upstream_runner)
 
+    def test_actor_v2_http_survives_network_flaps_in_all_stream_phases(self):
+        """Keep one upstream call across upload, response wait, and SSE flaps."""
+
+        upload_started = threading.Event()
+        wait_started = threading.Event()
+        stream_started = threading.Event()
+        calls = {"upload": 0, "wait": 0, "stream": 0}
+        uploaded = bytearray()
+
+        async def upload_handler(request):
+            calls["upload"] += 1
+            async for chunk in request.content.iter_chunked(32 * 1024):
+                uploaded.extend(chunk)
+                upload_started.set()
+                await asyncio.sleep(0.005)
+            return web.Response(body=b"upload-ok")
+
+        async def wait_handler(request):
+            calls["wait"] += 1
+            wait_started.set()
+            await asyncio.sleep(0.35)
+            return web.Response(body=b"wait-ok")
+
+        async def stream_handler(request):
+            calls["stream"] += 1
+            response = web.StreamResponse(
+                status=200,
+                headers={"Content-Type": "text/event-stream"},
+            )
+            await response.prepare(request)
+            await response.write(b"data: first\n\n")
+            stream_started.set()
+            await asyncio.sleep(0.35)
+            await response.write(b"data: second\n\n")
+            await response.write_eof()
+            return response
+
+        app = web.Application()
+        app.router.add_post("/upload-flap", upload_handler)
+        app.router.add_get("/wait-flap", wait_handler)
+        app.router.add_get("/stream-flap", stream_handler)
+        upstream_runner = self._start_upstream(app)
+        client = TunnelClient(
+            upstream=f"http://127.0.0.1:{UPSTREAM_PORT}",
+            reconnect_base_delay=0.02,
+            reconnect_max_delay=0.05,
+        )
+
+        def close_control_websocket():
+            websocket = client._ws
+            self.assertIsNotNone(websocket)
+            future = asyncio.run_coroutine_threadsafe(
+                websocket.close(code=1012, reason="test network flap"),
+                client._loop,
+            )
+            future.result(timeout=2)
+
+        async def fetch_with_flap(method, path, started, **kwargs):
+            import aiohttp
+
+            async with aiohttp.ClientSession() as session:
+                request = asyncio.create_task(
+                    session.request(
+                        method,
+                        f"http://127.0.0.1:{SRV_HTTP_PORT}{path}",
+                        **kwargs,
+                    )
+                )
+                started_ok = await asyncio.to_thread(started.wait, 2)
+                self.assertTrue(started_ok)
+                await asyncio.to_thread(close_control_websocket)
+                response = await asyncio.wait_for(request, timeout=5)
+                async with response:
+                    return response.status, await response.read()
+
+        upload_body = b"upload-resume-" * 180_000
+        try:
+            self.assertTrue(client.start(f"ws://127.0.0.1:{SRV_WS_PORT}"))
+            upload_status, upload_response = asyncio.run(
+                fetch_with_flap(
+                    "POST",
+                    "/upload-flap",
+                    upload_started,
+                    data=upload_body,
+                )
+            )
+            wait_status, wait_response = asyncio.run(
+                fetch_with_flap("GET", "/wait-flap", wait_started)
+            )
+            stream_status, stream_response = asyncio.run(
+                fetch_with_flap("GET", "/stream-flap", stream_started)
+            )
+            self.assertEqual((upload_status, upload_response), (200, b"upload-ok"))
+            self.assertEqual(bytes(uploaded), upload_body)
+            self.assertEqual((wait_status, wait_response), (200, b"wait-ok"))
+            self.assertEqual(
+                (stream_status, stream_response),
+                (200, b"data: first\n\ndata: second\n\n"),
+            )
+            self.assertEqual(calls, {"upload": 1, "wait": 1, "stream": 1})
+        finally:
+            client.stop()
+            self._stop_upstream(upstream_runner)
+
     def test_ws_message_relay_through_tunnel(self):
         """Relay WebSocket messages between Port B and the upstream server."""
         import time
