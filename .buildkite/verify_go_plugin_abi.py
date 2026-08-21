@@ -29,7 +29,10 @@ PLUGINS = [
     ROOT / "pattern/pattern_faas/faasscheduler/faasscheduler.so",
     ROOT / "pattern/pattern_faas/faasfrontend/faasfrontend.so",
 ]
-SYMBOL = "go:link.pkghashbytes.go.uber.org/multierr"
+# This package is the direct ABI boundary shared by goruntime and both system
+# function plugins.  A third-party package can remain identical while this
+# project package changes, so checking a generic dependency is insufficient.
+SYMBOL = "go:link.pkghashbytes.yuanrong.org/kernel/runtime/libruntime/api"
 SECTION_RE = re.compile(
     r"^\s*\[\s*(\d+)\]\s+(\S+)\s+\S+\s+([0-9a-fA-F]+)\s+([0-9a-fA-F]+)\s+([0-9a-fA-F]+)"
 )

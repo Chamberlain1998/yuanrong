@@ -469,6 +469,7 @@ void FuncExecSubmitHook(std::function<void(void)> &&f)
 
 void FillLibruntimeConfig(CLibruntimeConfig *config, LibruntimeConfig &librtCfg)
 {
+    librtCfg.dataSystemDeployed = YR::Libruntime::Config::Instance().YR_DATASYSTEM_DEPLOYED();
     YR::ParseIpAddr(config->functionSystemAddress, librtCfg.functionSystemIpAddr, librtCfg.functionSystemPort);
     YR::ParseIpAddr(config->grpcAddress, librtCfg.functionSystemRtServerIpAddr, librtCfg.functionSystemRtServerPort);
     YR::ParseIpAddr(config->dataSystemAddress, librtCfg.dataSystemIpAddr, librtCfg.dataSystemPort);

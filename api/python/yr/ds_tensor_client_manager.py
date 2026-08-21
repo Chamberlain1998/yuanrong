@@ -19,6 +19,7 @@ import os
 
 from yr import log
 from yr.config_manager import ConfigManager
+from yr.datasystem_capability import require_data_system
 
 data_system_import = True
 _import_error = None
@@ -47,6 +48,7 @@ def _inspect_data_system_address():
 
 
 def get_tensor_client():
+    require_data_system("tensor")
     if not data_system_import:
         raise RuntimeError(f"import err: {_import_error}")
 

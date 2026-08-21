@@ -33,6 +33,7 @@
 #include "src/libruntime/metricsadaptor/invoke_collector.h"
 #include "src/libruntime/metricsadaptor/metrics_adaptor.h"
 #include "src/libruntime/objectstore/memory_store.h"
+#include "src/libruntime/utils/datasystem_utils.h"
 #include "src/libruntime/utils/hash_utils.h"
 #include "src/libruntime/utils/serializer.h"
 #include "src/utility/id_generator.h"
@@ -114,7 +115,7 @@ Libruntime::Libruntime(std::shared_ptr<LibruntimeConfig> librtCfg, std::shared_p
 ErrorInfo Libruntime::Init(std::shared_ptr<FSClient> fsClient, YR::Libruntime::DatasystemClients &datasystemClients,
                            FinalizeCallback cb)
 {
-    if (config->inCluster && datasystemClients.dsObjectStore == nullptr) {
+    if (config->dataSystemDeployed && config->inCluster && datasystemClients.dsObjectStore == nullptr) {
         return ErrorInfo(ErrorCode::ERR_INNER_SYSTEM_ERROR, ModuleCode::RUNTIME,
                          "Init datasystemClients.dsObjectStore is nullptr!");
     }
@@ -132,9 +133,11 @@ ErrorInfo Libruntime::Init(std::shared_ptr<FSClient> fsClient, YR::Libruntime::D
     this->dependencyResolver = std::make_shared<DependencyResolver>(memStore);
     this->objectIdPool = std::make_shared<ObjectIdPool>(memStore, Config::Instance().YR_OBJECT_ID_POOL_SIZE());
     auto mapper = std::make_shared<GeneratorIdMap>();
-    this->generatorNotifier_ = std::make_shared<StreamGeneratorNotifier>(datasystemClients.dsStreamStore, mapper);
-    this->generatorReceiver_ =
-        std::make_shared<StreamGeneratorReceiver>(config, datasystemClients.dsStreamStore, this->memStore);
+    if (config->dataSystemDeployed) {
+        this->generatorNotifier_ = std::make_shared<StreamGeneratorNotifier>(datasystemClients.dsStreamStore, mapper);
+        this->generatorReceiver_ =
+            std::make_shared<StreamGeneratorReceiver>(config, datasystemClients.dsStreamStore, this->memStore);
+    }
     this->rGroupManager_ = std::make_shared<ResourceGroupManager>();
     auto functionId = config->functionIds[config->selfLanguage];
     if (functionId.empty()) {
@@ -151,9 +154,11 @@ ErrorInfo Libruntime::Init(std::shared_ptr<FSClient> fsClient, YR::Libruntime::D
     if (!err.OK()) {
         return err;
     }
-    SetTenantIdWithPriority();
+    if (config->dataSystemDeployed) {
+        SetTenantIdWithPriority();
+    }
     this->config->serverVersion = serverVersion;
-    if (config->logToDriver) {
+    if (config->dataSystemDeployed && config->logToDriver) {
         this->driverLogReceiver_ = std::make_shared<DriverLogReceiver>();
         this->driverLogReceiver_->Init(datasystemClients.dsStreamStore, config->jobId, config->dedupLogs);
     }
@@ -314,6 +319,9 @@ void Libruntime::SetResourceGroupAffinity(std::shared_ptr<InvokeSpec> spec, cons
 
 ErrorInfo Libruntime::PreProcessArgs(const std::shared_ptr<InvokeSpec> &spec)
 {
+    if (!config->dataSystemDeployed) {
+        spec->opts.bypassDatasystem = true;
+    }
     ErrorInfo err;
     std::vector<std::string> objIds;
     std::unordered_set<std::string> objIdSet;
@@ -339,6 +347,14 @@ ErrorInfo Libruntime::PreProcessArgs(const std::shared_ptr<InvokeSpec> &spec)
         uint64_t tmpTotalSize = totalSize + arg.dataObj->GetSize();
         if (tmpTotalSize < arg.dataObj->GetSize()) {
             return ErrorInfo(ErrorCode::ERR_PARAM_INVALID, "args size invalid");
+        }
+        if (spec->opts.bypassDatasystem && tmpTotalSize > BYPASS_DS_INLINE_PAYLOAD_LIMIT) {
+            return ErrorInfo(
+                ErrorCode::ERR_PARAM_INVALID,
+                fmt::format(
+                    "bypass_datasystem: request payload size ({} bytes) exceeds the {} bytes limit. "
+                    "Reduce the serialized arguments or deploy DataSystem.",
+                    tmpTotalSize, BYPASS_DS_INLINE_PAYLOAD_LIMIT));
         }
         if (!spec->opts.bypassDatasystem && tmpTotalSize > uint64_t(Config::Instance().MAX_ARGS_IN_MSG_BYTES())) {
             auto [err, objId] = Put(arg.dataObj, arg.nestedObjects);
@@ -756,6 +772,9 @@ std::pair<ErrorInfo, std::string> Libruntime::Put(std::shared_ptr<DataObject> da
                                                   const std::unordered_set<std::string> &nestedIds,
                                                   const CreateParam &createParam)
 {
+    if (!config->dataSystemDeployed) {
+        return std::make_pair(MakeDataSystemUnavailableError("Put"), "");
+    }
     // small data -> MemoryStore
     // Get an id from pool
     auto [err, objId] = objectIdPool->Pop();
@@ -770,6 +789,9 @@ std::pair<ErrorInfo, std::string> Libruntime::Put(std::shared_ptr<DataObject> da
 ErrorInfo Libruntime::Put(const std::string &objId, std::shared_ptr<DataObject> dataObj,
                           const std::unordered_set<std::string> &nestedId, const CreateParam &createParam)
 {
+    if (!config->dataSystemDeployed) {
+        return MakeDataSystemUnavailableError("Put");
+    }
     SetTraceId();
     return memStore->Put(dataObj->buffer, objId, nestedId, createParam);
 }
@@ -778,6 +800,9 @@ ErrorInfo Libruntime::Put(std::shared_ptr<Buffer> data, const std::string &objID
                           const std::unordered_set<std::string> &nestedID, bool toDataSystem,
                           const CreateParam &createParam)
 {
+    if (toDataSystem && !config->dataSystemDeployed) {
+        return MakeDataSystemUnavailableError("Put");
+    }
     SetTraceId();
     auto err = memStore->Put(data, objID, nestedID, toDataSystem, createParam);
     if (!err.OK()) {
@@ -790,6 +815,9 @@ ErrorInfo Libruntime::Put(std::shared_ptr<Buffer> data, const std::string &objID
 ErrorInfo Libruntime::PutRaw(const std::string &objId, std::shared_ptr<Buffer> data,
                              const std::unordered_set<std::string> &nestedId, const CreateParam &createParam)
 {
+    if (!config->dataSystemDeployed) {
+        return MakeDataSystemUnavailableError("PutRaw");
+    }
     auto objStore = std::atomic_load(&dsClients.dsObjectStore);
     if (!objStore) {
         return ErrorInfo(ErrorCode::ERR_INNER_SYSTEM_ERROR, "PutRaw dsClients.dsObjectStore is nullptr!");
@@ -816,6 +844,9 @@ ErrorInfo Libruntime::IncreaseReferenceRaw(const std::vector<std::string> &objId
     if (objIds.empty()) {
         return ErrorInfo();
     }
+    if (!config->dataSystemDeployed) {
+        return ErrorInfo();
+    }
     auto objStore = std::atomic_load(&dsClients.dsObjectStore);
     if (!objStore) {
         return ErrorInfo(ErrorCode::ERR_INNER_SYSTEM_ERROR, "IncreaseReferenceRaw dsObjectStore is nullptr!");
@@ -828,6 +859,9 @@ std::pair<ErrorInfo, std::vector<std::string>> Libruntime::IncreaseReferenceRaw(
                                                                                 const std::string &remoteId)
 {
     if (objIds.empty()) {
+        return std::make_pair(ErrorInfo(), std::vector<std::string>());
+    }
+    if (!config->dataSystemDeployed) {
         return std::make_pair(ErrorInfo(), std::vector<std::string>());
     }
     auto objStore = std::atomic_load(&dsClients.dsObjectStore);
@@ -867,6 +901,9 @@ void Libruntime::DecreaseReferenceRaw(const std::vector<std::string> &objIds)
     if (objIds.empty()) {
         return;
     }
+    if (!config->dataSystemDeployed) {
+        return;
+    }
     auto objStore = std::atomic_load(&dsClients.dsObjectStore);
     if (!objStore) {
         YRLOG_ERROR("DecreaseReferenceRaw dsObjectStore is nullptr!");
@@ -887,6 +924,9 @@ std::pair<ErrorInfo, std::vector<std::string>> Libruntime::DecreaseReferenceRaw(
     if (objIds.empty()) {
         return std::make_pair(ErrorInfo(), std::vector<std::string>());
     }
+    if (!config->dataSystemDeployed) {
+        return std::make_pair(ErrorInfo(), std::vector<std::string>());
+    }
     auto objStore = std::atomic_load(&dsClients.dsObjectStore);
     if (!objStore) {
         return std::make_pair(
@@ -899,6 +939,9 @@ std::pair<ErrorInfo, std::vector<std::string>> Libruntime::DecreaseReferenceRaw(
 
 ErrorInfo Libruntime::ReleaseGRefs(const std::string &remoteId)
 {
+    if (!config->dataSystemDeployed) {
+        return ErrorInfo();
+    }
     SetTraceId();
     return memStore->ReleaseGRefs(remoteId);
 }
@@ -907,6 +950,14 @@ ErrorInfo Libruntime::ReleaseGRefs(const std::string &remoteId)
 std::shared_ptr<YR::InternalWaitResult> Libruntime::Wait(const std::vector<std::string> &objs, std::size_t waitNum,
                                                          int timeoutSec)
 {
+    if (!config->dataSystemDeployed) {
+        auto result = std::make_shared<YR::InternalWaitResult>();
+        auto error = MakeDataSystemUnavailableError("Wait");
+        for (const auto &objectId : objs) {
+            result->exceptionIds.emplace(objectId, error);
+        }
+        return result;
+    }
     int64_t timeoutMs = timeoutSec != NO_TIMEOUT ? timeoutSec * S_TO_MS : NO_TIMEOUT;
     return waitingObjectManager->WaitUntilReady(objs, waitNum, timeoutMs);
 }
@@ -991,6 +1042,10 @@ std::pair<ErrorInfo, std::vector<std::shared_ptr<Buffer>>> Libruntime::MakeGetRe
 std::pair<ErrorInfo, std::vector<std::shared_ptr<DataObject>>> Libruntime::Get(const std::vector<std::string> &ids,
                                                                                int timeoutMs, bool allowPartial)
 {
+    if (!config->dataSystemDeployed) {
+        return std::make_pair(MakeDataSystemUnavailableError("Get"),
+                              std::vector<std::shared_ptr<DataObject>>{});
+    }
     auto [err, remainingTimePeriod] = WaitBeforeGet(ids, timeoutMs, allowPartial);
     if (!err.OK()) {
         return std::make_pair(err, std::vector<std::shared_ptr<DataObject>>{});
@@ -1011,6 +1066,10 @@ std::pair<ErrorInfo, std::vector<std::shared_ptr<DataObject>>> Libruntime::Get(c
 std::pair<ErrorInfo, std::vector<std::shared_ptr<Buffer>>> Libruntime::GetRaw(const std::vector<std::string> &ids,
                                                                               int timeoutMs, bool allowPartial)
 {
+    if (!config->dataSystemDeployed) {
+        return std::make_pair(MakeDataSystemUnavailableError("GetRaw"),
+                              std::vector<std::shared_ptr<Buffer>>{});
+    }
     auto objStore = std::atomic_load(&dsClients.dsObjectStore);
     if (!objStore) {
         return std::make_pair(ErrorInfo(ErrorCode::ERR_INNER_SYSTEM_ERROR, "GetRaw dsObjectStore is nullptr!"),
@@ -1070,12 +1129,18 @@ ErrorInfo Libruntime::AllocReturnObject(DataObject *returnObj, size_t metaSize, 
 
 ErrorInfo Libruntime::CreateBuffer(const std::string &objectId, size_t dataSize, std::shared_ptr<Buffer> &dataBuf)
 {
+    if (!config->dataSystemDeployed) {
+        return MakeDataSystemUnavailableError("CreateBuffer");
+    }
     SetTraceId();
     return memStore->CreateBuffer(objectId, dataSize, dataBuf);
 }
 
 std::pair<ErrorInfo, std::string> Libruntime::CreateBuffer(size_t dataSize, std::shared_ptr<Buffer> &dataBuf)
 {
+    if (!config->dataSystemDeployed) {
+        return std::make_pair(MakeDataSystemUnavailableError("CreateBuffer"), "");
+    }
     // small data -> MemoryStore
     // Get an id from pool
     SetTraceId();
@@ -1090,6 +1155,10 @@ std::pair<ErrorInfo, std::string> Libruntime::CreateBuffer(size_t dataSize, std:
 std::pair<ErrorInfo, std::vector<std::shared_ptr<Buffer>>> Libruntime::GetBuffers(const std::vector<std::string> &ids,
                                                                                   int timeoutMs, bool allowPartial)
 {
+    if (!config->dataSystemDeployed) {
+        return std::make_pair(MakeDataSystemUnavailableError("GetBuffer"),
+                              std::vector<std::shared_ptr<Buffer>>{});
+    }
     auto [errWait, remainingTimePeriod] = WaitBeforeGet(ids, timeoutMs, allowPartial);
     if (!errWait.OK()) {
         YRLOG_DEBUG("Failed to WaitBeforeGet, ids: {}, code: {}, message: {}",
@@ -1135,6 +1204,10 @@ std::pair<RetryInfo, std::vector<std::shared_ptr<DataObject>>> Libruntime::GetDa
 std::pair<RetryInfo, std::vector<std::shared_ptr<Buffer>>> Libruntime::GetBuffersWithoutWait(
     const std::vector<std::string> &ids, int timeoutMS)
 {
+    if (!config->dataSystemDeployed) {
+        return std::make_pair(RetryInfo{MakeDataSystemUnavailableError("GetBuffer"), RetryType::NO_RETRY},
+                              std::vector<std::shared_ptr<Buffer>>(ids.size()));
+    }
     SetTraceId();
     return memStore->GetBuffersWithoutRetry(ids, timeoutMS);
 }
@@ -1144,6 +1217,9 @@ std::pair<ErrorInfo, std::string> Libruntime::CreateDataObject(size_t metaSize, 
                                                                const std::vector<std::string> &nestedObjIds,
                                                                const CreateParam &createParam)
 {
+    if (!config->dataSystemDeployed) {
+        return std::make_pair(MakeDataSystemUnavailableError("CreateDataObject"), "");
+    }
     SetTraceId();
     auto [err, objId] = objectIdPool->Pop();
     if (!err.OK()) {
@@ -1157,6 +1233,9 @@ ErrorInfo Libruntime::CreateDataObject(const std::string &objId, size_t metaSize
                                        std::shared_ptr<DataObject> &dataObj,
                                        const std::vector<std::string> &nestedObjIds, const CreateParam &createParam)
 {
+    if (!config->dataSystemDeployed) {
+        return MakeDataSystemUnavailableError("CreateDataObject");
+    }
     for (const auto &nestedId : nestedObjIds) {
         if (nestedId == objId) {
             return ErrorInfo(ErrorCode::ERR_PARAM_INVALID, "check circular references detected, obj id: " + objId);
@@ -1220,6 +1299,9 @@ std::pair<ErrorInfo, std::vector<std::shared_ptr<DataObject>>> Libruntime::GetDa
 
 ErrorInfo Libruntime::KVWrite(const std::string &key, std::shared_ptr<Buffer> value, SetParam setParam)
 {
+    if (!config->dataSystemDeployed) {
+        return MakeDataSystemUnavailableError("KVWrite");
+    }
     SetTraceId();
     ErrorInfo err;
     auto stateStore = GetRequiredStateStore(dsClients, err);
@@ -1232,6 +1314,9 @@ ErrorInfo Libruntime::KVWrite(const std::string &key, std::shared_ptr<Buffer> va
 ErrorInfo Libruntime::KVMSetTx(const std::vector<std::string> &keys, const std::vector<std::shared_ptr<Buffer>> &vals,
                                const MSetParam &mSetParam)
 {
+    if (!config->dataSystemDeployed) {
+        return MakeDataSystemUnavailableError("KVMSetTx");
+    }
     SetTraceId();
     ErrorInfo err;
     auto stateStore = GetRequiredStateStore(dsClients, err);
@@ -1243,6 +1328,9 @@ ErrorInfo Libruntime::KVMSetTx(const std::vector<std::string> &keys, const std::
 
 SingleReadResult Libruntime::KVRead(const std::string &key, int timeoutMS)
 {
+    if (!config->dataSystemDeployed) {
+        return std::make_pair(nullptr, MakeDataSystemUnavailableError("KVRead"));
+    }
     SetTraceId();
     ErrorInfo err;
     auto stateStore = GetRequiredStateStore(dsClients, err);
@@ -1254,6 +1342,9 @@ SingleReadResult Libruntime::KVRead(const std::string &key, int timeoutMS)
 
 MultipleReadResult Libruntime::KVRead(const std::vector<std::string> &keys, int timeoutMS, bool allowPartial)
 {
+    if (!config->dataSystemDeployed) {
+        return std::make_pair(std::vector<std::shared_ptr<Buffer>>{}, MakeDataSystemUnavailableError("KVRead"));
+    }
     SetTraceId();
     ErrorInfo err;
     auto stateStore = GetRequiredStateStore(dsClients, err);
@@ -1266,6 +1357,10 @@ MultipleReadResult Libruntime::KVRead(const std::vector<std::string> &keys, int 
 MultipleReadResult Libruntime::KVGetWithParam(const std::vector<std::string> &keys, const GetParams &params,
                                               int timeoutMs)
 {
+    if (!config->dataSystemDeployed) {
+        return std::make_pair(std::vector<std::shared_ptr<Buffer>>{},
+                              MakeDataSystemUnavailableError("KVGetWithParam"));
+    }
     SetTraceId();
     ErrorInfo err;
     auto stateStore = GetRequiredStateStore(dsClients, err);
@@ -1277,6 +1372,9 @@ MultipleReadResult Libruntime::KVGetWithParam(const std::vector<std::string> &ke
 
 ErrorInfo Libruntime::KVDel(const std::string &key)
 {
+    if (!config->dataSystemDeployed) {
+        return MakeDataSystemUnavailableError("KVDel");
+    }
     SetTraceId();
     ErrorInfo err;
     auto stateStore = GetRequiredStateStore(dsClients, err);
@@ -1288,6 +1386,9 @@ ErrorInfo Libruntime::KVDel(const std::string &key)
 
 MultipleDelResult Libruntime::KVDel(const std::vector<std::string> &keys)
 {
+    if (!config->dataSystemDeployed) {
+        return std::make_pair(std::vector<std::string>{}, MakeDataSystemUnavailableError("KVDel"));
+    }
     SetTraceId();
     ErrorInfo err;
     auto stateStore = GetRequiredStateStore(dsClients, err);
@@ -1299,6 +1400,9 @@ MultipleDelResult Libruntime::KVDel(const std::vector<std::string> &keys)
 
 MultipleExistResult Libruntime::KVExist(const std::vector<std::string> &keys)
 {
+    if (!config->dataSystemDeployed) {
+        return std::make_pair(std::vector<bool>{}, MakeDataSystemUnavailableError("KVExist"));
+    }
     ErrorInfo err;
     auto stateStore = GetRequiredStateStore(dsClients, err);
     if (stateStore == nullptr) {
@@ -1309,6 +1413,9 @@ MultipleExistResult Libruntime::KVExist(const std::vector<std::string> &keys)
 
 ErrorInfo Libruntime::DevDelete(const std::vector<std::string> &objectIds, std::vector<std::string> &failedObjectIds)
 {
+    if (!config->dataSystemDeployed) {
+        return MakeDataSystemUnavailableError("DevDelete");
+    }
     SetTraceId();
     auto heteroStore = std::atomic_load(&dsClients.dsHeteroStore);
     if (!heteroStore) {
@@ -1320,6 +1427,9 @@ ErrorInfo Libruntime::DevDelete(const std::vector<std::string> &objectIds, std::
 ErrorInfo Libruntime::DevLocalDelete(const std::vector<std::string> &objectIds,
                                      std::vector<std::string> &failedObjectIds)
 {
+    if (!config->dataSystemDeployed) {
+        return MakeDataSystemUnavailableError("DevLocalDelete");
+    }
     SetTraceId();
     auto heteroStore = std::atomic_load(&dsClients.dsHeteroStore);
     if (!heteroStore) {
@@ -1331,6 +1441,9 @@ ErrorInfo Libruntime::DevLocalDelete(const std::vector<std::string> &objectIds,
 ErrorInfo Libruntime::DevSubscribe(const std::vector<std::string> &keys, const std::vector<DeviceBlobList> &blob2dList,
                                    std::vector<std::shared_ptr<YR::Libruntime::HeteroFuture>> &futureVec)
 {
+    if (!config->dataSystemDeployed) {
+        return MakeDataSystemUnavailableError("DevSubscribe");
+    }
     SetTraceId();
     auto heteroStore = std::atomic_load(&dsClients.dsHeteroStore);
     if (!heteroStore) {
@@ -1342,6 +1455,9 @@ ErrorInfo Libruntime::DevSubscribe(const std::vector<std::string> &keys, const s
 ErrorInfo Libruntime::DevPublish(const std::vector<std::string> &keys, const std::vector<DeviceBlobList> &blob2dList,
                                  std::vector<std::shared_ptr<YR::Libruntime::HeteroFuture>> &futureVec)
 {
+    if (!config->dataSystemDeployed) {
+        return MakeDataSystemUnavailableError("DevPublish");
+    }
     SetTraceId();
     auto heteroStore = std::atomic_load(&dsClients.dsHeteroStore);
     if (!heteroStore) {
@@ -1353,6 +1469,9 @@ ErrorInfo Libruntime::DevPublish(const std::vector<std::string> &keys, const std
 ErrorInfo Libruntime::DevMSet(const std::vector<std::string> &keys, const std::vector<DeviceBlobList> &blob2dList,
                               std::vector<std::string> &failedKeys)
 {
+    if (!config->dataSystemDeployed) {
+        return MakeDataSystemUnavailableError("DevMSet");
+    }
     SetTraceId();
     auto heteroStore = std::atomic_load(&dsClients.dsHeteroStore);
     if (!heteroStore) {
@@ -1364,6 +1483,9 @@ ErrorInfo Libruntime::DevMSet(const std::vector<std::string> &keys, const std::v
 ErrorInfo Libruntime::DevMGet(const std::vector<std::string> &keys, const std::vector<DeviceBlobList> &blob2dList,
                               std::vector<std::string> &failedKeys, int32_t timeoutSec)
 {
+    if (!config->dataSystemDeployed) {
+        return MakeDataSystemUnavailableError("DevMGet");
+    }
     SetTraceId();
     auto heteroStore = std::atomic_load(&dsClients.dsHeteroStore);
     if (!heteroStore) {
@@ -1375,6 +1497,9 @@ ErrorInfo Libruntime::DevMGet(const std::vector<std::string> &keys, const std::v
 ErrorInfo Libruntime::CreateStreamProducer(const std::string &streamName, ProducerConf producerConf,
                                            std::shared_ptr<StreamProducer> &producer)
 {
+    if (!config->dataSystemDeployed) {
+        return MakeDataSystemUnavailableError("CreateStreamProducer");
+    }
     producer = std::make_shared<StreamProducer>();
     auto streamStore = std::atomic_load(&dsClients.dsStreamStore);
     if (!streamStore) {
@@ -1388,6 +1513,9 @@ ErrorInfo Libruntime::CreateStreamProducer(const std::string &streamName, Produc
 ErrorInfo Libruntime::CreateStreamConsumer(const std::string &streamName, const SubscriptionConfig &config,
                                            std::shared_ptr<StreamConsumer> &consumer, bool autoAck)
 {
+    if (!this->config->dataSystemDeployed) {
+        return MakeDataSystemUnavailableError("CreateStreamConsumer");
+    }
     consumer = std::make_shared<StreamConsumer>();
     auto streamStore = std::atomic_load(&dsClients.dsStreamStore);
     if (!streamStore) {
@@ -1400,6 +1528,9 @@ ErrorInfo Libruntime::CreateStreamConsumer(const std::string &streamName, const 
 
 ErrorInfo Libruntime::DeleteStream(const std::string &streamName)
 {
+    if (!config->dataSystemDeployed) {
+        return MakeDataSystemUnavailableError("DeleteStream");
+    }
     auto streamStore = std::atomic_load(&dsClients.dsStreamStore);
     if (!streamStore) {
         return ErrorInfo(YR::Libruntime::ErrorCode::ERR_INNER_SYSTEM_ERROR, YR::Libruntime::ModuleCode::RUNTIME,
@@ -1411,6 +1542,9 @@ ErrorInfo Libruntime::DeleteStream(const std::string &streamName)
 
 ErrorInfo Libruntime::QueryGlobalProducersNum(const std::string &streamName, uint64_t &gProducerNum)
 {
+    if (!config->dataSystemDeployed) {
+        return MakeDataSystemUnavailableError("QueryGlobalProducersNum");
+    }
     auto streamStore = std::atomic_load(&dsClients.dsStreamStore);
     if (!streamStore) {
         return ErrorInfo(YR::Libruntime::ErrorCode::ERR_INNER_SYSTEM_ERROR, YR::Libruntime::ModuleCode::RUNTIME,
@@ -1422,6 +1556,9 @@ ErrorInfo Libruntime::QueryGlobalProducersNum(const std::string &streamName, uin
 
 ErrorInfo Libruntime::QueryGlobalConsumersNum(const std::string &streamName, uint64_t &gConsumerNum)
 {
+    if (!config->dataSystemDeployed) {
+        return MakeDataSystemUnavailableError("QueryGlobalConsumersNum");
+    }
     auto streamStore = std::atomic_load(&dsClients.dsStreamStore);
     if (!streamStore) {
         return ErrorInfo(YR::Libruntime::ErrorCode::ERR_INNER_SYSTEM_ERROR, YR::Libruntime::ModuleCode::RUNTIME,
@@ -1647,7 +1784,7 @@ void Libruntime::Finalize(bool isDriver)
         if (!err.OK()) {
             YRLOG_ERROR("failed to release http client, message({})", err.Msg());
         }
-    } else {
+    } else if (config->dataSystemDeployed) {
 #ifdef ENABLE_DATASYSTEM
         auto err = clientsMgr->ReleaseDsClient(config->dataSystemIpAddr, config->dataSystemPort);
         if (!err.OK()) {
@@ -1670,11 +1807,15 @@ void Libruntime::ReInit()
     int oldDsPort = config->dataSystemPort;
 #endif  // ENABLE_DATASYSTEM
 
-    UpdateDsAddressFromEnv();
+    if (config->dataSystemDeployed) {
+        UpdateDsAddressFromEnv();
+    }
 
 #ifdef ENABLE_DATASYSTEM
-    ReInitDsClients(oldDsIpAddr, oldDsPort);
-    ReInitStreamComponents();
+    if (config->dataSystemDeployed) {
+        ReInitDsClients(oldDsIpAddr, oldDsPort);
+        ReInitStreamComponents();
+    }
 #endif  // ENABLE_DATASYSTEM
 
     if (invokeAdaptor) {
@@ -1885,6 +2026,10 @@ ErrorInfo Libruntime::SetTenantId(const std::string &tenantId, bool isReturnErrW
         YRLOG_ERROR("failed to set tenantId, err: {}", msg);
         return ErrorInfo(YR::Libruntime::ErrorCode::ERR_PARAM_INVALID, YR::Libruntime::ModuleCode::RUNTIME, msg);
     }
+    if (!config->dataSystemDeployed) {
+        config->tenantId = tenantId;
+        return ErrorInfo();
+    }
     auto objStore = std::atomic_load(&dsClients.dsObjectStore);
     if (!objStore) {
         return ErrorInfo(ErrorCode::ERR_INNER_SYSTEM_ERROR, YR::Libruntime::ModuleCode::RUNTIME,
@@ -1930,6 +2075,9 @@ std::string Libruntime::GetTenantId()
 
 ErrorInfo Libruntime::GenerateKeyByStateStore(std::shared_ptr<StateStore> stateStore, std::string &returnKey)
 {
+    if (!config->dataSystemDeployed) {
+        return MakeDataSystemUnavailableError("GenerateKeyByStateStore");
+    }
     SetTraceId();
     return stateStore->GenerateKey(returnKey);
 }
@@ -1937,6 +2085,9 @@ ErrorInfo Libruntime::GenerateKeyByStateStore(std::shared_ptr<StateStore> stateS
 ErrorInfo Libruntime::SetByStateStore(std::shared_ptr<StateStore> stateStore, const std::string &key,
                                       std::shared_ptr<ReadOnlyNativeBuffer> nativeBuffer, SetParam setParam)
 {
+    if (!config->dataSystemDeployed) {
+        return MakeDataSystemUnavailableError("SetByStateStore");
+    }
     SetTraceId();
     return stateStore->Write(key, nativeBuffer, setParam);
 }
@@ -1945,6 +2096,9 @@ ErrorInfo Libruntime::SetValueByStateStore(std::shared_ptr<StateStore> stateStor
                                            std::shared_ptr<ReadOnlyNativeBuffer> nativeBuffer, SetParam setParam,
                                            std::string &returnKey)
 {
+    if (!config->dataSystemDeployed) {
+        return MakeDataSystemUnavailableError("SetValueByStateStore");
+    }
     SetTraceId();
     return stateStore->Write(nativeBuffer, setParam, returnKey);
 }
@@ -1952,6 +2106,9 @@ ErrorInfo Libruntime::SetValueByStateStore(std::shared_ptr<StateStore> stateStor
 SingleReadResult Libruntime::GetByStateStore(std::shared_ptr<StateStore> stateStore, const std::string &key,
                                              int timeoutMs)
 {
+    if (!config->dataSystemDeployed) {
+        return std::make_pair(nullptr, MakeDataSystemUnavailableError("GetByStateStore"));
+    }
     SetTraceId();
     return stateStore->Read(key, timeoutMs);
 }
@@ -1960,6 +2117,10 @@ MultipleReadResult Libruntime::GetArrayByStateStore(std::shared_ptr<StateStore> 
                                                     const std::vector<std::string> &keys, int timeoutMs,
                                                     bool allowPartial)
 {
+    if (!config->dataSystemDeployed) {
+        return std::make_pair(std::vector<std::shared_ptr<Buffer>>{},
+                              MakeDataSystemUnavailableError("GetArrayByStateStore"));
+    }
     SetTraceId();
     return stateStore->Read(keys, timeoutMs, allowPartial);
 }
@@ -1967,12 +2128,18 @@ MultipleReadResult Libruntime::GetArrayByStateStore(std::shared_ptr<StateStore> 
 ErrorInfo Libruntime::QuerySizeByStateStore(std::shared_ptr<StateStore> stateStore,
                                             const std::vector<std::string> &keys, std::vector<uint64_t> &outSizes)
 {
+    if (!config->dataSystemDeployed) {
+        return MakeDataSystemUnavailableError("QuerySizeByStateStore");
+    }
     SetTraceId();
     return stateStore->QuerySize(keys, outSizes);
 }
 
 ErrorInfo Libruntime::DelByStateStore(std::shared_ptr<StateStore> stateStore, const std::string &key)
 {
+    if (!config->dataSystemDeployed) {
+        return MakeDataSystemUnavailableError("DelByStateStore");
+    }
     SetTraceId();
     return stateStore->Del(key);
 }
@@ -1980,6 +2147,10 @@ ErrorInfo Libruntime::DelByStateStore(std::shared_ptr<StateStore> stateStore, co
 MultipleDelResult Libruntime::DelArrayByStateStore(std::shared_ptr<StateStore> stateStore,
                                                    const std::vector<std::string> &keys)
 {
+    if (!config->dataSystemDeployed) {
+        return std::make_pair(std::vector<std::string>{},
+                              MakeDataSystemUnavailableError("DelArrayByStateStore"));
+    }
     SetTraceId();
     return stateStore->Del(keys);
 }
@@ -2102,17 +2273,26 @@ void Libruntime::NotifyEvent(FiberEventNotify &event)
 
 std::pair<ErrorInfo, std::string> Libruntime::PeekObjectRefStream(const std::string &generatorId, bool blocking)
 {
+    if (!config->dataSystemDeployed) {
+        return std::make_pair(MakeDataSystemUnavailableError("PeekObjectRefStream"), "");
+    }
     return memStore->GetOutput(generatorId, blocking);
 }
 
 ErrorInfo Libruntime::NotifyGeneratorResult(const std::string &generatorId, int index,
                                             std::shared_ptr<DataObject> resultObj, const ErrorInfo &resultErr)
 {
+    if (!config->dataSystemDeployed || !generatorNotifier_) {
+        return MakeDataSystemUnavailableError("NotifyGeneratorResult");
+    }
     return generatorNotifier_->NotifyResult(generatorId, index, resultObj, resultErr);
 }
 
 ErrorInfo Libruntime::NotifyGeneratorFinished(const std::string &generatorId, int numResults)
 {
+    if (!config->dataSystemDeployed || !generatorNotifier_) {
+        return MakeDataSystemUnavailableError("NotifyGeneratorFinished");
+    }
     return generatorNotifier_->NotifyFinished(generatorId, numResults);
 }
 

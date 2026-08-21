@@ -1,117 +1,63 @@
-# InvokeDirect 验证报告
+# InvokeDirect 验证证据
 
-> 日期: 2026-04-16
-> 分支: feat/bypass-datasystem-invoke
+本文只记录验证环境和结果。规范性设计见 [Direct invoke](../features/direct-invoke.md)，部署约束见 [DataSystem 可选部署](../features/datasystem-optional-deployment.md)。
 
-## 一、功能验证
+## 环境
 
-### 1. SDK invoke_direct 基础功能 (in-cluster)
+- 基础功能验证：单节点集群内和经 Frontend 的集群外 Driver。
+- 载荷边界验证：Buildkite #191 镜像，北京四 no-DS 集群，Helm revision 5，2026-07-27。
+- 性能数据：单节点集群内，每个数据量执行 3 轮取平均。
 
-| Case | 描述 | 结果 |
-|------|------|------|
-| stateless_invoke_direct | `@yr.invoke` 函数 `.invoke_direct()` 返回 `ObjectRefDirect`，值正确 | PASS |
-| instance_invoke_direct | `@yr.instance` 类方法 `.invoke_direct()` 返回 `ObjectRefDirect`，值正确 | PASS |
-| invoke_vs_invoke_direct | `.invoke()` 返回 `ObjectRef`，`.invoke_direct()` 返回 `ObjectRefDirect`，结果一致 | PASS |
-| invoke_direct_large_data | 1000 元素 list，invoke_direct 正常返回 | PASS |
-| invoke_direct_multiple_calls | 连续 10 次 invoke_direct，全部正确 | PASS |
-
-### 2. out-of-cluster 模式 (通过 Frontend)
-
-| Case | 修复前 | 修复后 |
-|------|--------|--------|
-| 100KB invoke_direct | PASS | PASS |
-| 200KB invoke_direct | **卡死** (timeout) | PASS |
-| 500KB invoke_direct | 卡死 | PASS |
-| 1MB invoke_direct | 卡死 | PASS |
-| 4MB invoke_direct | 卡死 | PASS |
-
-### 3. 超阈值行为 (100MB)
+## 功能结果
 
 | Case | 结果 |
-|------|------|
-| 99MB invoke_direct | PASS，正常返回 |
-| 101MB invoke_direct | RuntimeError: `bypass_datasystem: return value size (xxx bytes) exceeds the 104857600 bytes limit. Use invoke() instead of invoke_direct() for large return values.` |
-| 60MB 普通 invoke (DS) | PASS，不受阈值限制 |
+| --- | --- |
+| stateless `.invoke_direct()` | 返回 `ObjectRefDirect`，结果正确 |
+| instance method `.invoke_direct()` | 返回 `ObjectRefDirect`，结果正确 |
+| 连续 10 次 direct invoke | 全部成功 |
+| 经 Frontend 的 100 KiB 至 4 MiB direct invoke | 全部成功 |
+| no-DS 自动能力发现后普通 invoke | 自动走 direct，结果正确 |
+| no-DS DS API | 快速返回 4299/DATASYSTEM 和具体操作名 |
 
-## 二、修复的 Bug
+## 载荷边界
 
-### Bug 1: bypass_datasystem 标志在 FunctionProxy 路径丢失
+| Case | 结果 |
+| --- | --- |
+| 参数序列化后 104857600 bytes | 成功 |
+| 返回值序列化后 104857600 bytes | 成功 |
+| 参数或返回值序列化后 104857601 bytes | 约 20 ms 返回 `ERR_PARAM_INVALID` |
+| 99 MiB 原始参数和返回值 | 成功 |
+| 100、101、120、127、128 MiB 原始参数 | 均在进入 gRPC 上限前返回产品约束错误 |
+| 两个 51 MiB 或两个 64 MiB 返回值 | 按聚合大小快速失败，无卡住 |
+| 60 MiB 普通 DS invoke | 成功，不受 inline 限制 |
 
-**根因:** `functionsystem/.../invocation_handler.cpp` 的 `InvokeRequestToCallRequest()` 没有将 `InvokeOptions.bypass_datasystem` 复制到 `CallRequest.bypass_datasystem`。
+边界按序列化后总量判断。测试中的 Python `bytes` 恰好边界原始大小分别为请求 104857550 bytes、响应 104857584 bytes，只用于复现实验，不能作为其他类型的通用上限。
 
-**影响:**
+## 已验证缺陷
 
-- 通过 FunctionProxy 的 invoke（非 direct connection），bypass_datasystem 始终为 false
-- Worker 端不走 bypass 路径，返回值走 DS，但 caller 端以为是 bypass 模式（不做 ref counting）
-- 结果：out-of-cluster 模式下 >100KB 数据卡死；in-cluster 模式下无 bypass 性能收益
+验证曾暴露并确认修复两项缺陷：
 
-**修复:**
+1. FunctionProxy 转换 InvokeRequest 时遗漏 bypass 标志，导致集群外较大 direct 调用等待 DataSystem 路径而超时。
+2. 超限返回值曾被截断，造成 Python 反序列化断言；当前请求和响应均在组包前按聚合大小返回 `ERR_PARAM_INVALID`，不再截断。
 
-```cpp
-// functionsystem/.../invocation_handler.cpp:45
-callRequest->set_bypass_datasystem(request->invokeoptions().bypass_datasystem());
-```
+## 性能样本
 
-### Bug 2: 超阈值截断产生不可反序列化的数据
+| 载荷 | direct 延迟 (ms) | DS 延迟 (ms) | direct/DS | direct RSS (MiB) | DS RSS (MiB) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 MiB | 8.6 | 6.2 | 1.4x | 127 | 130 |
+| 10 MiB | 68 | 37 | 1.8x | 231 | 259 |
+| 20 MiB | 144 | 63 | 2.3x | 383 | 442 |
+| 40 MiB | 375 | 155 | 2.4x | 595 | 714 |
+| 60 MiB | 620 | 226 | 2.7x | 816 | 901 |
+| 80 MiB | 816 | 304 | 2.7x | 1018 | 1258 |
 
-**根因:** 超过阈值时，C++ 层截断 pickle 序列化后的 raw bytes 前 N 字节返回，破坏序列化格式。
+该样本表明 direct 在大载荷下因 protobuf 编解码和消息复制而慢于共享内存 DS 路径，同时省去部分 DS buffer 和引用计数内存。它是特定环境的测量证据，不构成跨集群性能保证。
 
-**影响:** Python 反序列化时 `split_buffer` 断言失败，抛出无意义的 `AssertionError`。
-
-**修复:** 超阈值时直接设 `ERR_PARAM_INVALID` 错误码返回，Python 层收到明确的 `RuntimeError`。
-
-```cpp
-// src/libruntime/invokeadaptor/invoke_adaptor.cpp:657-665
-if (req.bypass_datasystem() && bufSize > BYPASS_DS_TRUNCATION_THRESHOLD) {
-    auto msg = fmt::format(
-        "bypass_datasystem: return value size ({} bytes) exceeds the {} bytes limit. "
-        "Use invoke() instead of invoke_direct() for large return values.",
-        bufSize, BYPASS_DS_TRUNCATION_THRESHOLD);
-    callResult.set_code(common::ERR_PARAM_INVALID);
-    callResult.set_message(msg);
-    return callResult;
-}
-```
-
-## 三、性能对比
-
-测试环境: 单节点 in-cluster，每个数据量 3 轮取平均。
-
-| size | invoke_direct (ms) | invoke/DS (ms) | 延迟比 | direct RSS (MB) | DS RSS (MB) | RSS 节省 |
-|------|--------------------|----------------|--------|-----------------|-------------|----------|
-| 1MB | 8.6 | 6.2 | 1.4x | 127 | 130 | 2% |
-| 5MB | 40 | 20 | 2.0x | 163 | 178 | 8% |
-| 10MB | 68 | 37 | 1.8x | 231 | 259 | 11% |
-| 20MB | 144 | 63 | 2.3x | 383 | 442 | 13% |
-| 40MB | 375 | 155 | 2.4x | 595 | 714 | 17% |
-| 60MB | 620 | 226 | 2.7x | 816 | 901 | 9% |
-| 80MB | 816 | 304 | 2.7x | 1018 | 1258 | 19% |
-
-### 结论
-
-- **延迟:** invoke_direct 在大数据量（>5MB）下比 DS 路径慢 2-3x。原因是 gRPC inline 传输整个序列化消息（protobuf 编解码开销），而 DS 路径通过共享内存零拷贝传输。
-- **内存:** invoke_direct 的 RSS 峰值比 DS 路径低 ~10-20%，因为跳过了 DS 的 buffer 管理和引用计数结构。
-- **适用场景:** invoke_direct 适合小数据量（<5MB）+ 无需 DS 引用计数管理的场景（如一次性调用、无后续 ObjectRef 传递）。大数据量场景应使用普通 invoke。
-
-## 四、配置参数
-
-| 参数 | 值 | 文件 |
-|------|-----|------|
-| BYPASS_DS_TRUNCATION_THRESHOLD | 100MB | src/libruntime/utils/constants.h |
-| YR_MAX_GRPC_SIZE | 128MB | src/dto/config.h |
-
-## 五、测试用例
+## 复现入口
 
 测试代码位于 `test/smoke/invoke-direct/`：
 
-| 文件 | 描述 |
-|------|------|
-| run_test.sh | 安装 whl、启动 yr、运行测试、清理 |
-| test_invoke_direct.py | SDK (cluster-internal) + Frontend HTTP (cluster-external) 测试 |
-| services.yaml | yrlib service 定义 |
-
-运行方式（需在 dev container 中）:
-
 ```bash
-cd test/smoke/invoke-direct && bash run_test.sh
+cd test/smoke/invoke-direct
+bash run_test.sh
 ```

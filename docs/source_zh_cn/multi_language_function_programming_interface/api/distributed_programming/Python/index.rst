@@ -63,6 +63,7 @@ Python
    yr.get
    yr.wait
    yr.object_ref.ObjectRef
+   yr.object_ref.ObjectRefDirect
 
 
 .. toctree::

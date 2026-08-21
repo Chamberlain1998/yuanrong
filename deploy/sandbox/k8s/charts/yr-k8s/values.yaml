@@ -1,6 +1,9 @@
 fullnameOverride: yr
 
 global:
+  dataSystem:
+    enabled: true
+    bypass: false
   namespace:
     create: true
     name: yr-k8s

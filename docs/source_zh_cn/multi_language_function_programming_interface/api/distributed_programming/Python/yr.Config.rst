@@ -1,7 +1,7 @@
 yr.Config
 ==========================
 
-.. py:class:: yr.Config(function_id: str = '', cpp_function_id: str = '', server_address: str = '', ds_address: str = '', is_driver: bool = True, log_level: str | int = 'WARNING', invoke_timeout: int = 900, local_mode: bool = False, code_dir: str = '', connection_nums: int = 100, recycle_time: int = 2, job_id: str = '', tls_config: ~yr.config.UserTLSConfig | None = None, auto: bool = False, deployment_config: ~yr.config.DeploymentConfig | None = None, rt_server_address: str = '', log_dir: str = './', log_file_size_max: int = 0, log_file_num_max: int = 0, log_flush_interval: int = 5, runtime_id: str = 'driver', max_task_instance_num: int = -1, load_paths: list = <factory>, rpc_timeout: int = 1800, enable_mtls: bool = False, private_key_path: str = '', certificate_file_path: str = '', verify_file_path: str = '', server_name: str = '', ns: str = '', enable_metrics: bool = False, custom_envs: ~typing.Dict[str, str] = <factory>, master_addr_list: list = <factory>, working_dir: str = '', enable_ds_encrypt: bool = False, ds_public_key_path: str = '', runtime_public_key_path: str = '', runtime_private_key_path: str = '')
+.. py:class:: yr.Config(function_id: str = '', cpp_function_id: str = '', server_address: str = '', ds_address: str = '', is_driver: bool = True, log_level: str | int = 'WARNING', invoke_timeout: int = 900, local_mode: bool = False, code_dir: str = '', connection_nums: int = 100, recycle_time: int = 2, job_id: str = '', tls_config: ~yr.config.UserTLSConfig | None = None, auto: bool = False, deployment_config: ~yr.config.DeploymentConfig | None = None, rt_server_address: str = '', log_dir: str = './', log_file_size_max: int = 0, log_file_num_max: int = 0, log_flush_interval: int = 5, runtime_id: str = 'driver', max_task_instance_num: int = -1, load_paths: list = <factory>, rpc_timeout: int = 1800, enable_mtls: bool = False, private_key_path: str = '', certificate_file_path: str = '', verify_file_path: str = '', server_name: str = '', ns: str = '', enable_metrics: bool = True, bypass_datasystem: bool | None = None, custom_envs: ~typing.Dict[str, str] = <factory>, master_addr_list: list = <factory>, working_dir: str = '', enable_ds_encrypt: bool = False, ds_public_key_path: str = '', runtime_public_key_path: str = '', runtime_private_key_path: str = '')
 
     基类：``object``
 
@@ -33,6 +33,8 @@ yr.Config
          - 是否启用数据系统 TLS 认证。
        * - :ref:`enable_metrics <enable_metrics>`
          - 是否启用指标收集。
+       * - :ref:`bypass_datasystem <config_bypass_datasystem>`
+         - 当前进程的默认 invoke 传输策略；不表示 DataSystem 是否部署。
        * - :ref:`enable_mtls <enable_mtls>`
          - 是否启用客户端双向认证，默认 ``False``。
        * - :ref:`function_id <function_id_cf>`
@@ -117,6 +119,7 @@ yr.Config
     yr.Config.ds_public_key_path
     yr.Config.enable_ds_encrypt
     yr.Config.enable_metrics
+    yr.Config.bypass_datasystem
     yr.Config.enable_mtls
     yr.Config.function_id
     yr.Config.in_cluster

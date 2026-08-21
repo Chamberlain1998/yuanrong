@@ -18,10 +18,12 @@
 
 import atexit
 from collections import defaultdict
+from concurrent.futures import FIRST_COMPLETED, TimeoutError as FuturesTimeoutError, wait as wait_futures
 import functools
 import importlib
 import logging
 import os
+import time
 from typing import Dict, List, Optional, Tuple, Union
 
 from yr import _preload_native_libraries
@@ -52,6 +54,11 @@ ClientInfo = _config.ClientInfo
 Config = _config.Config
 InvokeOptions = _config.InvokeOptions
 ConfigManager = importlib.import_module("yr.config_manager").ConfigManager
+resolve_data_system_capability = importlib.import_module(
+    "yr.datasystem_capability").resolve_data_system_capability
+require_data_system = importlib.import_module(
+    "yr.datasystem_capability").require_data_system
+ErrorCode = importlib.import_module("yr.err_type").ErrorCode
 
 function_proxy = importlib.import_module("yr.decorator.function_proxy")
 instance_proxy = importlib.import_module("yr.decorator.instance_proxy")
@@ -67,6 +74,7 @@ Producer = _fnruntime.Producer
 auto_get_cluster_access_info = _fnruntime.auto_get_cluster_access_info
 NpuObject = importlib.import_module("yr.npu_object").NpuObject
 ObjectRef = importlib.import_module("yr.object_ref").ObjectRef
+ObjectRefDirect = importlib.import_module("yr.object_ref").ObjectRefDirect
 ResourceGroup = importlib.import_module("yr.resource_group").ResourceGroup
 RgObjectRef = importlib.import_module("yr.resource_group_ref").RgObjectRef
 Serialization = importlib.import_module("yr.serialization").Serialization
@@ -264,7 +272,13 @@ def init(conf: Config = None) -> ClientInfo:
     conf = Config() if conf is None else conf
 
     conf = _auto_get_cluster_access_info(conf)
-    ConfigManager().init(conf, is_initialized())
+    capability = resolve_data_system_capability(conf)
+    if not capability.data_system_deployed and not capability.bypass_data_system:
+        raise_yr_runtime_error(
+            "Invalid DataSystem configuration: YR_DATASYSTEM_DEPLOYED=false requires "
+            "YR_BYPASS_DATASYSTEM=true or Config.bypass_datasystem=True",
+            code=ErrorCode.ERR_PARAM_INVALID)
+    ConfigManager().init(conf, is_initialized(), capability)
     runtime_holder.init()
 
     if not is_initialized():
@@ -386,6 +400,7 @@ def put(obj: object, create_param: CreateParam = CreateParam()) -> ObjectRef:
     """
     if obj is None or (isinstance(obj, (bytes, bytearray, memoryview)) and len(obj) == 0):
         raise_yr_value_error("value is None or has zero length")
+    require_data_system("put")
     # Make sure that the value is not an object ref.
     if isinstance(obj, ObjectRef):
         raise_yr_type_error(
@@ -433,6 +448,92 @@ def _recurse(obj, ref_obj):
 def _restore(obj, object_refs):
     for i, _ in enumerate(obj):
         obj[i] = _recurse(obj[i], object_refs[i])
+
+
+def _deadline_from_timeout(timeout):
+    return None if timeout == constants.NO_LIMIT else time.monotonic() + timeout
+
+
+def _remaining_timeout(deadline):
+    return None if deadline is None else max(0, deadline - time.monotonic())
+
+
+def _get_inline_results(obj_refs, timeout, allow_partial=False):
+    futures = [ref.get_future() for ref in obj_refs]
+    deadline = _deadline_from_timeout(timeout)
+    results = []
+    for future in futures:
+        try:
+            results.append(future.result(timeout=_remaining_timeout(deadline)))
+        except FuturesTimeoutError:
+            if not allow_partial:
+                raise
+            results.append(None)
+    return results
+
+
+def _wait_inline_results(obj_refs, wait_num, timeout):
+    ref_futures = [(ref, ref.get_future()) for ref in obj_refs]
+    futures = {future: ref for ref, future in ref_futures}
+    pending = set(futures)
+    done = set()
+    deadline = _deadline_from_timeout(timeout)
+    while pending and len(done) < wait_num:
+        completed, pending = wait_futures(
+            pending, timeout=_remaining_timeout(deadline), return_when=FIRST_COMPLETED)
+        if not completed:
+            break
+        done.update(completed)
+    ready_indexes = [index for index, (_, future) in enumerate(ref_futures) if future in done][:wait_num]
+    ready_index_set = set(ready_indexes)
+    ready = [obj_refs[index] for index in ready_indexes]
+    unready = [ref for index, ref in enumerate(obj_refs) if index not in ready_index_set]
+    return ready, unready
+
+
+def _wait_mixed_results(obj_refs, wait_num, timeout):
+    runtime = runtime_holder.global_runtime.get_runtime()
+    direct_futures = {
+        index: ref.get_future()
+        for index, ref in enumerate(obj_refs)
+        if isinstance(ref, ObjectRefDirect)
+    }
+    unresolved_normal = {
+        ref.id: index
+        for index, ref in enumerate(obj_refs)
+        if not isinstance(ref, ObjectRefDirect)
+    }
+    ready_indexes = set()
+    deadline = _deadline_from_timeout(timeout)
+    poll_interval = 0.05
+
+    while len(ready_indexes) < wait_num:
+        if unresolved_normal:
+            ready_ids, _ = runtime.wait(list(unresolved_normal), 1, 0)
+            for object_id in ready_ids:
+                index = unresolved_normal.pop(object_id, None)
+                if index is not None:
+                    ready_indexes.add(index)
+
+        ready_indexes.update(index for index, future in direct_futures.items() if future.done())
+        if len(ready_indexes) >= wait_num:
+            break
+
+        remaining = _remaining_timeout(deadline)
+        if remaining is not None and remaining <= 0:
+            break
+        wait_time = poll_interval if remaining is None else min(poll_interval, remaining)
+        pending_direct = {future for future in direct_futures.values() if not future.done()}
+        if pending_direct:
+            wait_futures(pending_direct, timeout=wait_time, return_when=FIRST_COMPLETED)
+        else:
+            time.sleep(wait_time)
+
+    selected_indexes = [index for index in range(len(obj_refs)) if index in ready_indexes][:wait_num]
+    selected_index_set = set(selected_indexes)
+    ready = [obj_refs[index] for index in selected_indexes]
+    unready = [ref for index, ref in enumerate(obj_refs) if index not in selected_index_set]
+    return ready, unready
 
 
 @check_initialized
@@ -504,8 +605,26 @@ def get(obj_refs: Union["ObjectRef", List, "RgObjectRef"], timeout: int = consta
     elif isinstance(obj_refs, list) and len(obj_refs) == 0:
         return []
     _check_object_ref(obj_refs)
-    objects = runtime_holder.global_runtime.get_runtime().get(
-        [ref.id for ref in obj_refs], timeout, allow_partial)
+    direct_indexes = [index for index, ref in enumerate(obj_refs) if isinstance(ref, ObjectRefDirect)]
+    if len(direct_indexes) == len(obj_refs):
+        objects = _get_inline_results(obj_refs, timeout, allow_partial)
+    else:
+        require_data_system("get")
+        deadline = _deadline_from_timeout(timeout)
+        direct_futures = {index: obj_refs[index].get_future() for index in direct_indexes}
+        normal_indexes = [index for index in range(len(obj_refs)) if index not in direct_futures]
+        normal_objects = runtime_holder.global_runtime.get_runtime().get(
+            [obj_refs[index].id for index in normal_indexes], timeout, allow_partial)
+        objects = [None] * len(obj_refs)
+        for index, value in zip(normal_indexes, normal_objects):
+            objects[index] = value
+        for index, future in direct_futures.items():
+            try:
+                objects[index] = future.result(timeout=_remaining_timeout(deadline))
+            except FuturesTimeoutError:
+                if not allow_partial:
+                    raise
+                objects[index] = None
     _restore(objects, obj_refs)
     if is_single_obj:
         return objects[0]
@@ -588,6 +707,11 @@ def wait(obj_refs: Union[ObjectRef, List[ObjectRef]], wait_num: Optional[int] = 
                 f"invalid timeout type, actual: {type(timeout)}, expect: <class 'int'>")
         if timeout != -1 and timeout < 0 or timeout > _MAX_INT:
             raise_yr_value_error(f"invalid timeout value, actual: {timeout}, expect:None, -1, [0, {_MAX_INT}]")
+    if all(isinstance(obj_ref, ObjectRefDirect) for obj_ref in obj_refs):
+        return _wait_inline_results(obj_refs, wait_num, timeout)
+    require_data_system("wait")
+    if any(isinstance(obj_ref, ObjectRefDirect) for obj_ref in obj_refs):
+        return _wait_mixed_results(obj_refs, wait_num, timeout)
     # deal with YRError
     ready_ids, _ = runtime_holder.global_runtime.get_runtime().wait(
         [obj_ref.id for obj_ref in obj_refs], wait_num, timeout)
@@ -925,6 +1049,7 @@ def create_stream_producer(stream_name: str, config: ProducerConfig) -> Producer
         ...     # 处理异常
         ...     pass
     """
+    require_data_system("create_stream_producer")
     return runtime_holder.global_runtime.get_runtime().create_stream_producer(stream_name, config)
 
 
@@ -952,6 +1077,7 @@ def create_stream_consumer(stream_name: str, config: SubscriptionConfig) -> Cons
         ... except RuntimeError as exp:
         ...     pass
     """
+    require_data_system("create_stream_consumer")
     return runtime_holder.global_runtime.get_runtime().create_stream_consumer(stream_name, config)
 
 
@@ -966,6 +1092,7 @@ def query_global_producers_num(stream_name: str) -> int:
     Returns:
         数量
     """
+    require_data_system("query_global_producers_num")
     return runtime_holder.global_runtime.get_runtime().query_global_producers_num(stream_name)
 
 
@@ -980,6 +1107,7 @@ def query_global_consumers_num(stream_name: str) -> int:
     Returns:
         数量
     """
+    require_data_system("query_global_consumers_num")
     return runtime_holder.global_runtime.get_runtime().query_global_consumers_num(stream_name)
 
 
@@ -1007,6 +1135,7 @@ def delete_stream(stream_name: str) -> None:
         ... except RuntimeError as exp:
         ...     pass
     """
+    require_data_system("delete_stream")
     runtime_holder.global_runtime.get_runtime().delete_stream(stream_name)
 
 
@@ -1051,6 +1180,7 @@ def kv_write(key: str, value: bytes, existence: ExistenceOpt = ExistenceOpt.NONE
         >>>
         >>> yr.finalize()
     """
+    require_data_system("kv_write")
     set_param = SetParam()
     set_param.existence = existence
     set_param.write_mode = write_mode
@@ -1092,6 +1222,7 @@ def kv_write_with_param(key: str, value: bytes, set_param: SetParam) -> None:
         >>>
         >>> yr.finalize()
     """
+    require_data_system("kv_write_with_param")
     runtime_holder.global_runtime.get_runtime().kv_write(key, value, set_param)
 
 
@@ -1120,6 +1251,7 @@ def kv_m_write_tx(keys: List[str], values: List[bytes], m_set_param: MSetParam =
             If data writing to the data system fails.
 
     """
+    require_data_system("kv_m_write_tx")
     if len(keys) != len(values):
         raise ValueError(
             f"arguments list size not equal. keys size is: {len(keys)}, values size is: {len(values)}.")
@@ -1152,6 +1284,7 @@ def kv_read(
     Example:
         >>> v1 = yr.kv_read("kv-key")
     """
+    require_data_system("kv_read")
     is_single_obj = isinstance(key, str)
     rets = runtime_holder.global_runtime.get_runtime().kv_read(key, timeout)
     if is_single_obj:
@@ -1190,6 +1323,7 @@ def kv_set(key: str, value: bytes, set_param: SetParam = SetParam()) -> None:
         >>>
         >>> yr.finalize()
     """
+    require_data_system("kv_set")
     runtime_holder.global_runtime.get_runtime().kv_write(key, value, set_param)
 
 
@@ -1217,6 +1351,7 @@ def kv_get(
     Example:
         >>> v1 = yr.kv_get("kv-key")
     """
+    require_data_system("kv_get")
     if timeout <= constants.MIN_TIMEOUT_LIMIT and timeout != constants.NO_LIMIT:
         raise ValueError(
             "Parameter 'timeout' should be greater than 0 or equal to -1 (no timeout)")
@@ -1258,6 +1393,7 @@ def kv_get_with_param(keys: List[str], get_params: GetParams, timeout: int = con
         >>> params.get_params = [get_param]
         >>> v1 = yr.kv_get_with_param(["kv-key"], params, 10)
     """
+    require_data_system("kv_get_with_param")
     if timeout < constants.NO_LIMIT:
         raise ValueError(
             "Parameter 'timeout' should be greater than or equal to -1 (no timeout).")
@@ -1288,6 +1424,7 @@ def kv_del(key: Union[str, List[str]]) -> None:
         >>> yr.kv_write("kv-key", b"value1", yr.ExistenceOpt.NONE, yr.WriteMode.NONE_L2_CACHE, 0) # doctest: +SKIP
         >>> yr.kv_del("kv-key")
     """
+    require_data_system("kv_del")
     runtime_holder.global_runtime.get_runtime().kv_del(key)
 
 
@@ -1340,6 +1477,7 @@ def save_state(timeout_sec: int = _DEFAULT_SAVE_LOAD_STATE_TIMEOUT) -> None:
         >>> counter.load.invoke()
         >>> print(f"member value after load state(back to 0): {yr.get(counter.get.invoke())}")
     """
+    require_data_system("save_state")
     remote_runtime = ConfigManager().in_cluster and not ConfigManager().is_driver
     if not remote_runtime:
         raise RuntimeError(
@@ -1405,6 +1543,7 @@ def load_state(timeout_sec: int = _DEFAULT_SAVE_LOAD_STATE_TIMEOUT) -> None:
         >>> print(f"member value after load state(back to 0): {yr.get(counter.get.invoke())}")
         member value after load state(back to 0): 0
     """
+    require_data_system("load_state")
     remote_runtime = ConfigManager().in_cluster and not ConfigManager().is_driver
     if not remote_runtime:
         raise RuntimeError(

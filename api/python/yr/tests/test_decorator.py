@@ -21,9 +21,10 @@ from unittest.mock import Mock, patch
 
 from yr.code_manager import CodeManager
 from yr.decorator import instance_proxy, function_proxy
-from yr.object_ref import ObjectRef
+from yr.object_ref import ObjectRef, ObjectRefDirect
 from yr.config import InvokeOptions
 from yr.config_manager import ConfigManager
+from yr.datasystem_capability import DataSystemCapability
 from yr.common.utils import CrossLanguageInfo
 from yr.libruntime_pb2 import LanguageType, FunctionMeta
 
@@ -34,10 +35,10 @@ logger = logging.getLogger(__name__)
 class TestDecorator(TestCase):
 
     def setUp(self):
-        ConfigManager().bypass_datasystem = None
+        ConfigManager().data_system_capability = DataSystemCapability()
 
     def tearDown(self):
-        ConfigManager().bypass_datasystem = None
+        ConfigManager().data_system_capability = DataSystemCapability()
 
     def test_instance_need_order_auto_default_only_when_unset(self):
         class Actor:
@@ -125,10 +126,10 @@ class TestDecorator(TestCase):
         obj = ins1.get.options(InvokeOptions()).invoke()
         self.assertTrue(isinstance(obj, ObjectRef))
 
-        ConfigManager().bypass_datasystem = True
+        ConfigManager().data_system_capability = DataSystemCapability(False, True, "environment")
         ins1.get.options(InvokeOptions(bypass_datasystem=False)).invoke()
         self.assertTrue(mock_runtime.invoke_instance.call_args.kwargs["opt"].bypass_datasystem)
-        ConfigManager().bypass_datasystem = None
+        ConfigManager().data_system_capability = DataSystemCapability()
 
         ins1.group_name = ""
         with self.assertRaises(RuntimeError):
@@ -339,7 +340,7 @@ class TestDecorator(TestCase):
         mock_rt.put_serialized.assert_not_called()
 
     @patch("yr.runtime_holder.global_runtime.get_runtime")
-    def test_function_proxy_respects_global_bypass_override(self, get_runtime):
+    def test_function_proxy_respects_detected_bypass(self, get_runtime):
         mock_runtime = Mock()
         mock_runtime.invoke_by_name.return_value = ["obj1"]
         get_runtime.return_value = mock_runtime
@@ -348,16 +349,18 @@ class TestDecorator(TestCase):
         proxy.options(InvokeOptions(bypass_datasystem=False)).invoke()
         self.assertFalse(mock_runtime.invoke_by_name.call_args.kwargs["opt"].bypass_datasystem)
 
-        ConfigManager().bypass_datasystem = True
+        ConfigManager().data_system_capability = DataSystemCapability(False, True, "environment")
         proxy.options(InvokeOptions(bypass_datasystem=False)).invoke()
         self.assertTrue(mock_runtime.invoke_by_name.call_args.kwargs["opt"].bypass_datasystem)
+        self.assertIsInstance(proxy.options(InvokeOptions()).invoke(), ObjectRefDirect)
 
-        ConfigManager().bypass_datasystem = False
-        proxy.invoke_direct()
-        self.assertFalse(mock_runtime.invoke_by_name.call_args.kwargs["opt"].bypass_datasystem)
+        ConfigManager().data_system_capability = DataSystemCapability(True, False, "environment")
+        direct_ref = proxy.invoke_direct()
+        self.assertTrue(mock_runtime.invoke_by_name.call_args.kwargs["opt"].bypass_datasystem)
+        self.assertIsInstance(direct_ref, ObjectRefDirect)
 
     @patch("yr.runtime_holder.global_runtime.get_runtime")
-    def test_instance_creator_respects_global_bypass_override(self, get_runtime):
+    def test_explicit_per_call_bypass_is_preserved(self, get_runtime):
         mock_runtime = Mock()
         mock_runtime.create_instance.return_value = "instance-id"
         mock_runtime.invoke_instance.return_value = ["object-id"]
@@ -367,16 +370,15 @@ class TestDecorator(TestCase):
             def ping(self):
                 return "pong"
 
-        ConfigManager().bypass_datasystem = False
         creator = instance_proxy.InstanceCreator.create_from_user_class(
             Actor, InvokeOptions(skip_serialize=True, bypass_datasystem=True))
         proxy = creator.invoke()
 
         opt = mock_runtime.create_instance.call_args.kwargs["opt"]
-        self.assertFalse(opt.bypass_datasystem)
+        self.assertTrue(opt.bypass_datasystem)
         proxy.ping.invoke()
         method_opt = mock_runtime.invoke_instance.call_args.kwargs["opt"]
-        self.assertFalse(method_opt.bypass_datasystem)
+        self.assertTrue(method_opt.bypass_datasystem)
 
     @patch("yr.runtime_holder.global_runtime.get_runtime")
     def test_sandbox_instance_defaults_to_bypass_datasystem(self, get_runtime):
@@ -400,13 +402,47 @@ class TestDecorator(TestCase):
         method_opt = mock_runtime.invoke_instance.call_args.kwargs["opt"]
         self.assertTrue(method_opt.bypass_datasystem)
 
-    def test_config_manager_preserves_per_invoke_bypass_without_override(self):
+    def test_config_manager_preserves_per_invoke_bypass(self):
         opt = InvokeOptions(bypass_datasystem=True)
 
-        overridden = ConfigManager().override_bypass_datasystem(opt)
+        overridden = ConfigManager().apply_data_system_capability(opt)
 
         self.assertIs(overridden, opt)
         self.assertTrue(overridden.bypass_datasystem)
+
+    def test_config_manager_applies_detected_bypass(self):
+        ConfigManager().data_system_capability = DataSystemCapability(False, True, "environment")
+
+        overridden = ConfigManager().apply_data_system_capability(InvokeOptions())
+
+        self.assertTrue(overridden.bypass_datasystem)
+
+    @patch("yr.runtime_holder.global_runtime.get_runtime")
+    def test_no_datasystem_rejects_object_ref_arguments_before_invoke(self, get_runtime):
+        mock_runtime = Mock()
+        get_runtime.return_value = mock_runtime
+        ConfigManager().data_system_capability = DataSystemCapability(False, True, "environment")
+
+        proxy = function_proxy.make_cpp_function_proxy("cppfunc", "key")
+        with self.assertRaisesRegex(RuntimeError, "ObjectRef invoke arguments"):
+            proxy.invoke(ObjectRef("dependency", need_incre=False))
+
+        mock_runtime.invoke_by_name.assert_not_called()
+
+    @patch("yr.runtime_holder.global_runtime.get_runtime")
+    def test_no_datasystem_rejects_generator_before_invoke(self, get_runtime):
+        mock_runtime = Mock()
+        get_runtime.return_value = mock_runtime
+        ConfigManager().data_system_capability = DataSystemCapability(False, True, "environment")
+
+        def values():
+            yield 1
+
+        proxy = function_proxy.FunctionProxy(values)
+        with self.assertRaisesRegex(RuntimeError, "generator invoke"):
+            proxy.invoke()
+
+        mock_runtime.invoke_by_name.assert_not_called()
 
     @patch("yr.runtime_holder.global_runtime.get_runtime")
     def test_get_if_exists_returns_existing_instance(self, get_runtime):

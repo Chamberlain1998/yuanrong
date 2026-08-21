@@ -19,6 +19,7 @@
 #include "auto_init.h"
 #include "src/dto/config.h"
 #include "src/libruntime/utils/constants.h"
+#include "src/libruntime/utils/datasystem_utils.h"
 #include "src/utility/logger/log_handler.h"
 #include "src/utility/timer_worker.h"
 #include "src/libruntime/gwclient/transport/ws_transport.h"
@@ -258,6 +259,7 @@ ErrorInfo LibruntimeManager::Init(const LibruntimeConfig &config, const std::str
 ErrorInfo LibruntimeManager::CreateLibruntime(std::shared_ptr<LibruntimeConfig> librtConfig,
                                               std::shared_ptr<Libruntime> &librt)
 {
+    librtConfig->dataSystemDeployed = ResolveDataSystemDeployed(librtConfig->dataSystemDeployed);
     SetClusterAccessInfo(librtConfig);
     if (!Config::Instance().YR_JWT_TOKEN().empty()) {
         librtConfig->authToken = Config::Instance().YR_JWT_TOKEN();
@@ -284,10 +286,12 @@ ErrorInfo LibruntimeManager::CreateLibruntime(std::shared_ptr<LibruntimeConfig> 
     if (security->GetMetricsTLSConfig(metricsRootCertData, metricsCertData, metricsKeyData)) {
         metricsAdaptor->SetMetricsTLSConfig(metricsRootCertData, metricsCertData, metricsKeyData);
     }
-    auto [enableDsAuth, encryptEnable] = security->GetDataSystemConfig(
-        librtConfig->runtimePublicKey, librtConfig->runtimePrivateKey, librtConfig->dsPublicKey);
-    librtConfig->enableAuth = enableDsAuth;
-    librtConfig->encryptEnable = encryptEnable;
+    if (librtConfig->dataSystemDeployed) {
+        auto [enableDsAuth, encryptEnable] = security->GetDataSystemConfig(
+            librtConfig->runtimePublicKey, librtConfig->runtimePrivateKey, librtConfig->dsPublicKey);
+        librtConfig->enableAuth = enableDsAuth;
+        librtConfig->encryptEnable = encryptEnable;
+    }
     security->GetToken(librtConfig->token);
     std::string ak = "";
     SensitiveValue sk("");
@@ -295,6 +299,11 @@ ErrorInfo LibruntimeManager::CreateLibruntime(std::shared_ptr<LibruntimeConfig> 
     auto finalizeHandler = [this, rtCtx(librtConfig->rtCtx)]() { this->Finalize(rtCtx); };
     librt = std::make_shared<Libruntime>(librtConfig, clientsMgr, metricsAdaptor, security, socketClient_);
     if (librtConfig->inCluster) {
+        if (!librtConfig->dataSystemDeployed) {
+            auto fsClient = std::make_shared<FSClient>();
+            DatasystemClients datasystemClients{};
+            return librt->Init(fsClient, datasystemClients, finalizeHandler);
+        }
 #ifdef ENABLE_DATASYSTEM
         auto [datasystemClients, err] =
             clientsMgr->GetOrNewDsClient(librtConfig, ak, sk, Config::Instance().DS_CONNECT_TIMEOUT_SEC());
@@ -365,7 +374,10 @@ ErrorInfo LibruntimeManager::CreateLibruntime(std::shared_ptr<LibruntimeConfig> 
         gwClient->Init(httpClient, Config::Instance().DS_CONNECT_TIMEOUT_SEC(), librtConfig->authToken);
         gwClient->SetWsTransport(CreateWsTransportFromConfig(librtConfig));
         auto fsClient = std::make_shared<FSClient>(gwClient);
-        DatasystemClients dsClients{gwClient, gwClient, gwClient, gwClient};
+        DatasystemClients dsClients{};
+        if (librtConfig->dataSystemDeployed) {
+            dsClients = DatasystemClients{gwClient, gwClient, gwClient, gwClient};
+        }
         return librt->Init(fsClient, dsClients);
     }
 }

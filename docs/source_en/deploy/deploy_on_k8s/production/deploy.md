@@ -36,6 +36,8 @@ systemctl restart docker
 
 Deploy openYuanrong using helm commands on any K8s node.
 
+DataSystem is deployed by default. For a no-DataSystem installation, read [Optional DataSystem Deployment](optional-datasystem.md) first and set both `global.dataSystem.enabled=false` and `global.dataSystem.bypass=true`.
+
 Find openyuanrong version.
 
 ```bash  

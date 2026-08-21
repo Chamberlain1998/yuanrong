@@ -25,6 +25,10 @@ import yr
 from yr.fnruntime import GeneratorEndError
 from yr.generator import ObjectRefGenerator
 from yr.object_ref import ObjectRef
+from yr.config_manager import ConfigManager
+from yr.datasystem_capability import DataSystemCapability
+from yr.err_type import ErrorCode
+from yr.exception import YRRuntimeError
 
 
 logger = logging.getLogger(__name__)
@@ -105,7 +109,22 @@ class testObjectRef(unittest.TestCase):
 class TestObjectRefGenerator(unittest.TestCase):
 
     def setUp(self):
-        pass
+        ConfigManager().data_system_capability = DataSystemCapability()
+
+    def tearDown(self):
+        ConfigManager().data_system_capability = DataSystemCapability()
+
+    @patch('yr.runtime_holder.global_runtime.get_runtime')
+    def test_disabled_datasystem_fails_before_stream_access(self, get_runtime):
+        ref = ObjectRef("generator", need_incre=False)
+        get_runtime.reset_mock()
+        ConfigManager().data_system_capability = DataSystemCapability(False, True, "environment")
+
+        with self.assertRaises(YRRuntimeError) as raised:
+            ObjectRefGenerator(ref)
+
+        self.assertEqual(raised.exception.code, ErrorCode.ERR_DATASYSTEM_FAILED)
+        get_runtime.assert_not_called()
 
     @patch('yr.runtime_holder.global_runtime.get_runtime')
     def test_iter(self, get_runtime):

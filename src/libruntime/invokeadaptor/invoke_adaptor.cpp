@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <thread>
 
 #include "absl/synchronization/notification.h"
@@ -37,6 +38,7 @@
 #include "src/libruntime/groupmanager/function_group.h"
 #include "src/libruntime/metricsadaptor/metrics_adaptor.h"
 #include "src/libruntime/utils/constants.h"
+#include "src/libruntime/utils/datasystem_utils.h"
 #include "src/proto/libruntime.pb.h"
 #include "src/utility/logger/logger.h"
 #include "src/utility/string_utility.h"
@@ -743,6 +745,12 @@ CallResult InvokeAdaptor::Call(const CallRequest &req, const libruntime::MetaDat
 
     std::string genId;
     if (metaData.functionmeta().isgenerator() && req.returnobjectids_size() > 0) {
+        if (!librtConfig->dataSystemDeployed || !generatorNotifier_) {
+            auto error = MakeDataSystemUnavailableError("generator invoke");
+            callResult.set_code(static_cast<common::ErrorCode>(error.Code()));
+            callResult.set_message(error.Msg());
+            return callResult;
+        }
         generatorNotifier_->Initialize();
         genId = req.returnobjectids(0);
     }
@@ -807,24 +815,37 @@ CallResult InvokeAdaptor::Call(const CallRequest &req, const libruntime::MetaDat
     if (invokeCollector_) {
         invokeCollector_->AfterInvoke(metaData, *this->librtConfig);
     }
+    if (req.bypass_datasystem()) {
+        uint64_t totalReturnSize = 0;
+        for (const auto &returnObject : returnObjects) {
+            if (returnObject->buffer == nullptr || !returnObject->buffer->IsNative() || returnObject->putDone) {
+                continue;
+            }
+            auto bufSize = returnObject->buffer->GetSize();
+            if (totalReturnSize > std::numeric_limits<uint64_t>::max() - bufSize) {
+                totalReturnSize = std::numeric_limits<uint64_t>::max();
+                break;
+            }
+            totalReturnSize += bufSize;
+        }
+        if (totalReturnSize > BYPASS_DS_INLINE_PAYLOAD_LIMIT) {
+            auto msg = fmt::format(
+                "bypass_datasystem: return payload size ({} bytes) exceeds the {} bytes limit. "
+                "Reduce the serialized return values or deploy DataSystem.",
+                totalReturnSize, BYPASS_DS_INLINE_PAYLOAD_LIMIT);
+            YRLOG_WARN(msg);
+            callResult.set_code(common::ERR_PARAM_INVALID);
+            callResult.set_message(msg);
+            return callResult;
+        }
+    }
     for (size_t i = 0; i < returnObjects.size(); i++) {
         if (returnObjects[i]->buffer != nullptr && returnObjects[i]->buffer->IsNative() &&
             returnObjects[i]->putDone == false) {
             auto bufSize = returnObjects[i]->buffer->GetSize();
-            if (req.bypass_datasystem() && bufSize > BYPASS_DS_TRUNCATION_THRESHOLD) {
-                auto msg = fmt::format(
-                    "bypass_datasystem: return value size ({} bytes) exceeds the {} bytes limit. "
-                    "Use invoke() instead of invoke_direct() for large return values.",
-                    bufSize, BYPASS_DS_TRUNCATION_THRESHOLD);
-                YRLOG_WARN(msg);
-                callResult.set_code(common::ERR_PARAM_INVALID);
-                callResult.set_message(msg);
-                return callResult;
-            } else {
-                auto smallObject = callResult.add_smallobjects();
-                smallObject->set_id(returnObjects[i]->id);
-                smallObject->set_value(returnObjects[i]->buffer->ImmutableData(), bufSize);
-            }
+            auto smallObject = callResult.add_smallobjects();
+            smallObject->set_id(returnObjects[i]->id);
+            smallObject->set_value(returnObjects[i]->buffer->ImmutableData(), bufSize);
         } else if (!req.bypass_datasystem()) {
             objectsInDs.emplace_back(returnObjects[i]->id);
         }

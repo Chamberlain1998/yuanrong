@@ -33,7 +33,12 @@ from typing import Optional
 import tomli_w
 
 from yr.cli.component.base import ComponentConfig, ComponentLauncher
-from yr.cli.component.registry import LAUNCHER_CLASSES, PREPEND_CHAR_OVERRIDES, get_depends_on_overrides
+from yr.cli.component.registry import (
+    LAUNCHER_CLASSES,
+    OPTIONAL_DEPENDENCIES_BY_COMPONENT,
+    PREPEND_CHAR_OVERRIDES,
+    get_depends_on_overrides,
+)
 from yr.cli.config import ConfigResolver
 from yr.cli.const import (
     DEFAULT_MASTER_INFO_PATH,
@@ -705,12 +710,11 @@ class SystemLauncher:
         depends_on_override = self.depends_on_overrides.get(comp_name)
         if depends_on_override is not None:
             enabled_components = self.resolver.rendered_config["mode"].get(self.mode.value, {})
+            optional_dependencies = {"etcd"} | OPTIONAL_DEPENDENCIES_BY_COMPONENT.get(comp_name, set())
             launcher.component_config.depends_on = [
                 dep
                 for dep in depends_on_override
-                # In K8S deployments etcd can be provided externally. Components
-                # still need the rendered etcd address, but not a local etcd process.
-                if dep != "etcd" or enabled_components.get("etcd", False)
+                if dep not in optional_dependencies or enabled_components.get(dep, False)
             ]
 
     def _start_component(self, component_name: str) -> Optional[subprocess.Popen]:

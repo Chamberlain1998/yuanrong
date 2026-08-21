@@ -187,6 +187,7 @@ struct LibruntimeConfig {
 
     std::string dataSystemIpAddr = "";
     int dataSystemPort = 0;
+    bool dataSystemDeployed = true;
 
     // iamAdreess is address to request iamAdapter
     std::string iamAddress = "";

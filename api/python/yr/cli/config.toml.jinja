@@ -262,6 +262,8 @@ endpoint = "{{ 'https' if values.fs.tls.enable else 'http' }}://{{ values.functi
 [function_master.env]
 LD_LIBRARY_PATH = "{{ values.yr_package_path }}/functionsystem/lib"
 LD_PRELOAD = "" # for jemalloc use
+YR_DATASYSTEM_DEPLOYED = "true"
+YR_BYPASS_DATASYSTEM = "false"
 
 [function_master.args]
 ip = "{{ values.function_master.ip }}:{{ values.function_master.global_scheduler_port }}"
@@ -322,6 +324,8 @@ endpoint = "{{ 'https' if values.fs.tls.enable else 'http' }}://{{ values.functi
 [function_proxy.env]
 LD_LIBRARY_PATH = "{{ values.yr_package_path }}/functionsystem/lib:{{ values.ds_bin }}/lib" # datasystem lib is needed for libds_router_client.so which needs v1.1 libssl and libcrypto
 LD_PRELOAD = "" # for jemalloc use
+YR_DATASYSTEM_DEPLOYED = "true"
+YR_BYPASS_DATASYSTEM = "false"
 LOCAL_IP = "{{ values.local_ip }}"
 HOST_IP = "{{ values.function_proxy.ip }}"
 {% if values.runtime_launcher.enable %}
@@ -484,6 +488,8 @@ bin_path = "{{ values.yr_package_path }}/functionsystem/bin/function_agent"
 
 [function_agent.env]
 LD_LIBRARY_PATH = "{{ values.yr_package_path }}/functionsystem/lib:{{ values.ds_bin }}/lib"
+YR_DATASYSTEM_DEPLOYED = "true"
+YR_BYPASS_DATASYSTEM = "false"
 GOOGLE_LOG_DIR = "{{ values.fs.log.path }}"
 DATASYSTEM_CLIENT_LOG_DIR = "{{ values.fs.log.path }}"
 RUNTIME_METRICS_CONFIG = "{{ values.fs.metrics.metrics_config }}"
@@ -579,6 +585,8 @@ src_init_config_path = "{{ values.faas_root }}/init_scheduler_args.json"
 
 [function_scheduler.env]
 LD_LIBRARY_PATH = "{{ values.yr_package_path }}/functionsystem/lib:{{ values.yr_package_path }}/runtime/service/go/bin"
+YR_DATASYSTEM_DEPLOYED="true"
+YR_BYPASS_DATASYSTEM="false"
 GO_RUNTIME_BIN="{{ values.yr_package_path }}/runtime/service/go/bin"
 POD_NAME="scheduler-process"
 FUNCTION_LIB_PATH="{{ values.faas_root }}/faasscheduler/faasscheduler.so"
@@ -637,6 +645,8 @@ enable_function_token_auth = {{ values.frontend.enable_function_token_auth | low
 
 [frontend.env]
 LD_LIBRARY_PATH = "{{ values.yr_package_path }}/functionsystem/lib:{{ values.yr_package_path }}/runtime/service/go/bin"
+YR_DATASYSTEM_DEPLOYED="true"
+YR_BYPASS_DATASYSTEM="false"
 GO_RUNTIME_BIN="{{ values.yr_package_path }}/runtime/service/go/bin"
 POD_NAME="frontend-process"
 FUNCTION_LIB_PATH="{{ values.faas_root }}/faasfrontend/faasfrontend.so"

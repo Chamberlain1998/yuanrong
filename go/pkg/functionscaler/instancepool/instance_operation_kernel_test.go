@@ -1804,6 +1804,15 @@ func TestCreateInvokeOptions(t *testing.T) {
 	assert.Equal(t, "trace-parent", opt.CustomExtensions["traceparent"])
 }
 
+func TestCreateInvokeOptionsUsesDataSystemBypassCapability(t *testing.T) {
+	t.Setenv(mockUtils.BypassDataSystemEnvKey, "true")
+	funcSpec := &types.FunctionSpecification{ExtendedMetaData: commonTypes.ExtendedMetaData{}}
+
+	opt := createInvokeOptions(funcSpec, &types.SchedulingOptions{}, nil, "", "trace-id", "")
+
+	assert.True(t, opt.BypassDataSystem)
+}
+
 func TestCreateInvokeOptionsDoesNotMutateSchedulingExtensions(t *testing.T) {
 	funcSpec := &types.FunctionSpecification{
 		FuncKey: "testVpcFuncKey",

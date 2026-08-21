@@ -36,6 +36,8 @@ systemctl restart docker
 
 在任意 K8s 节点上使用 helm 命令部署 openYuanrong。
 
+DataSystem 默认部署。需要 no-DS 形态时，请先阅读 [DataSystem 可选部署](./optional-datasystem.md)，并同时设置 `global.dataSystem.enabled=false` 和 `global.dataSystem.bypass=true`。
+
 查找 openyuanrong 版本。
 
 ```bash  

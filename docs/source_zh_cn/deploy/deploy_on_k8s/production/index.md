@@ -8,6 +8,7 @@
 
    prepare
    deploy
+   optional-datasystem
    restrictions
 ```
 
@@ -15,4 +16,5 @@
 
 - [环境准备](./prepare.md)
 - [部署 openYuanrong](./deploy.md)
+- [DataSystem 可选部署](./optional-datasystem.md)
 - [规格与限制](./restrictions.md)

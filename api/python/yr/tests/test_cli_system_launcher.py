@@ -38,7 +38,7 @@ class TestCliSystemLauncher(unittest.TestCase):
     def make_launcher(self, name: str):
         return SimpleNamespace(component_config=ComponentConfig(name=name))
 
-    def test_disabled_ds_worker_dependency_is_not_silently_removed(self):
+    def test_disabled_ds_worker_dependency_is_optional_for_function_proxy(self):
         system_launcher = TestableSystemLauncher.__new__(TestableSystemLauncher)
         system_launcher.mode = StartMode.MASTER
         system_launcher.prepend_char_overrides = {}
@@ -64,6 +64,34 @@ class TestCliSystemLauncher(unittest.TestCase):
             "function_proxy": function_proxy,
             "runtime_launcher": runtime_launcher,
         }
+
+        self.assertEqual(function_proxy.component_config.depends_on, ["runtime_launcher"])
+        self.assertEqual(
+            system_launcher.get_start_order_for_test(),
+            ["runtime_launcher", "function_proxy"],
+        )
+
+    def test_disabled_required_dependency_is_not_silently_removed(self):
+        system_launcher = TestableSystemLauncher.__new__(TestableSystemLauncher)
+        system_launcher.mode = StartMode.MASTER
+        system_launcher.prepend_char_overrides = {}
+        system_launcher.depends_on_overrides = {
+            "collector": ["ds_worker"],
+        }
+        system_launcher.resolver = SimpleNamespace(
+            rendered_config={
+                "mode": {
+                    StartMode.MASTER.value: {
+                        "collector": True,
+                        "ds_worker": False,
+                    }
+                }
+            }
+        )
+
+        collector = self.make_launcher("collector")
+        system_launcher.apply_component_overrides_for_test("collector", collector)
+        system_launcher.components = {"collector": collector}
 
         with self.assertRaisesRegex(ValueError, "depends on unknown component 'ds_worker'"):
             system_launcher.get_start_order_for_test()

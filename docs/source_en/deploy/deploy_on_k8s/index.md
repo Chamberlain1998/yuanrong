@@ -26,7 +26,7 @@ Master node pod is used to manage the cluster, responsible for global function s
 
 ### Worker Node Pod
 
-Worker node pod is used to run distributed tasks. Deployed openYuanrong components include function agent, function proxy, data worker, and runtime manager.
+Worker node pods run distributed tasks. They include function agent, function proxy, runtime manager, and data worker, which is enabled by default but can be disabled.
 
 ### Component Introduction
 
@@ -65,7 +65,7 @@ Worker node pod is used to run distributed tasks. Deployed openYuanrong componen
   Responsible for cpu, memory and other resource collection and reporting, function process lifecycle management, etc. Deployment form is [Deployment](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/){target="_blank"}, it is in the same pod with function agent.
 - **data worker**
 
-  Provides data object storage and other capabilities. Deployment form is [DaemonSet](https://kubernetes.io/docs/concepts/workloads/controllers/daemonset/){target="_blank"}.
+  Provides data object storage and related capabilities. It is deployed as a [DaemonSet](https://kubernetes.io/docs/concepts/workloads/controllers/daemonset/){target="_blank"} by default and can be disabled as described in [Optional DataSystem Deployment](production/optional-datasystem.md) when only direct invoke is required.
 
 ### Pod Resource Pool
 

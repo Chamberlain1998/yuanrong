@@ -46,6 +46,49 @@ def load_package_function_definitions():
 
 
 class PackageYuanrongLayoutTest(unittest.TestCase):
+    def test_packaged_datasystem_chart_follows_parent_enable_flag(self):
+        """Copied DataSystem templates must disappear when the parent disables DS."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = pathlib.Path(temp_dir)
+            source_chart = temp_path / "source" / "k8s" / "helm_chart" / "datasystem"
+            templates = source_chart / "templates"
+            templates.mkdir(parents=True)
+            (source_chart / "Chart.yaml").write_text(
+                "apiVersion: v2\nname: datasystem\nversion: 1.0.0\n",
+                encoding="utf-8",
+            )
+            (source_chart / "values.yaml").write_text("global: {}\n", encoding="utf-8")
+            (templates / "worker.yaml").write_text(
+                "apiVersion: apps/v1\nkind: DaemonSet\nmetadata:\n  name: ds-worker\n",
+                encoding="utf-8",
+            )
+
+            output_dir = temp_path / "output"
+            function_file = temp_path / "package-functions.sh"
+            function_file.write_text(load_package_function_definitions(), encoding="utf-8")
+            subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    textwrap.dedent(
+                        f"""\
+                        source "{function_file}"
+                        DATASYSTEM_SOURCE_DIR="{temp_path / 'source'}"
+                        LEGACY_DATASYSTEM_SOURCE_DIR="{temp_path / 'missing'}"
+                        OUTPUT_DIR="{output_dir}"
+                        mkdir -p "$OUTPUT_DIR/openyuanrong/deploy/k8s/charts"
+                        copy_datasystem_k8s_assets
+                        """
+                    ),
+                ],
+                check=True,
+            )
+
+            copied = output_dir / "openyuanrong/deploy/k8s/charts/datasystem/templates/worker.yaml"
+            content = copied.read_text(encoding="utf-8")
+            self.assertTrue(content.startswith("{{- if .Values.global.dataSystem.enabled }}\n"))
+            self.assertTrue(content.endswith("\n{{- end }}\n"))
+
     def test_release_archive_uses_parallel_gzip_with_compatible_fallback(self):
         """Final release archives should preserve layout with or without parallel gzip."""
         package_script = PACKAGE_SCRIPT.read_text(encoding="utf-8")

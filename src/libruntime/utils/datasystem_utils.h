@@ -16,6 +16,7 @@
  */
 #pragma once
 
+#include <cstdlib>
 #include <set>
 
 #include <memory>
@@ -26,6 +27,7 @@
 #include "datasystem/utils/status.h"
 #endif
 #include "src/dto/buffer.h"
+#include "src/dto/config.h"
 #include "src/dto/tensor.h"
 #include "src/libruntime/err_type.h"
 #include "src/utility/logger/logger.h"
@@ -49,6 +51,19 @@ struct DsConnectOptions {
     std::string tenantId = "";
     bool enableCrossNodeConnection = false;
 };
+
+inline ErrorInfo MakeDataSystemUnavailableError(const std::string &operation)
+{
+    return ErrorInfo(ErrorCode::ERR_DATASYSTEM_FAILED, ModuleCode::DATASYSTEM,
+                     "DataSystem is disabled in this cluster; " + operation + " is unavailable");
+}
+
+inline bool ResolveDataSystemDeployed(bool detectedValue)
+{
+    return std::getenv("YR_DATASYSTEM_DEPLOYED") == nullptr ? detectedValue
+                                                            : Config::Instance().YR_DATASYSTEM_DEPLOYED();
+}
+
 ErrorInfo ProcessKeyPartialResult(const std::vector<std::string> &keys,
                                   const std::vector<std::shared_ptr<Buffer>> &result, const ErrorInfo &errInfo,
                                   int timeoutMs);

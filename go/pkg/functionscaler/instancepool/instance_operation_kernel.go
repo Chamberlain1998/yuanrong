@@ -333,6 +333,7 @@ func createInvokeOptions(funcSpec *types.FunctionSpecification, schedulingOption
 		Timeout:            int(utils.GetCreateTimeout(funcSpec).Seconds()),
 		ScheduleTimeoutMs:  constant.KernelScheduleTimeout * time.Second.Milliseconds(),
 		TraceID:            traceID,
+		BypassDataSystem:   commonUtils.BypassDataSystemEnabled(),
 	}
 	return invokeOpts
 }
@@ -1292,7 +1293,7 @@ func setCreateOptionForFuncSpec(funcSpec *types.FunctionSpecification, createOpt
 	createOpt[types.FunctionSign] = funcSpec.FuncMetaSignature
 
 	if funcSpec.SandboxType != "" {
-	    createOpt["sandbox_type"] = funcSpec.SandboxType
+		createOpt["sandbox_type"] = funcSpec.SandboxType
 	}
 }
 

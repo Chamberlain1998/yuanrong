@@ -1,3 +1,4 @@
+{{- include "yr-k8s.validateDataSystem" . }}
 {{- if .Values.frontend.enabled }}
 apiVersion: apps/v1
 kind: Deployment
@@ -61,8 +62,14 @@ spec:
               value: {{ .Values.frontend.envPorts.functionProxyPort | quote }}
             - name: FUNCTION_PROXY_GRPC_PORT
               value: {{ .Values.frontend.envPorts.functionProxyGrpcPort | quote }}
+            - name: YR_DATASYSTEM_DEPLOYED
+              value: {{ .Values.global.dataSystem.enabled | quote }}
+            - name: YR_BYPASS_DATASYSTEM
+              value: {{ .Values.global.dataSystem.bypass | quote }}
+{{- if .Values.global.dataSystem.enabled }}
             - name: DS_WORKER_PORT
               value: {{ .Values.frontend.envPorts.dsWorkerPort | quote }}
+{{- end }}
             - name: IAM_SERVER_ADDRESS
               value: {{ default (printf "%s:%v" (include "yr-k8s.componentName" (dict "root" . "component" "master-access")) .Values.master.service.ports.iamServer) .Values.frontend.iamServerAddress | quote }}
             - name: ENABLE_SANDBOX_ROUTER

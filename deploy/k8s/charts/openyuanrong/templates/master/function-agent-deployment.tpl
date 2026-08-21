@@ -21,6 +21,7 @@ spec:
 {{- end }}
 
 {{- define "agent.pod.template" }}
+{{- $dsEnabled := .Values.global.dataSystem.enabled }}
     metadata:
       creationTimestamp: null
       labels:
@@ -306,10 +307,12 @@ spec:
           - mountPath: /home/snuser/runtime/java/log4j2.xml
             name: java-runtime-log4j2-config
             subPath: log4j2.xml
+          {{- if $dsEnabled }}
           - mountPath: /home/uds
             name: datasystem-socket
           - mountPath: /dev/shm
             name: datasystem-shm
+          {{- end }}
           - mountPath: /home/sn/podInfo
             name: podinfo
           - name: config-volume
@@ -550,6 +553,7 @@ spec:
               path: iptabelsRule
           name: function-agent-config
         name: iptables-rules
+      {{- if $dsEnabled }}
       - hostPath:
           path: /home/uds
           type: ""
@@ -558,6 +562,7 @@ spec:
           path: /dev/shm
           type: ""
         name: datasystem-shm
+      {{- end }}
       - downwardAPI:
           defaultMode: 420
           items:

@@ -19,8 +19,11 @@
 #include <stdlib.h>
 #include <fstream>
 #include <iostream>
+#include <optional>
+#include <utility>
 
 #include "src/libruntime/libruntime_config.h"
+#include "src/libruntime/utils/datasystem_utils.h"
 #include "src/utility/logger/logger.h"
 
 using namespace testing;
@@ -29,6 +32,44 @@ using namespace YR::utility;
 
 namespace YR {
 namespace test {
+namespace {
+
+class ScopedEnv {
+public:
+    explicit ScopedEnv(std::string name) : name_(std::move(name))
+    {
+        const char *value = getenv(name_.c_str());
+        if (value != nullptr) {
+            originalValue_ = value;
+        }
+    }
+
+    ~ScopedEnv()
+    {
+        if (originalValue_.has_value()) {
+            setenv(name_.c_str(), originalValue_->c_str(), 1);
+        } else {
+            unsetenv(name_.c_str());
+        }
+    }
+
+    void Set(const char *value) const
+    {
+        setenv(name_.c_str(), value, 1);
+    }
+
+    void Unset() const
+    {
+        unsetenv(name_.c_str());
+    }
+
+private:
+    std::string name_;
+    std::optional<std::string> originalValue_;
+};
+
+}  // namespace
+
 class LibruntimeConfigTest : public ::testing::Test {
 public:
     LibruntimeConfigTest()
@@ -51,6 +92,11 @@ public:
     ~LibruntimeConfigTest() {}
     static void SetUpTestSuite()
     {
+    }
+
+    void TearDown() override
+    {
+        Config::Reset();
     }
 };
 
@@ -91,6 +137,62 @@ TEST_F(LibruntimeConfigTest, GetInstanceIdTest)
     config.funcMeta = meta;
     insId = config.GetInstanceId();
     ASSERT_EQ(insId, "ns-name");
+}
+
+TEST_F(LibruntimeConfigTest, DataSystemDeployedTypedConfig)
+{
+    ScopedEnv dataSystemDeployed("YR_DATASYSTEM_DEPLOYED");
+    dataSystemDeployed.Unset();
+    Config::Reset();
+    EXPECT_TRUE(Config::Instance().YR_DATASYSTEM_DEPLOYED());
+
+    dataSystemDeployed.Set("false");
+    Config::Reset();
+    EXPECT_FALSE(Config::Instance().YR_DATASYSTEM_DEPLOYED());
+
+    dataSystemDeployed.Set("true");
+    Config::Reset();
+    EXPECT_TRUE(Config::Instance().YR_DATASYSTEM_DEPLOYED());
+
+    dataSystemDeployed.Set("invalid");
+    EXPECT_THROW(Config::Reset(), std::invalid_argument);
+
+    dataSystemDeployed.Unset();
+    Config::Reset();
+}
+
+TEST_F(LibruntimeConfigTest, DataSystemDeployedEnvironmentOverridesDetectedCapability)
+{
+    ScopedEnv dataSystemDeployed("YR_DATASYSTEM_DEPLOYED");
+    dataSystemDeployed.Unset();
+    Config::Reset();
+    EXPECT_FALSE(ResolveDataSystemDeployed(false));
+    EXPECT_TRUE(ResolveDataSystemDeployed(true));
+
+    dataSystemDeployed.Set("true");
+    Config::Reset();
+    EXPECT_TRUE(ResolveDataSystemDeployed(false));
+
+    dataSystemDeployed.Set("false");
+    Config::Reset();
+    EXPECT_FALSE(ResolveDataSystemDeployed(true));
+
+    dataSystemDeployed.Unset();
+    Config::Reset();
+}
+
+TEST_F(LibruntimeConfigTest, FunctionAgentClientSwitchDoesNotChangeDeploymentCapability)
+{
+    ScopedEnv dataSystemClientEnabled("DATA_SYSTEM_ENABLE");
+    ScopedEnv dataSystemDeployed("YR_DATASYSTEM_DEPLOYED");
+    dataSystemClientEnabled.Set("false");
+    dataSystemDeployed.Unset();
+    Config::Reset();
+
+    EXPECT_TRUE(ResolveDataSystemDeployed(true));
+
+    dataSystemClientEnabled.Unset();
+    Config::Reset();
 }
 
 }  // namespace test

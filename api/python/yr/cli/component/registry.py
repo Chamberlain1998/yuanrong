@@ -56,6 +56,13 @@ PREPEND_CHAR_OVERRIDES: dict[str, str] = {
     "frontend": "-",
 }
 
+# These components can run in bypass mode without a local DataSystem worker.
+# Other disabled dependencies remain configuration errors.
+OPTIONAL_DEPENDENCIES_BY_COMPONENT: dict[str, set[str]] = {
+    "function_proxy": {"ds_worker"},
+    "function_agent": {"ds_worker"},
+}
+
 
 DEPENDS_ON_OVERRIDES_BY_MODE: dict[StartMode, dict[str, list[str]]] = {
     StartMode.MASTER: {

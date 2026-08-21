@@ -1,7 +1,7 @@
 yr.InvokeOptions
 ==========================
 
-.. py:class:: yr.InvokeOptions(cpu: int = 500, memory: int = 500, concurrency: int = 1, custom_resources: ~typing.Dict[str, float] = <factory>, custom_extensions: ~typing.Dict[str, str] = <factory>, pod_labels: ~typing.Dict[str, str] = <factory>, labels: ~typing.List[str] = <factory>, max_invoke_latency: int = 5000, min_instances: int = 0, max_instances: int = 0, recover_retry_times: int = 0, need_order: bool = False, name: str = '', namespace: str = '', schedule_affinities: ~typing.List[~yr.affinity.Affinity] = <factory>, resource_group_options: ~yr.config.ResourceGroupOptions = <factory>, function_group_options: ~yr.config.FunctionGroupOptions = <factory>, env_vars: ~typing.Dict[str, str] = <factory>, retry_times: int = 0, trace_id: str = '', alias_params: ~typing.Dict[str, str] = <factory>, runtime_env: ~typing.Dict = <factory>)
+.. py:class:: yr.InvokeOptions(cpu: int = 500, memory: int = 500, concurrency: int = 1, custom_resources: ~typing.Dict[str, float] = <factory>, custom_extensions: ~typing.Dict[str, str] = <factory>, pod_labels: ~typing.Dict[str, str] = <factory>, labels: ~typing.List[str] = <factory>, max_invoke_latency: int = 5000, min_instances: int = 0, max_instances: int = 0, recover_retry_times: int = 0, need_order: bool = False, name: str = '', namespace: str = '', schedule_affinities: ~typing.List[~yr.affinity.Affinity] = <factory>, resource_group_options: ~yr.config.ResourceGroupOptions = <factory>, function_group_options: ~yr.config.FunctionGroupOptions = <factory>, env_vars: ~typing.Dict[str, str] = <factory>, retry_times: int = 0, trace_id: str = '', alias_params: ~typing.Dict[str, str] = <factory>, runtime_env: ~typing.Dict = <factory>, bypass_datasystem: bool = False)
 
     基类：``object``
 
@@ -80,6 +80,8 @@ yr.InvokeOptions
          - 使用 conda、pip、working_dir 和 env_vars 配置 actor/task 的运行时环境。
        * - :ref:`is_data_affinity <is_data_affinity>`
          - 实例是否开启数据亲和。
+       * - :ref:`bypass_datasystem <invoke_bypass_datasystem>`
+         - 为该调用显式开启内联传输。
 
     **方法**：
 
@@ -124,4 +126,5 @@ yr.InvokeOptions
     yr.InvokeOptions.__init__ 
     yr.InvokeOptions.check_options_valid
     yr.InvokeOptions.is_data_affinity
+    yr.InvokeOptions.bypass_datasystem
     

@@ -218,6 +218,33 @@ func TestNewInstanceManager(t *testing.T) {
 	})
 }
 
+func TestCreateInstanceUsesDataSystemBypassCapability(t *testing.T) {
+	t.Setenv(utils.BypassDataSystemEnvKey, "true")
+	manager := &FrontendManager{
+		sdkClient:     &mockUtils.FakeLibruntimeSdkClient{},
+		instanceCache: make(map[string]*types.InstanceSpecification),
+	}
+	var captured api.InvokeOptions
+	patch := ApplyFunc((*mockUtils.FakeLibruntimeSdkClient).CreateInstance,
+		func(_ *mockUtils.FakeLibruntimeSdkClient, _ api.FunctionMeta, _ []api.Arg,
+			options api.InvokeOptions) (string, error) {
+			captured = options
+			return "instance-id", nil
+		})
+	defer patch.Reset()
+
+	result := manager.CreateInstance(context.Background(), "function", nil, &commonTypes.ExtraParams{
+		DesignatedInstanceID: "instance-id",
+	})
+
+	if result != "instance-id" {
+		t.Fatalf("unexpected instance ID: %q", result)
+	}
+	if !captured.BypassDataSystem {
+		t.Fatal("expected system function creation to bypass DataSystem")
+	}
+}
+
 func TestInstanceManager_CreateMultiInstances(t *testing.T) {
 	Convey("Test CreateMultiInstances", t, func() {
 		Convey("Test CreateMultiInstances with retry", func() {
