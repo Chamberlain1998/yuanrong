@@ -1,3 +1,7 @@
+// Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+// Licensed under the Apache License, Version 2.0.
+// See the LICENSE file in this repository for the complete license text.
+
 //! Native Rust reverse-tunnel server (replaces spawning the python tunnel_server).
 //!
 //! Port A (ws_port, 0.0.0.0): WebSocket endpoint the external TunnelClient connects to.
@@ -36,7 +40,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{
+    mpsc, oneshot, watch, Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore,
+};
 use tokio::task::AbortHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
@@ -1530,6 +1536,93 @@ pub(super) struct BoundTunnelServers {
     http_port: u16,
 }
 
+#[derive(Clone)]
+pub(super) struct TunnelServerControl {
+    inner: Arc<TunnelServerControlInner>,
+}
+
+impl std::fmt::Debug for TunnelServerControl {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TunnelServerControl")
+            .field("generation", &self.inner.generation.load(Ordering::Acquire))
+            .finish()
+    }
+}
+
+struct TunnelServerControlInner {
+    porta: std::net::TcpListener,
+    portb: std::net::TcpListener,
+    state: Arc<State>,
+    accept_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    generation: AtomicU64,
+    ready_tx: watch::Sender<super::RuntimeReadyState>,
+}
+
+impl TunnelServerControl {
+    pub(super) fn start(
+        bound: BoundTunnelServers,
+        ready_tx: watch::Sender<super::RuntimeReadyState>,
+    ) -> Result<Self, String> {
+        let BoundTunnelServers {
+            porta,
+            portb,
+            ws_port,
+            http_port,
+        } = bound;
+        let porta = porta
+            .into_std()
+            .map_err(|error| format!("failed to preserve tunnel WS listener: {error}"))?;
+        let portb = portb
+            .into_std()
+            .map_err(|error| format!("failed to preserve tunnel HTTP listener: {error}"))?;
+        porta
+            .set_nonblocking(true)
+            .map_err(|error| format!("failed to configure tunnel WS listener: {error}"))?;
+        portb
+            .set_nonblocking(true)
+            .map_err(|error| format!("failed to configure tunnel HTTP listener: {error}"))?;
+        let control = Self {
+            inner: Arc::new(TunnelServerControlInner {
+                porta,
+                portb,
+                state: Arc::new(State::default()),
+                accept_task: Mutex::new(None),
+                generation: AtomicU64::new(0),
+                ready_tx,
+            }),
+        };
+        control.rearm().map_err(|error| {
+            format!(
+                "failed to install tunnel listeners on WS port {} and HTTP port {}: {error}",
+                ws_port, http_port
+            )
+        })?;
+        Ok(control)
+    }
+
+    pub(super) fn rearm(&self) -> std::io::Result<u64> {
+        let mut accept_task =
+            self.inner.accept_task.lock().map_err(|_| {
+                std::io::Error::other("RRT tunnel listener control lock is poisoned")
+            })?;
+        let porta = TcpListener::from_std(self.inner.porta.try_clone()?)?;
+        let portb = TcpListener::from_std(self.inner.portb.try_clone()?)?;
+        let state = self.inner.state.clone();
+        let generation = self.inner.generation.load(Ordering::Relaxed) + 1;
+        self.inner.generation.store(generation, Ordering::Release);
+        let _ = self.inner.ready_tx.send(super::RuntimeReadyState::Ready);
+        let task = tokio::spawn(async move {
+            serve(porta, portb, state).await;
+        });
+        if let Some(previous) = accept_task.replace(task) {
+            previous.abort();
+        }
+        rrt_info!("[rrt-tunnel] listener generation installed generation={generation}");
+        Ok(generation)
+    }
+}
+
 impl BoundTunnelServers {
     pub(super) async fn bind(ws_port: u16, http_port: u16) -> Result<Self, String> {
         let (porta, portb) = tokio::try_join!(
@@ -1550,15 +1643,6 @@ impl BoundTunnelServers {
             ws_port,
             http_port,
         })
-    }
-
-    pub(super) async fn serve(self) {
-        rrt_info!(
-            "[rrt-runtime] tunnel listening ws=0.0.0.0:{} http=127.0.0.1:{}",
-            self.ws_port,
-            self.http_port
-        );
-        serve(self.porta, self.portb, Arc::new(State::default())).await;
     }
 }
 

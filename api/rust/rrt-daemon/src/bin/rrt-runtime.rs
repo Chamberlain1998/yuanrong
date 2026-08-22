@@ -1,3 +1,7 @@
+// Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+// Licensed under the Apache License, Version 2.0.
+// See the LICENSE file in this repository for the complete license text.
+
 //! rrt-runtime binary: sandbox runtime-mode entrypoint.
 //! Start with `rrt-runtime`; runtime context comes from environment variables injected by functionsystem.
 
@@ -5,10 +9,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Fork-based warm starts hold here until the child is ready. Refresh the
     // restored environment before constructing Tokio or reading runtime args.
     rrt_daemon::startup::prepare_runtime_environment()?;
-    tokio::runtime::Builder::new_multi_thread()
+    build_runtime()?.block_on(run())
+}
+
+fn build_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    // Keep checkpoint-restored control, transport and listener futures on one
+    // scheduler. File and command work already uses Tokio's blocking pool.
+    tokio::runtime::Builder::new_current_thread()
         .enable_all()
-        .build()?
-        .block_on(run())
+        .build()
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {

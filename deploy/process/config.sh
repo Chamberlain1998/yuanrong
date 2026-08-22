@@ -88,6 +88,7 @@ log_expiration_enable:,log_expiration_time_threshold:,log_expiration_cleanup_int
 enable_traefik_registry:,enable_traefik_provider:,traefik_domain:,traefik_etcd_prefix:,traefik_lease_ttl:,traefik_http_entrypoint:,traefik_http_entry_point:,traefik_enable_tls:,traefik_servers_transport:,traefik_forward_timeout_ms:,\
 meta_service_address:,\
 system_tenant_id:,\
+enable_sandbox_pause_resume:,snapshot_storage_backend:,checkpoint_dir:,\
 help"
 FS_LOG_CONFIG="{\"filepath\": \"{{logConfigPath}}\",\"level\": \"{{logLevel}}\",\"compress\": {{logCompressEnable}}, \
 \"rolling\": {\"maxsize\": {{logRollingMaxSize}},\"maxfiles\": {{logRollingMaxFiles}},\"retentionDays\": {{logRollingRetentionDays}}}, \
@@ -174,6 +175,9 @@ RUNTIME_METRICS_CONFIG=""
 RUNTIME_METRICS_CONFIG_FILE=""
 YR_DATASYSTEM_DEFAULT_WRITE_MODE="NONE_L2_CACHE"
 STATE_STORAGE_TYPE="datasystem"
+ENABLE_SANDBOX_PAUSE_RESUME="false"
+SNAPSHOT_STORAGE_BACKEND=""
+CHECKPOINT_DIR=""
 PULL_RESOURCE_INTERVAL=1000
 BLOCK=false
 ENABLE_MULTI_MASTER="false"
@@ -986,12 +990,29 @@ function parse_opt() {
     --dposix_uds_path) DPOSIX_UDS_PATH=$2 && shift 2 ;;
     --local_ip) LOCAL_IP=$2 && shift 2 ;;
     --system_tenant_id) SYSTEM_TENANT_ID=$2 && shift 2 ;;
+    --enable_sandbox_pause_resume) ENABLE_SANDBOX_PAUSE_RESUME=$2 && shift 2 ;;
+    --snapshot_storage_backend) SNAPSHOT_STORAGE_BACKEND=$2 && shift 2 ;;
+    --checkpoint_dir) CHECKPOINT_DIR=$2 && shift 2 ;;
     --) shift && break ;;
     *) log_error "Invalid option: $1" && return 1 ;;
     esac
   done
   if [ -z "${RUNTIME_METRICS_CONFIG_FILE}" ]; then
     RUNTIME_METRICS_CONFIG_FILE="${METRICS_CONFIG_FILE}"
+  fi
+  if [ "X${ENABLE_SANDBOX_PAUSE_RESUME}" != "Xtrue" ] && [ "X${ENABLE_SANDBOX_PAUSE_RESUME}" != "Xfalse" ]; then
+    log_error "enable_sandbox_pause_resume can only be 'true' or 'false'"
+    return 1
+  fi
+  if [ "X${ENABLE_SANDBOX_PAUSE_RESUME}" = "Xtrue" ]; then
+    if [ "X${SNAPSHOT_STORAGE_BACKEND}" != "Xdatasystem" ]; then
+      log_error "standalone pause/resume requires snapshot_storage_backend=datasystem"
+      return 1
+    fi
+    if [ -z "${CHECKPOINT_DIR}" ] || [ "${CHECKPOINT_DIR#/}" = "${CHECKPOINT_DIR}" ]; then
+      log_error "checkpoint_dir must be an absolute path when pause/resume is enabled"
+      return 1
+    fi
   fi
 }
 
@@ -1817,6 +1838,7 @@ function export_config() {
   export RUNTIME_INIT_PORT DS_WORKER_PORT RUNTIME_CONN_TIMEOUT_S
   export ENABLE_RUNTIME_LAUNCHER RUNTIME_LAUNCHER_SOCK
   export RUNTIME_INIT_CALL_TIMEOUT_SECONDS IS_SCHEDULE_TOLERATE_ABNORMAL STATE_STORAGE_TYPE
+  export ENABLE_SANDBOX_PAUSE_RESUME SNAPSHOT_STORAGE_BACKEND CHECKPOINT_DIR
   export MERGE_PROCESS_ENABLE FUNCTION_PROXY_MERGE_PROCESS_ENABLE DATA_SYSTEM_ENABLE YR_DATASYSTEM_DEPLOYED YR_BYPASS_DATASYSTEM DRIVER_GATEWAY_ENABLE SSH_ENABLE ENABLE_TCP_TUNNEL
   export FRONTEND_SSH_AUTH_ENABLE FRONTEND_SSH_ADDRESS FRONTEND_SSH_HOST_KEY FRONTEND_SSH_AUTHORIZED_KEYS
   export FRONTEND_SSH_BACKEND_KEY FRONTEND_SSH_MAX_CONNECTIONS TCP_TUNNEL_PORT TCP_TUNNEL_MAX_CONNECTIONS

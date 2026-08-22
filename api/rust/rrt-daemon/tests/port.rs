@@ -1,3 +1,9 @@
+// Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+// Licensed under the Apache License, Version 2.0.
+// See the LICENSE file in this repository for the complete license text.
+
+#![cfg(target_os = "linux")]
+
 use rrt_daemon::pb::port_client::PortClient;
 use rrt_daemon::pb::ListPortsRequest;
 use std::time::Duration;

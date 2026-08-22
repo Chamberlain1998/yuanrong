@@ -1,3 +1,7 @@
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+# Licensed under the Apache License, Version 2.0.
+# See the LICENSE file in this repository for the complete license text.
+
 {{- define "agent.deployment.template" }}
 metadata:
   labels:
@@ -264,6 +268,8 @@ spec:
         volumeMounts:
           - mountPath: /etc/localtime
             name: local-time
+          - mountPath: {{ quote .Values.global.pauseResume.checkpointRoot }}
+            name: pause-resume-checkpoints
           {{- if .Values.global.log.hostPath.enable }}
           - mountPath: "{{ .Values.global.log.functionSystem.path }}"
             name: varlog-runtime-manager
@@ -330,7 +336,7 @@ spec:
               fi
               umask 0027
               [ ! -d "{{ .Values.global.log.functionSystem.path }}" ] && mkdir -p "{{ .Values.global.log.functionSystem.path }}"
-              python3 -m yr.cli.main -v launch --inherit-env --env-subst POD_IP,NODE_ID,HOST_IP,POD_NAME,S3_ACCESS_KEY,S3_SECRET_KEY function_agent
+              python3 -m yr.cli.main -v launch --inherit-env --env-subst POD_IP,NODE_ID,HOST_IP,POD_NAME,S3_ACCESS_KEY,S3_SECRET_KEY,SNAPSHOT_OBS_ACCESS_KEY,SNAPSHOT_OBS_SECRET_KEY,SNAPSHOT_OBS_SECURITY_TOKEN function_agent
         env:
         - name: POD_IP
           valueFrom:
@@ -370,6 +376,25 @@ spec:
               name: minio-secret-yuanrong
               key: secretkey
         {{ end }}
+        {{- if and .Values.global.pauseResume.enabled (eq .Values.global.pauseResume.snapshotStorage.backend "obs") }}
+        {{- $snapshotSecret := required "global.pauseResume.snapshotStorage.obs.credentials.secretName is required for OBS" .Values.global.pauseResume.snapshotStorage.obs.credentials.secretName }}
+        - name: SNAPSHOT_OBS_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: {{ quote $snapshotSecret }}
+              key: {{ quote .Values.global.pauseResume.snapshotStorage.obs.credentials.accessKeyKey }}
+        - name: SNAPSHOT_OBS_SECRET_KEY
+          valueFrom:
+            secretKeyRef:
+              name: {{ quote $snapshotSecret }}
+              key: {{ quote .Values.global.pauseResume.snapshotStorage.obs.credentials.secretKeyKey }}
+        - name: SNAPSHOT_OBS_SECURITY_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: {{ quote $snapshotSecret }}
+              key: {{ quote .Values.global.pauseResume.snapshotStorage.obs.credentials.securityTokenKey }}
+              optional: true
+        {{- end }}
         image: "{{ .Values.global.imageRegistry | trimSuffix "/" }}/{{ .Values.global.images.functionAgent }}"
         imagePullPolicy: IfNotPresent
         livenessProbe:
@@ -422,6 +447,8 @@ spec:
         {{- end }}
         - mountPath: /etc/localtime
           name: local-time
+        - mountPath: {{ quote .Values.global.pauseResume.checkpointRoot }}
+          name: pause-resume-checkpoints
         - mountPath: "{{ .Values.global.log.functionSystem.path }}"
           name: varlog-function-agent
           {{- if .Values.global.log.hostPath.enable }}
@@ -461,6 +488,8 @@ spec:
           - 1002
       terminationGracePeriodSeconds: {{ .Values.global.pool.gracePeriodSeconds }}
       volumes:
+      - name: pause-resume-checkpoints
+        emptyDir: {}
       - name: local-time
         hostPath:
           path: /etc/localtime
