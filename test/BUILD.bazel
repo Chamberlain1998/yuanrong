@@ -14,6 +14,16 @@
 
 load("@rules_cc//cc:defs.bzl", "cc_test")
 
+cc_test(
+    name = "fd_utils_test",
+    size = "small",
+    srcs = ["libruntime/fd_utils_test.cpp"],
+    deps = [
+        "@gtest//:gtest_main",
+        "//:fd_utils",
+    ],
+)
+
 genrule(
     name = "metrics_file_exporter_so_in_test_dir",
     srcs = ["//src/utility/metrics:libobservability-metrics-file-exporter.so"],
@@ -323,7 +333,9 @@ cc_test(
     "libruntime/http_client_test.cpp",
     "libruntime/https_client_test.cpp",
   ],
-  copts = select({
+  copts = [
+    "-fno-access-control",
+  ] + select({
         "//:disable_datasystem": [],
         "//conditions:default": ["-DENABLE_DATASYSTEM"],
   }),

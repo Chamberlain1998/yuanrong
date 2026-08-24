@@ -16,6 +16,9 @@
 
 #include "domain_socket_client.h"
 
+#include <system_error>
+
+#include "src/libruntime/utils/fd_utils.h"
 #include "src/utility/logger/logger.h"
 #include "src/utility/platform_compat.h"
 
@@ -38,26 +41,52 @@ void DomainSocketClient::InitOnce()
 
 ErrorInfo DomainSocketClient::DoInitOnce()
 {
+#ifdef SOCK_CLOEXEC
+    // Set close-on-exec atomically to avoid a fork/exec race between socket() and fcntl().
+    sockfd_ = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+#else
+    // macOS does not define SOCK_CLOEXEC, so set the descriptor flag immediately after creation.
     sockfd_ = socket(AF_UNIX, SOCK_STREAM, 0);
+#endif
     if (sockfd_ == -1) {
         return ErrorInfo(ErrorCode::ERR_INCORRECT_INIT_USAGE, "failed to init socket.");
     }
+#ifndef SOCK_CLOEXEC
+    if (!SetCloseOnExec(sockfd_)) {
+        close(sockfd_);
+        sockfd_ = -1;
+        return ErrorInfo(ErrorCode::ERR_INCORRECT_INIT_USAGE, "failed to set socket close-on-exec.");
+    }
+#endif
     struct sockaddr_un serverAddr;
     if (memset_s(&serverAddr, sizeof(struct sockaddr_un), 0, sizeof(struct sockaddr_un)) != 0) {
+        close(sockfd_);
+        sockfd_ = -1;
         return ErrorInfo(ErrorCode::ERR_INCORRECT_INIT_USAGE, "failed to set sock address.");
     }
     serverAddr.sun_family = AF_UNIX;
     if (strncpy_s(serverAddr.sun_path, sizeof(serverAddr.sun_path) - 1, socketPath_.c_str(),
                   sizeof(serverAddr.sun_path) - 1) != 0) {
+        close(sockfd_);
+        sockfd_ = -1;
         return ErrorInfo(ErrorCode::ERR_INCORRECT_INIT_USAGE, "failed to copy sock address.");
     }
     if (connect(sockfd_, (struct sockaddr *)&serverAddr, sizeof(struct sockaddr_un)) == -1) {
+        close(sockfd_);
+        sockfd_ = -1;
         return ErrorInfo(ErrorCode::ERR_INCORRECT_INIT_USAGE, "failed to connect socket.");
     }
-    writeThread_ = std::thread([this] {
-        YR_SET_THREAD_NAME_CURRENT("yr.uds.write");
-        HandleWrite();
-    });
+    try {
+        writeThread_ = std::thread([this] {
+            YR_SET_THREAD_NAME_CURRENT("yr.uds.write");
+            HandleWrite();
+        });
+    } catch (const std::system_error &e) {
+        close(sockfd_);
+        sockfd_ = -1;
+        return ErrorInfo(ErrorCode::ERR_INCORRECT_INIT_USAGE,
+                         std::string("failed to start socket write thread: ") + e.what());
+    }
     return ErrorInfo();
 }
 

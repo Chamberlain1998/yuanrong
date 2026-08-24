@@ -17,10 +17,12 @@
 #include "src/libruntime/gwclient/transport/ws_transport.h"
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
 #include <queue>
+#include <system_error>
 #include <thread>
 #include <unordered_map>
 
@@ -36,6 +38,7 @@
 
 #include "src/dto/config.h"
 #include "src/libruntime/libruntime_config.h"
+#include "src/libruntime/utils/fd_utils.h"
 #include "src/utility/logger/logger.h"
 
 namespace beast = boost::beast;
@@ -190,15 +193,26 @@ public:
 
     void CompleteHandshake(const asio::ip::tcp::resolver::results_type &results)
     {
-        beast::get_lowest_layer(*ws_).connect(results);
-        ws_->next_layer().handshake(ssl::stream_base::client);
-        ws_->handshake(host_, POSIX_WS_PATH);
-        ws_->binary(true);
-        ws_->control_callback(
-            [](websocket::frame_type kind, beast::string_view payload) {
-                YRLOG_DEBUG("WsTransport control frame: kind={}, payload={} bytes",
-                            static_cast<int>(kind), payload.size());
-            });
+        auto &stream = beast::get_lowest_layer(*ws_);
+        try {
+            stream.connect(results);
+            if (!SetCloseOnExec(stream.socket().native_handle())) {
+                const int error = errno;
+                throw std::system_error(error, std::generic_category(), "failed to set socket close-on-exec");
+            }
+            ws_->next_layer().handshake(ssl::stream_base::client);
+            ws_->handshake(host_, POSIX_WS_PATH);
+            ws_->binary(true);
+            ws_->control_callback(
+                [](websocket::frame_type kind, beast::string_view payload) {
+                    YRLOG_DEBUG("WsTransport control frame: kind={}, payload={} bytes",
+                                static_cast<int>(kind), payload.size());
+                });
+        } catch (...) {
+            beast::error_code closeError;
+            stream.socket().close(closeError);
+            throw;
+        }
     }
 
     bool WaitForConnection()

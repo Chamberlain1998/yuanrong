@@ -16,6 +16,7 @@
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <unistd.h>
 #include <boost/beast/http.hpp>
@@ -72,6 +73,23 @@ TEST_F(HttpClientTest, InitFailed)
     auto httpClient = std::make_unique<ClientManager>(librtCfg);
     auto err = httpClient->Init({"127.0.0.1", "0", 1}, 1, 1);
     ASSERT_EQ(err.OK(), false);
+}
+
+TEST_F(HttpClientTest, ConnectedTcpSocketIsCloseOnExec)
+{
+    ASSERT_TRUE(httpServer_->StartServer(ip_, port_, threadNum));
+    port_ = httpServer_->GetListeningPort();
+    ASSERT_NE(port_, 0);
+
+    auto ioc = std::make_shared<asio::io_context>();
+    asio::ip::tcp::resolver resolver(*ioc);
+    beast::tcp_stream stream(*ioc);
+    ConnectWithOptionalProxy(stream, resolver, {ip_, std::to_string(port_)}, false);
+
+    const int flags = fcntl(stream.socket().native_handle(), F_GETFD);
+    ASSERT_NE(flags, -1);
+    EXPECT_NE(flags & FD_CLOEXEC, 0);
+    httpServer_->StopServer();
 }
 
 TEST_F(HttpClientTest, SubmitTask)
