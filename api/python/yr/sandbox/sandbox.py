@@ -465,6 +465,7 @@ class SandboxCreateOptions:
     graceful_shutdown_time: Optional[int] = None
     before_checkpoint_func: Optional[Callable[..., Any]] = None
     after_restore_func: Optional[Callable[..., Any]] = None
+    user: Optional[str] = None
 
 
 def create(
@@ -487,6 +488,7 @@ def create(
     before_checkpoint_func: Optional[Callable[..., Any]] = None,
     after_restore_func: Optional[Callable[..., Any]] = None,
     graceful_shutdown_time: Optional[int] = None,
+    user: Optional[str] = None,
 ):
     """
     Create a new Sandbox instance.
@@ -516,6 +518,11 @@ def create(
             Controls how long the executor waits before force-killing the
             instance (e.g. Docker stop?t= for docker). None (default) uses "0"
             for docker sandboxes so terminate is immediate.
+        user (Optional[str]): Container run-as user, passed to the backend as
+            the ``host_user`` deploy option and ultimately set as Docker's
+            ``Config.User``. Supports any format Docker accepts, e.g. ``"1000"``,
+            ``"1000:1000"``, ``"root"``, ``"root:root"``.
+            Only effective when sandbox_type="docker".
 
     Returns:
         Sandbox wrapper instance.
@@ -558,6 +565,7 @@ def create(
             before_checkpoint_func=before_checkpoint_func,
             after_restore_func=after_restore_func,
             graceful_shutdown_time=graceful_shutdown_time,
+            user=user,
         )
     except Exception as e:
         print(f"failed to create, exception: {e}")
@@ -645,6 +653,7 @@ class Sandbox:
         before_checkpoint_func: Optional[Callable[..., Any]] = None,
         after_restore_func: Optional[Callable[..., Any]] = None,
         graceful_shutdown_time: Optional[int] = None,
+        user: Optional[str] = None,
     ):
         """
         Initialize the Sandbox wrapper.
@@ -682,6 +691,11 @@ class Sandbox:
                 force-killing the instance (e.g. Docker stop?t= for docker).
                 None (default) uses "0" for docker sandboxes so terminate is
                 immediate.
+            user (Optional[str]): Container run-as user, passed to the backend
+                as the ``host_user`` deploy option and ultimately set as Docker's
+                ``Config.User``. Supports any format Docker accepts, e.g.
+                ``"1000"``, ``"1000:1000"``, ``"root"``, ``"root:root"``.
+                Only effective when sandbox_type="docker".
         """
         self._forwarded_ports = set()
         self._tunnel_client = None
@@ -708,6 +722,7 @@ class Sandbox:
                 before_checkpoint_func=before_checkpoint_func,
                 after_restore_func=after_restore_func,
                 graceful_shutdown_time=graceful_shutdown_time,
+                user=user,
             ))
         else:
             self.restore_instance(checkpoint_id=checkpoint_id)
@@ -788,6 +803,9 @@ class Sandbox:
 
         if options.graceful_shutdown_time is not None:
             opt.custom_extensions["GRACEFUL_SHUTDOWN_TIME"] = str(options.graceful_shutdown_time)
+
+        if options.user is not None:
+            opt.custom_extensions["host_user"] = options.user
 
         if name is not None:
             opt.name = name
