@@ -170,15 +170,26 @@ def render_chart(*extra_args: str) -> list[dict]:
     return [doc for doc in yaml.safe_load_all(result.stdout) if doc]
 
 
+def run_production_chart(*extra_args: str, check: bool = True) -> subprocess.CompletedProcess:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        chart = pathlib.Path(temp_dir) / "openyuanrong"
+        shutil.copytree(REPO_ROOT / "deploy/k8s/charts/openyuanrong", chart)
+        (chart / "charts").mkdir()
+        shutil.copytree(
+            REPO_ROOT / "datasystem/k8s/helm_chart/datasystem",
+            chart / "charts/datasystem",
+        )
+        return subprocess.run(
+            [str(HELM_BIN), "template", "yr", str(chart), *extra_args],
+            cwd=ROOT,
+            check=check,
+            capture_output=True,
+            text=True,
+        )
+
+
 def render_production_chart(*extra_args: str) -> list[dict]:
-    chart = ROOT.parents[1] / "k8s/charts/openyuanrong"
-    result = subprocess.run(
-        [str(HELM_BIN), "template", "yr", str(chart), *extra_args],
-        cwd=ROOT,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    result = run_production_chart(*extra_args)
     return [doc for doc in yaml.safe_load_all(result.stdout) if doc]
 
 
@@ -861,22 +872,12 @@ class YrK8sLayoutTests(unittest.TestCase):
         self.assertIn('YR_DATASYSTEM_DEPLOYED="true"', config)
 
     def test_production_chart_rejects_no_datasystem_without_bypass(self):
-        chart = ROOT.parents[1] / "k8s/charts/openyuanrong"
-        result = subprocess.run(
-            [
-                str(HELM_BIN),
-                "template",
-                "yr",
-                str(chart),
-                "--set",
-                "global.dataSystem.enabled=false",
-                "--set",
-                "global.dataSystem.bypass=false",
-            ],
-            cwd=ROOT,
+        result = run_production_chart(
+            "--set",
+            "global.dataSystem.enabled=false",
+            "--set",
+            "global.dataSystem.bypass=false",
             check=False,
-            capture_output=True,
-            text=True,
         )
 
         self.assertNotEqual(result.returncode, 0)

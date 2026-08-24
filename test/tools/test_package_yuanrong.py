@@ -18,6 +18,7 @@
 
 import os
 import pathlib
+import shutil
 import subprocess
 import tempfile
 import textwrap
@@ -27,6 +28,9 @@ import zipfile
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 PACKAGE_SCRIPT = REPO_ROOT / "scripts" / "package_yuanrong.sh"
+PARENT_CHART = (
+    REPO_ROOT / "deploy" / "k8s" / "charts" / "openyuanrong" / "Chart.yaml"
+)
 BUILD_SCRIPT = REPO_ROOT / "build.sh"
 PREPARE_ST_SCRIPT = REPO_ROOT / "test" / "st" / "prepare_and_start_yr.sh"
 ST_TEST_SCRIPT = REPO_ROOT / "test" / "st" / "test.sh"
@@ -46,18 +50,21 @@ def load_package_function_definitions():
 
 
 class PackageYuanrongLayoutTest(unittest.TestCase):
-    def test_packaged_datasystem_chart_follows_parent_enable_flag(self):
-        """Copied DataSystem templates must disappear when the parent disables DS."""
+    def test_packaged_datasystem_chart_is_standalone_and_parent_condition_controls_it(self):
+        """The parent dependency controls DS without modifying the standalone chart."""
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = pathlib.Path(temp_dir)
             source_chart = temp_path / "source" / "k8s" / "helm_chart" / "datasystem"
             templates = source_chart / "templates"
             templates.mkdir(parents=True)
             (source_chart / "Chart.yaml").write_text(
-                "apiVersion: v2\nname: datasystem\nversion: 1.0.0\n",
+                "apiVersion: v2\nname: datasystem\nversion: 2.2.0\n",
                 encoding="utf-8",
             )
-            (source_chart / "values.yaml").write_text("global: {}\n", encoding="utf-8")
+            (source_chart / "values.yaml").write_text(
+                "global:\n  namespace: default\n",
+                encoding="utf-8",
+            )
             (templates / "worker.yaml").write_text(
                 "apiVersion: apps/v1\nkind: DaemonSet\nmetadata:\n  name: ds-worker\n",
                 encoding="utf-8",
@@ -84,10 +91,61 @@ class PackageYuanrongLayoutTest(unittest.TestCase):
                 check=True,
             )
 
-            copied = output_dir / "openyuanrong/deploy/k8s/charts/datasystem/templates/worker.yaml"
-            content = copied.read_text(encoding="utf-8")
-            self.assertTrue(content.startswith("{{- if .Values.global.dataSystem.enabled }}\n"))
-            self.assertTrue(content.endswith("\n{{- end }}\n"))
+            copied_chart = output_dir / "openyuanrong/deploy/k8s/charts/datasystem"
+            copied_template = copied_chart / "templates/worker.yaml"
+            template_content = copied_template.read_text(encoding="utf-8")
+            source_template = (templates / "worker.yaml").read_text(encoding="utf-8")
+            self.assertEqual(template_content, source_template)
+            self.assertEqual(
+                (copied_chart / "values.yaml").read_text(encoding="utf-8"),
+                (source_chart / "values.yaml").read_text(encoding="utf-8"),
+            )
+
+            rendered = subprocess.run(
+                [
+                    "helm",
+                    "template",
+                    "datasystem",
+                    str(copied_chart),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            self.assertIn("kind: DaemonSet", rendered)
+            self.assertIn("name: ds-worker", rendered)
+
+            parent_chart = temp_path / "parent"
+            (parent_chart / "charts").mkdir(parents=True)
+            shutil.copytree(copied_chart, parent_chart / "charts/datasystem")
+            shutil.copy2(PARENT_CHART, parent_chart / "Chart.yaml")
+            (parent_chart / "values.yaml").write_text(
+                "global:\n  dataSystem:\n    enabled: true\n    bypass: false\n",
+                encoding="utf-8",
+            )
+            parent_enabled = subprocess.run(
+                ["helm", "template", "parent", str(parent_chart)],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            parent_disabled = subprocess.run(
+                [
+                    "helm",
+                    "template",
+                    "parent",
+                    str(parent_chart),
+                    "--set",
+                    "global.dataSystem.enabled=false",
+                    "--set",
+                    "global.dataSystem.bypass=true",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            self.assertIn("name: ds-worker", parent_enabled)
+            self.assertNotIn("name: ds-worker", parent_disabled)
 
     def test_release_archive_uses_parallel_gzip_with_compatible_fallback(self):
         """Final release archives should preserve layout with or without parallel gzip."""

@@ -187,7 +187,6 @@ function copy_datasystem_k8s_assets() {
     docker_dir="${source_dir}/k8s/docker"
     mkdir -p "${chart_dest}"
     cp -fr "${chart_dir}" "${chart_dest}/"
-    guard_datasystem_helm_templates "${chart_dest}/datasystem"
     echo "Copied datasystem helm chart from ${chart_dir}"
 
     if [ -d "${docker_dir}" ]; then
@@ -197,24 +196,6 @@ function copy_datasystem_k8s_assets() {
     else
         echo "Skip datasystem k8s docker files: ${docker_dir} not found"
     fi
-}
-
-function guard_datasystem_helm_templates() {
-    local chart_dir=$1
-    local template_file
-    local guarded_file
-
-    while IFS= read -r -d '' template_file; do
-        guarded_file="${template_file}.guarded"
-        {
-            printf '{{- if .Values.global.dataSystem.enabled }}\n'
-            cat "${template_file}"
-            printf '\n{{- end }}\n'
-        } > "${guarded_file}"
-        chmod --reference="${template_file}" "${guarded_file}" 2>/dev/null || true
-        mv "${guarded_file}" "${template_file}"
-    done < <(find "${chart_dir}/templates" -type f \
-        \( -name '*.yaml' -o -name '*.yml' \) -print0)
 }
 
 function ensure_openssl_linker_symlinks() {
