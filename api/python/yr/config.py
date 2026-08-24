@@ -149,6 +149,10 @@ class Config:
     #: Whether to enable client two-way authentication, default is ``False``.
     enable_mtls: bool = None
     enable_tls: bool = None
+    #: Whether to skip Frontend server certificate verification.
+    #: This also applies to capability discovery.
+    #: The default preserves the existing SDK connection behavior.
+    skip_server_verify: bool = True
     #: Client private key file path.
     private_key_path: str = ""
     #: Client certificate file path.

@@ -146,6 +146,7 @@ def test_frontend_request_reuses_tls_and_has_bounded_timeout_without_auth():
     config = Config(
         server_address="frontend:443",
         enable_tls=True,
+        skip_server_verify=False,
         auth_token="jwt-token",
         tls_config=UserTLSConfig(
             root_cert_path="/certs/ca.pem",
@@ -172,7 +173,7 @@ def test_frontend_request_reuses_tls_and_has_bounded_timeout_without_auth():
         certfile="/certs/client.pem", keyfile="/certs/client-key.pem")
 
 
-def test_legacy_tls_frontend_request_verifies_server_by_default():
+def test_frontend_request_reuses_default_skip_server_verify_policy():
     response = Mock()
     response.getcode.return_value = 200
     response.read.return_value = json.dumps({
@@ -187,6 +188,45 @@ def test_legacy_tls_frontend_request_verifies_server_by_default():
 
     create_context.assert_called_once_with()
     assert get.call_args.kwargs["context"] is context
+    assert context.check_hostname is False
+    assert context.verify_mode == ssl.CERT_NONE
+
+
+def test_frontend_request_can_enable_system_ca_verification():
+    response = Mock()
+    response.getcode.return_value = 200
+    response.read.return_value = json.dumps({
+        "dataSystem": {"dataSystemDeployed": True, "bypassDataSystem": False}
+    }).encode()
+    config = Config(
+        server_address="frontend:443",
+        enable_tls=True,
+        skip_server_verify=False,
+    )
+
+    context = Mock(spec=ssl.SSLContext)
+    with patch("yr.datasystem_capability.ssl.create_default_context", return_value=context) as create_context, \
+            patch("yr.datasystem_capability.urlopen", return_value=response) as get:
+        resolve_data_system_capability(config)
+
+    create_context.assert_called_once_with()
+    assert get.call_args.kwargs["context"] is context
+    assert "check_hostname" not in context.__dict__
+    assert "verify_mode" not in context.__dict__
+
+
+def test_normal_runtime_and_capability_share_server_verify_config():
+    manager = type(ConfigManager())()
+    manager.init(Config(
+        function_id="sn:cn:yrk:default:function:0-test-test:$latest",
+        server_address="frontend:443",
+        in_cluster=False,
+        enable_tls=True,
+        skip_server_verify=False,
+    ))
+
+    assert manager.enable_tls is True
+    assert manager.skip_server_verify is False
 
 
 @pytest.mark.parametrize("config", [

@@ -138,6 +138,9 @@ def _ssl_context(config: Config, url: str) -> Optional[ssl.SSLContext]:
     if not url.startswith("https://"):
         return None
     context = ssl.create_default_context(cafile=ca_file) if ca_file else ssl.create_default_context()
+    if config.skip_server_verify:
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
     if cert is not None:
         context.load_cert_chain(certfile=cert[0], keyfile=cert[1])
     return context

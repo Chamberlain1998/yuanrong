@@ -264,6 +264,7 @@ cdef extern from "src/libruntime/libruntime_config.h" nogil:
         shared_ptr[void] tlsContext
         uint32_t httpIocThreadsNum
         string serverName
+        bool skipServerVerify
         string clientId
         bool inCluster
         string ns

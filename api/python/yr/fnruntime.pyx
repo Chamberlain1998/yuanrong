@@ -1428,6 +1428,8 @@ cdef class Fnruntime:
         config.tenantId = ConfigManager().tenant_id
         config.enableMTLS = ConfigManager().enable_mtls
         config.enableTLS = ConfigManager().enable_tls
+        # Reuse the capability discovery server verification policy.
+        config.skipServerVerify = ConfigManager().skip_server_verify
         config.privateKeyPath = ConfigManager().private_key_path
         config.certificateFilePath = ConfigManager().certificate_file_path
         config.verifyFilePath = ConfigManager().verify_file_path

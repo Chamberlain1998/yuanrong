@@ -16,6 +16,7 @@
 import asyncio
 import socket
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import ClassVar
@@ -42,6 +43,29 @@ def _unused_tcp_ports(count: int) -> tuple[int, ...]:
             sock.close()
 
 
+def _wait_for_tunnel_forwarding(port: int, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while True:
+        request = (
+            b"GET /tunnel-ready HTTP/1.1\r\n"
+            + f"Host: 127.0.0.1:{port}\r\n".encode()
+            + b"Connection: close\r\n\r\n"
+        )
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as conn:
+            conn.sendall(request)
+            with conn.makefile("rb") as response_file:
+                status_line = response_file.readline()
+        if b" 200 " in status_line:
+            return
+        if b" 503 " not in status_line:
+            raise RuntimeError(
+                f"unexpected tunnel readiness response: {status_line!r}"
+            )
+        if time.monotonic() >= deadline:
+            raise RuntimeError("TunnelClient forwarding did not become ready")
+        time.sleep(0.01)
+
+
 class _StrictContentLengthHandler(BaseHTTPRequestHandler):
     """Read only Content-Length bytes, as common upstream proxies do."""
 
@@ -50,6 +74,13 @@ class _StrictContentLengthHandler(BaseHTTPRequestHandler):
 
     def log_message(self, _format, *_args):
         return
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
 
     def do_POST(self):
         content_length = int(self.headers.get("Content-Length") or "0")
@@ -187,6 +218,7 @@ class TestChunkedRequestForwarding(unittest.TestCase):
                     timeout=5,
                 )
             )
+            _wait_for_tunnel_forwarding(http_port)
             request = (
                 b"POST /aux/v1/messages HTTP/1.1\r\n"
                 + f"Host: 127.0.0.1:{http_port}\r\n".encode()

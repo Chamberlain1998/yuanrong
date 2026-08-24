@@ -83,6 +83,7 @@ class ConfigManager:
         self.private_key_path = ""
         self.certificate_file_path = ""
         self.verify_file_path = ""
+        self.skip_server_verify = True
         self.private_key_paaswd = ""
         self.http_ioc_threads_num = _DEFAULT_HTTP_IOC_THREADS_NUM
         self.server_name = ""
@@ -298,6 +299,7 @@ class ConfigManager:
         conf.private_key_paaswd = ""
         self.certificate_file_path = conf.certificate_file_path
         self.verify_file_path = conf.verify_file_path
+        self.skip_server_verify = conf.skip_server_verify
         self.http_ioc_threads_num = conf.http_ioc_threads_num
         self.server_name = conf.server_name
         self.ns = conf.ns
