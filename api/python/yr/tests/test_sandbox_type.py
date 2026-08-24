@@ -599,5 +599,44 @@ class TestSandboxFileRpc(TestCase):
             self.assertEqual(result, {"items": [{"name": "a.py"}]})
 
 
+class TestSandboxDockerUser(TestCase):
+    """Test user parameter for Docker sandbox."""
+
+    def test_sandbox_docker_with_user(self):
+        """Test user sets host_user and works with image/rootfs params."""
+        with patch('yr.sandbox.sandbox.SandboxInstance') as mock_instance, \
+             patch('yr.get', return_value="test-instance"):
+            mock_instance.options.return_value = MagicMock()
+            mock_instance.get_name.invoke.return_value = MagicMock()
+
+            # image + user
+            sandbox = yr.sandbox.Sandbox(sandbox_type="docker", image="python:3.12-slim", user="1000:1000")
+            opts = mock_instance.options.call_args[0][0]
+            self.assertEqual(opts.custom_extensions.get("host_user"), "1000:1000")
+            rootfs = json.loads(opts.custom_extensions["rootfs"])
+            self.assertEqual(rootfs["imageurl"], "python:3.12-slim")
+
+            # rootfs + user
+            mock_instance.reset_mock()
+            mock_instance.options.return_value = MagicMock()
+            mock_instance.get_name.invoke.return_value = MagicMock()
+            custom_rootfs = '{"type":"image","imageurl":"custom:latest"}'
+            sandbox = yr.sandbox.Sandbox(sandbox_type="docker", rootfs=custom_rootfs, user="root")
+            opts = mock_instance.options.call_args[0][0]
+            self.assertEqual(opts.custom_extensions.get("host_user"), "root")
+            self.assertEqual(opts.custom_extensions["rootfs"], custom_rootfs)
+
+    def test_sandbox_docker_without_user(self):
+        """Test that host_user is not set when user is None."""
+        with patch('yr.sandbox.sandbox.SandboxInstance') as mock_instance, \
+             patch('yr.get', return_value="test-instance"):
+            mock_instance.options.return_value = MagicMock()
+            mock_instance.get_name.invoke.return_value = MagicMock()
+
+            sandbox = yr.sandbox.Sandbox(sandbox_type="docker", image="python:3.12-slim")
+            opts = mock_instance.options.call_args[0][0]
+            self.assertNotIn("host_user", opts.custom_extensions)
+
+
 if __name__ == "__main__":
     main()
