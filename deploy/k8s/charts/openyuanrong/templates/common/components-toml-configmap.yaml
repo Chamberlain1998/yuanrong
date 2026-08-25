@@ -7,7 +7,7 @@
 {{- if and (not $dsEnabled) (not $dsBypass) -}}
 {{- fail "YR_BYPASS_DATASYSTEM must be true when YR_DATASYSTEM_DEPLOYED is false" -}}
 {{- end -}}
-{{- $stateStorageType := ternary .Values.global.common.stateStorageType "disable" $dsEnabled -}}
+{{- $stateStorageType := ternary .Values.global.common.stateStorageType "disable" $dsEnabled }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
