@@ -47,15 +47,16 @@ def _wait_for_tunnel_forwarding(port: int, timeout: float = 5.0) -> None:
     deadline = time.monotonic() + timeout
     while True:
         request = (
-            b"GET /tunnel-ready HTTP/1.1\r\n"
+            b"POST /tunnel-ready HTTP/1.1\r\n"
             + f"Host: 127.0.0.1:{port}\r\n".encode()
-            + b"Connection: close\r\n\r\n"
+            + b"Content-Length: 0\r\nConnection: close\r\n\r\n"
         )
         with socket.create_connection(("127.0.0.1", port), timeout=5) as conn:
             conn.sendall(request)
             with conn.makefile("rb") as response_file:
                 status_line = response_file.readline()
-        if b" 200 " in status_line:
+        # The empty probe reaches the strict upstream, which rejects its body.
+        if b" 422 " in status_line:
             return
         if b" 503 " not in status_line:
             raise RuntimeError(
@@ -74,13 +75,6 @@ class _StrictContentLengthHandler(BaseHTTPRequestHandler):
 
     def log_message(self, _format, *_args):
         return
-
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Length", "0")
-        self.send_header("Connection", "close")
-        self.end_headers()
-        self.close_connection = True
 
     def do_POST(self):
         content_length = int(self.headers.get("Content-Length") or "0")
