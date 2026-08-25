@@ -19,6 +19,7 @@ import http.server
 import json
 import socket
 import threading
+import time
 import unittest
 from typing import ClassVar
 
@@ -64,6 +65,26 @@ def _raw_request(port: int, request: bytes) -> tuple[int, list[tuple[str, str]],
             key, value = line.split(":", 1)
             headers.append((key, value.strip()))
     return status, headers, body
+
+
+def _wait_for_tunnel_forwarding(port: int, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while True:
+        status, _, _ = _raw_request(
+            port,
+            (
+                b"GET /tunnel-ready HTTP/1.1\r\n"
+                + f"Host: 127.0.0.1:{port}\r\n".encode()
+                + b"Connection: close\r\n\r\n"
+            ),
+        )
+        if status == 200:
+            return
+        if status != 503:
+            raise RuntimeError(f"unexpected tunnel readiness status: {status}")
+        if time.monotonic() >= deadline:
+            raise RuntimeError("TunnelClient forwarding did not become ready")
+        time.sleep(0.01)
 
 
 class _FidelityUpstream(http.server.BaseHTTPRequestHandler):
@@ -173,6 +194,8 @@ class TestPythonTunnelHttpFidelity(unittest.TestCase):
             timeout=5,
         ):
             raise RuntimeError("TunnelClient did not connect")
+        _wait_for_tunnel_forwarding(cls.http_port)
+        _FidelityUpstream.observations.clear()
 
     @classmethod
     def tearDownClass(cls):

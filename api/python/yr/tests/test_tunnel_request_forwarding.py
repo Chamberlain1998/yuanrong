@@ -16,6 +16,7 @@
 import asyncio
 import socket
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import ClassVar
@@ -40,6 +41,30 @@ def _unused_tcp_ports(count: int) -> tuple[int, ...]:
     finally:
         for sock in sockets:
             sock.close()
+
+
+def _wait_for_tunnel_forwarding(port: int, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while True:
+        request = (
+            b"POST /tunnel-ready HTTP/1.1\r\n"
+            + f"Host: 127.0.0.1:{port}\r\n".encode()
+            + b"Content-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as conn:
+            conn.sendall(request)
+            with conn.makefile("rb") as response_file:
+                status_line = response_file.readline()
+        # The empty probe reaches the strict upstream, which rejects its body.
+        if b" 422 " in status_line:
+            return
+        if b" 503 " not in status_line:
+            raise RuntimeError(
+                f"unexpected tunnel readiness response: {status_line!r}"
+            )
+        if time.monotonic() >= deadline:
+            raise RuntimeError("TunnelClient forwarding did not become ready")
+        time.sleep(0.01)
 
 
 class _StrictContentLengthHandler(BaseHTTPRequestHandler):
@@ -187,6 +212,7 @@ class TestChunkedRequestForwarding(unittest.TestCase):
                     timeout=5,
                 )
             )
+            _wait_for_tunnel_forwarding(http_port)
             request = (
                 b"POST /aux/v1/messages HTTP/1.1\r\n"
                 + f"Host: 127.0.0.1:{http_port}\r\n".encode()
