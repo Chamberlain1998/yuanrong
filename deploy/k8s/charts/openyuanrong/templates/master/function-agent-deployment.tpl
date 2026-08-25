@@ -336,7 +336,7 @@ spec:
               fi
               umask 0027
               [ ! -d "{{ .Values.global.log.functionSystem.path }}" ] && mkdir -p "{{ .Values.global.log.functionSystem.path }}"
-              python3 -m yr.cli.main -v launch --inherit-env --env-subst POD_IP,NODE_ID,HOST_IP,POD_NAME,S3_ACCESS_KEY,S3_SECRET_KEY,SNAPSHOT_OBS_ACCESS_KEY,SNAPSHOT_OBS_SECRET_KEY,SNAPSHOT_OBS_SECURITY_TOKEN function_agent
+              python3 -m yr.cli.main -v launch --inherit-env --env-subst POD_IP,NODE_ID,HOST_IP,POD_NAME,S3_ACCESS_KEY,S3_SECRET_KEY function_agent
         env:
         - name: POD_IP
           valueFrom:
