@@ -804,6 +804,17 @@ class YrK8sLayoutTests(unittest.TestCase):
                     self.assertFalse(config["function_proxy"]["args"]["data_system_enable"])
                     self.assertFalse(config["function_agent"]["args"]["data_system_enable"])
 
+    def test_production_chart_documents_have_api_version_and_kind(self):
+        manifests = render_production_chart()
+        invalid = {}
+        for index, manifest in enumerate(manifests):
+            missing = [key for key in ("apiVersion", "kind") if key not in manifest]
+            if missing:
+                name = manifest.get("metadata", {}).get("name", f"document-{index}")
+                invalid[name] = missing
+
+        self.assertEqual(invalid, {})
+
     def test_production_chart_no_datasystem_contract(self):
         manifests = render_production_chart(
             "--set",
