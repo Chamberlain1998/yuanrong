@@ -607,8 +607,8 @@
       <td class="var">RUST_BUILDER_IMAGE</td>
       <td><code>pipeline.dynamic.yml</code></td>
       <td><code>compile-ubuntu2004-rust:v20260507_x86_64</code></td>
-      <td>现有 Rust builder，仅供独立 <code>build-rrt-amd64</code> 使用</td>
-      <td class="impact">不会用于 C++ FunctionSystem、主包或 cp314 SDK；无需额外发布 Python 3.14 Rust builder</td>
+      <td>现有 Rust builder，仅供独立 <code>build-rrt-amd64</code> 使用；构建入口锁定 amd64 musl target 并验证静态 ELF</td>
+      <td class="impact">不会用于 C++ FunctionSystem、主包或 cp314 SDK；RRT 产物通过 ELF 架构、解释器与共享库依赖门禁后才可上传</td>
     </tr>
     <tr>
       <td class="var">SDK_PYTHON_VERSIONS</td>

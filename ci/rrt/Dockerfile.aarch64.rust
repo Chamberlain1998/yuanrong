@@ -3,9 +3,8 @@
 # Dedicated builder for the standalone rrt-runtime binary and its Python wheel.
 # Keep this image independent from the C++ FunctionSystem/SDK builder so each
 # architecture can pin its own Rust toolchain and native compiler.
-# Keep the runtime's glibc baseline compatible with Ubuntu 20.04 (glibc 2.31).
-# The compiler is intentionally selected through the image's default gcc/g++;
-# RRT does not require the gcc-10 executable names.
+# Preinstall the native musl target and ELF inspection tools required by the
+# shared RRT release-build gate.
 ARG RUST_IMAGE=rust:1.85.1-bullseye
 FROM ${RUST_IMAGE}
 
@@ -29,9 +28,16 @@ RUN set -eux; \
         python3-venv \
         python3-wheel; \
     rm -rf /var/lib/apt/lists/*; \
+    case "${TARGETARCH}" in \
+        arm64) rrt_target=aarch64-unknown-linux-musl ;; \
+        amd64) rrt_target=x86_64-unknown-linux-musl ;; \
+        *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    rustup target add "${rrt_target}"; \
     rustc --version; \
     cargo --version; \
     cc --version | head -n 1; \
+    readelf --version | head -n 1; \
     protoc --version; \
     python3 -c 'import packaging, setuptools, wheel'
 

@@ -296,19 +296,24 @@ RRT log format:
 RRT is built in the Rust compile image, not on the host.
 
 ```bash
-cd api/rust/rrt-daemon
-cargo build --release --bin rrt-runtime
-cargo test -p rrt-daemon
+bash scripts/build_rrt_runtime.sh
+cargo test --manifest-path api/rust/Cargo.toml -p rrt-daemon
 ```
 
-The release artifact is packaged as the `openyuanrong-rrt` Python wheel. The wheel contains the `rrt-runtime` binary and exposes `openyuanrong_rrt.runtime_path()` so bootstrap commands can locate the binary without hard-coded paths.
+The release builder selects `x86_64-unknown-linux-musl` or
+`aarch64-unknown-linux-musl` from the requested architecture. Before staging an
+artifact, it verifies that the ELF machine matches the target and that the
+binary has neither an ELF interpreter nor shared-library dependencies. The
+release artifact is packaged as the `openyuanrong-rrt` Python wheel. The wheel
+contains the `rrt-runtime` binary and exposes `openyuanrong_rrt.runtime_path()`
+so bootstrap commands can locate the binary without hard-coded paths.
 
 Current CI packaging model:
 
 - Build RRT amd64 builds `rrt-runtime` and the `openyuanrong-rrt` wheel.
+- Build RRT arm64 builds the corresponding native musl runtime and wheel.
 - Build Runtime images install the wheel into the runtime image.
 - Build Manifest includes the RRT wheel and sandbox SDK artifacts.
-- arm64 RRT is optional until the Rust-capable arm builder image is available.
 
 ---
 

@@ -20,8 +20,8 @@ ENABLE_SANDBOX_K8S_TEST_ONLY="${ENABLE_SANDBOX_K8S_TEST_ONLY:-false}"
 ENABLE_PYTHON314_BUILDER_BOOTSTRAP="${ENABLE_PYTHON314_BUILDER_BOOTSTRAP:-false}"
 ENABLE_RUST_FUNCTIONSYSTEM_ST="${ENABLE_RUST_FUNCTIONSYSTEM_ST:-false}"
 RUST_BUILDER_IMAGE="${RUST_BUILDER_IMAGE:-swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/compile-ubuntu2004-rust:v20260507_x86_64}"
-RRT_AMD64_BUILDER_IMAGE="${RRT_AMD64_BUILDER_IMAGE:-${RUST_BUILDER_IMAGE}}"
-RRT_ARM64_BUILDER_IMAGE="${RRT_ARM64_BUILDER_IMAGE:-swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/rrt-rust-builder:v20260806_rust1851_sccache082_arm64}"
+RRT_AMD64_BUILDER_IMAGE="${RRT_AMD64_BUILDER_IMAGE:-swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/compile-ubuntu2004-rust:v20260826_rust1950_musl_x86_64}"
+RRT_ARM64_BUILDER_IMAGE="${RRT_ARM64_BUILDER_IMAGE:-swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/rrt-rust-builder:v20260826_rust1851_sccache082_musl_arm64}"
 FUNCTIONSYSTEM_REPO="${FUNCTIONSYSTEM_REPO:-https://gitcode.com/openeuler/yuanrong-functionsystem.git}"
 FUNCTIONSYSTEM_BRANCH="${FUNCTIONSYSTEM_BRANCH:-master}"
 BUILD_ALL_IMAGE="${BUILDER_IMAGE}"
@@ -1008,11 +1008,6 @@ cat << YAML
       mkdir -p \$\$CARGO_HOME \$\$CARGO_TARGET_DIR
       . .buildkite/setup_sccache.sh
 
-      echo "=== [rrt] cargo build rrt-runtime (release) ==="
-      ( cd api/rust/rrt-daemon && cargo build --release --bin rrt-runtime )
-      RRT_BIN="\$\$CARGO_TARGET_DIR/release/rrt-runtime"
-      test -x "\$\$RRT_BIN" || { echo "rrt-runtime missing at \$\$RRT_BIN" >&2; exit 1; }
-
       echo "=== [rrt] package standalone openyuanrong-rrt wheel ==="
       OBS_UPLOAD_CHANNEL="daily"
       OBS_UPLOAD_VERSION_ARGS=""
@@ -1022,8 +1017,9 @@ cat << YAML
       fi
       rm -rf artifacts/openyuanrong-rrt
       mkdir -p artifacts/openyuanrong-rrt
+      RRT_BIN="\$\$(pwd)/artifacts/openyuanrong-rrt/rrt-runtime-amd64"
+      RRT_BUILD_ARCH=amd64 RRT_OUTPUT="\$\$RRT_BIN" bash scripts/build_rrt_runtime.sh
       ( cd api/python-rrt && RRT_RUNTIME_SRC="\$\$RRT_BIN" BUILD_VERSION="\$\$YR_BUILD_VERSION" python3 setup.py bdist_wheel -d "\$\$OLDPWD/artifacts/openyuanrong-rrt" )
-      cp "\$\$RRT_BIN" "artifacts/openyuanrong-rrt/rrt-runtime-\$\${BUILD_ARCH:-x86_64}"
       ( cd artifacts/openyuanrong-rrt && sha256sum openyuanrong_rrt-*.whl rrt-runtime-* > SHA256SUMS )
       ls -lh artifacts/openyuanrong-rrt/
       ( cd artifacts/openyuanrong-rrt && buildkite-agent artifact upload "openyuanrong_rrt-*.whl" )
@@ -1605,11 +1601,6 @@ cat << YAML
       mkdir -p \$\$CARGO_HOME \$\$CARGO_TARGET_DIR
       . .buildkite/setup_sccache.sh
 
-      echo "=== [rrt] cargo build rrt-runtime (release) ==="
-      ( cd api/rust/rrt-daemon && cargo build --release --bin rrt-runtime )
-      RRT_BIN="\$\$CARGO_TARGET_DIR/release/rrt-runtime"
-      test -x "\$\$RRT_BIN" || { echo "rrt-runtime missing at \$\$RRT_BIN" >&2; exit 1; }
-
       echo "=== [rrt] package standalone openyuanrong-rrt wheel ==="
       OBS_UPLOAD_CHANNEL="daily"
       OBS_UPLOAD_VERSION_ARGS=""
@@ -1619,8 +1610,9 @@ cat << YAML
       fi
       rm -rf artifacts/openyuanrong-rrt
       mkdir -p artifacts/openyuanrong-rrt
+      RRT_BIN="\$\$(pwd)/artifacts/openyuanrong-rrt/rrt-runtime-arm64"
+      RRT_BUILD_ARCH=arm64 RRT_OUTPUT="\$\$RRT_BIN" bash scripts/build_rrt_runtime.sh
       ( cd api/python-rrt && RRT_RUNTIME_SRC="\$\$RRT_BIN" BUILD_VERSION="\$\$YR_BUILD_VERSION" python3 setup.py bdist_wheel -d "\$\$OLDPWD/artifacts/openyuanrong-rrt" )
-      cp "\$\$RRT_BIN" "artifacts/openyuanrong-rrt/rrt-runtime-\$\${BUILD_ARCH:-x86_64}"
       ( cd artifacts/openyuanrong-rrt && sha256sum openyuanrong_rrt-*.whl rrt-runtime-* > SHA256SUMS )
       ls -lh artifacts/openyuanrong-rrt/
       ( cd artifacts/openyuanrong-rrt && buildkite-agent artifact upload "openyuanrong_rrt-*.whl" )

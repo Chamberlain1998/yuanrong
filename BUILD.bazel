@@ -1,6 +1,9 @@
 load("//bazel:yr.bzl", "COPTS", "cc_strip")
 
-exports_files(["WORKSPACE"])
+exports_files([
+    "WORKSPACE",
+    "scripts/build_rrt_runtime.sh",
+])
 
 # Config setting for Linux platform
 config_setting(
