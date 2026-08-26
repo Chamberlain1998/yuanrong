@@ -22,8 +22,8 @@ One-click deployment of the CI infrastructure:
    - `swr-pull-secret` in `build-tools` for yuanrong-ci pod `imagePullSecrets`
    - `sandbox-target-kubeconfig` in `default` for Test K8S deployment,
      mounted by the agent-stack podSpec patch at `/var/run/yr-k8s/target/kubeconfig`
-   - `test-pypi-credentials` in `default` for publishing pre-release `openyuanrong_sdk` wheels to TestPyPI
-   - `pypi-credentials` in `default` for publishing stable release `openyuanrong_sdk` wheels to PyPI
+   - `test-pypi-credentials` in `default` for publishing pre-release `openyuanrong-sandbox` wheels to TestPyPI
+   - `pypi-credentials` in `default` for publishing stable release `openyuanrong-sandbox` wheels to PyPI
    - `gitcode-webhook-relay-auth` in `build-tools` for webhook relay API/auth
 4. bazel-remote image mirrored to SWR (see NOTES.txt)
 5. Buildkite pipeline repository configured as
@@ -88,8 +88,8 @@ jobs stuck in `Pending`/`Init` before the build command starts.
 | `swr-pull-secret` | `default` | `.dockerconfigjson` | Build Image/Test K8S image pulls and Docker config fallback |
 | `swr-pull-secret` | `build-tools` | `.dockerconfigjson` | Webhook relay, cache-aging, and chart-managed pod image pulls |
 | `sandbox-target-kubeconfig` | `default` | `kubeconfig` | Test K8S mounted kubeconfig |
-| `test-pypi-credentials` | `default` | `api-token` | Pre-release tag upload of `openyuanrong_sdk*.whl` to TestPyPI |
-| `pypi-credentials` | `default` | `api-token` | Stable release tag upload of `openyuanrong_sdk*.whl` to PyPI |
+| `test-pypi-credentials` | `default` | `api-token` | Pre-release tag upload of `openyuanrong_sandbox*.whl` to TestPyPI |
+| `pypi-credentials` | `default` | `api-token` | Stable release tag upload of `openyuanrong_sandbox*.whl` to PyPI |
 | `gitcode-webhook-relay-auth` | `build-tools` | `buildkite-api-token`, `webhook-token`, `webhook-signature-secret` | GitCode webhook relay |
 
 Before enabling the pipeline on a fresh cluster, fill and apply:
@@ -114,10 +114,11 @@ manifest, pass `--set secrets.targetKubeconfig.create=true` and provide the
 kubeconfig content through a private values file or equivalent secret manager
 workflow.
 
-PyPI publishing is limited to `openyuanrong_sdk*.whl` from SDK build steps.
-Pre-release tags such as alpha, beta, rc, and dev publish to TestPyPI through
+Tag releases publish only `openyuanrong_sandbox*.whl` by default. Pre-release
+tags such as alpha, beta, rc, and dev publish to TestPyPI through
 `test-pypi-credentials`; stable release tags publish to PyPI through
-`pypi-credentials`.
+`pypi-credentials`. Set `PUBLISH_OPENYUANRONG_SDK_PYPI=true` explicitly when a
+release must also publish `openyuanrong_sdk*.whl`.
 
 ## GitCode webhook relay
 
@@ -158,7 +159,7 @@ By default it is configured for merge-triggered CI and tag-triggered release bui
 - tag push events matching `gitcodeWebhookRelay.filters.tagPatterns` start
   release builds; tag `0.7.50` builds version `0.7.50`, disables Buildkite
   Package Registry uploads, and enables PyPI upload for
-  `openyuanrong_sdk*.whl`; pre-release tags such as `0.7.50rc1` keep using
+  `openyuanrong_sandbox*.whl`; pre-release tags such as `0.7.50rc1` keep using
   TestPyPI
 - only merge-request action `merge` is accepted; `update` events remain `update`
   and are filtered, including post-merge metadata updates such as label changes

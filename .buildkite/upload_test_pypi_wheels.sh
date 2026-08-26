@@ -5,6 +5,8 @@ TEST_PYPI_URL="${TEST_PYPI_REPOSITORY_URL:-https://test.pypi.org/legacy/}"
 PYPI_URL="${PYPI_REPOSITORY_URL:-https://upload.pypi.org/legacy/}"
 PUBLISH_TO_TEST_PYPI="${PUBLISH_TEST_PYPI:-}"
 PUBLISH_TO_PYPI="${PUBLISH_PYPI:-}"
+PUBLISH_OPENYUANRONG_SDK_PYPI="${PUBLISH_OPENYUANRONG_SDK_PYPI:-false}"
+PUBLISH_OPENYUANRONG_SANDBOX_PYPI="${PUBLISH_OPENYUANRONG_SANDBOX_PYPI:-true}"
 
 is_enabled() {
     case "$1" in
@@ -73,24 +75,40 @@ if [ "$#" -eq 0 ]; then
     exit 1
 fi
 
+is_selected_wheel() {
+    case "$(basename "$1")" in
+        openyuanrong_sdk*.whl)
+            is_enabled "${PUBLISH_OPENYUANRONG_SDK_PYPI}"
+            ;;
+        openyuanrong_sandbox*.whl)
+            is_enabled "${PUBLISH_OPENYUANRONG_SANDBOX_PYPI}"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 files=()
 for path in "$@"; do
     if [ -d "${path}" ]; then
         while IFS= read -r -d '' file; do
-            files+=("${file}")
+            if is_selected_wheel "${file}"; then
+                files+=("${file}")
+            fi
         done < <(find "${path}" -type f \( -name 'openyuanrong_sdk*.whl' -o -name 'openyuanrong_sandbox*.whl' \) -print0)
         continue
     fi
     for file in ${path}; do
         [ -f "${file}" ] || continue
-        case "$(basename "${file}")" in
-            openyuanrong_sdk*.whl | openyuanrong_sandbox*.whl) files+=("${file}") ;;
-        esac
+        if is_selected_wheel "${file}"; then
+            files+=("${file}")
+        fi
     done
 done
 
 if [ "${#files[@]}" -eq 0 ]; then
-    printf 'No openyuanrong SDK wheel files matched for PyPI upload.\n' >&2
+    printf 'No enabled openYuanRong wheel files matched for PyPI upload.\n' >&2
     exit 1
 fi
 

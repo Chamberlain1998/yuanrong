@@ -1755,6 +1755,14 @@ class YrK8sLayoutTests(unittest.TestCase):
         self.assertIn('--channel "${obs_channel}"', package_script)
         self.assertIn('PUBLISH_TO_TEST_PYPI="${PUBLISH_TEST_PYPI:-}"', test_pypi_upload_script)
         self.assertIn('PUBLISH_TO_PYPI="${PUBLISH_PYPI:-}"', test_pypi_upload_script)
+        self.assertIn(
+            'PUBLISH_OPENYUANRONG_SDK_PYPI="${PUBLISH_OPENYUANRONG_SDK_PYPI:-false}"',
+            test_pypi_upload_script,
+        )
+        self.assertIn(
+            'PUBLISH_OPENYUANRONG_SDK_PYPI="${PUBLISH_OPENYUANRONG_SDK_PYPI:-false}"',
+            pipeline,
+        )
         self.assertIn('is_prerelease_version "${tag_version}"', test_pypi_upload_script)
         self.assertIn('PUBLISH_TO_PYPI=1', test_pypi_upload_script)
         self.assertIn('PYPI_API_TOKEN is required when PyPI publishing is enabled.', test_pypi_upload_script)
@@ -1782,7 +1790,7 @@ class YrK8sLayoutTests(unittest.TestCase):
         self.assertIn('"${BASE_DIR}/functionsystem/output/metrics/lib"', build_sh)
         self.assertIn('${service_python_dir}/yr/$(basename "${member}")', build_sh)
 
-    def test_test_pypi_publish_only_depends_on_emitted_sandbox_sdk_test(self):
+    def test_pypi_publish_defaults_to_openyuanrong_sandbox_only(self):
         without_sandbox = emit_dynamic_pipeline(
             ENABLE_LINUX_ARM="false",
             ENABLE_MACOS_SDK="false",
@@ -1794,29 +1802,10 @@ class YrK8sLayoutTests(unittest.TestCase):
         )
         without_sandbox_steps = index_pipeline_steps(without_sandbox)
         self.assertNotIn("test-sandbox-sdk", without_sandbox_steps)
-        self.assertEqual(
-            without_sandbox_steps["publish-wheels-testpypi"]["env"][
-                "SANDBOX_SANDBOX_SDK_STEPS"
-            ],
-            "",
-        )
-        self.assertNotIn(
-            "test-sandbox-sdk",
-            without_sandbox_steps["publish-wheels-testpypi"]["depends_on"],
-        )
-        publish_command = without_sandbox_steps["publish-wheels-testpypi"]["command"]
-        self.assertIn('set -- --pattern \'openyuanrong_sdk*.whl\'', publish_command)
-        self.assertIn(
-            'if [ -n "$$SANDBOX_SANDBOX_SDK_STEPS" ]; then',
-            publish_command,
-        )
-        self.assertIn(
-            'set -- "$$@" --pattern \'openyuanrong_sandbox*.whl\'',
-            publish_command,
-        )
-        self.assertIn('"$$@"', publish_command)
+        self.assertNotIn("publish-wheels-testpypi", without_sandbox_steps)
 
         with_sandbox = emit_dynamic_pipeline(
+            BUILDKITE_TAG="0.9.11",
             ENABLE_LINUX_ARM="false",
             ENABLE_MACOS_SDK="false",
             ENABLE_RUNTIME_X86="false",
@@ -1829,15 +1818,97 @@ class YrK8sLayoutTests(unittest.TestCase):
         with_sandbox_steps = index_pipeline_steps(with_sandbox)
         self.assertIn("test-sandbox-sdk", with_sandbox_steps)
         self.assertEqual(
-            with_sandbox_steps["publish-wheels-testpypi"]["env"][
-                "SANDBOX_SANDBOX_SDK_STEPS"
-            ],
+            with_sandbox_steps["publish-wheels-testpypi"]["env"]["PYPI_PUBLISH_STEPS"],
             "test-sandbox-sdk",
+        )
+        self.assertEqual(
+            with_sandbox_steps["publish-wheels-testpypi"]["env"][
+                "PUBLISH_OPENYUANRONG_SDK_PYPI"
+            ],
+            "false",
         )
         self.assertIn(
             "test-sandbox-sdk",
             with_sandbox_steps["publish-wheels-testpypi"]["depends_on"],
         )
+        publish_command = with_sandbox_steps["publish-wheels-testpypi"]["command"]
+        self.assertIn(
+            "set -- --pattern 'openyuanrong_sandbox*.whl'",
+            publish_command,
+        )
+        self.assertNotIn("--pattern 'openyuanrong_sdk*.whl'", publish_command)
+
+    def test_pypi_publish_allows_explicit_openyuanrong_sdk_opt_in(self):
+        pipeline = emit_dynamic_pipeline(
+            BUILDKITE_TAG="0.9.11",
+            ENABLE_LINUX_ARM="false",
+            ENABLE_MACOS_SDK="false",
+            ENABLE_RUNTIME_X86="false",
+            ENABLE_RUNTIME_ARM="false",
+            ENABLE_SANDBOX_PACKAGE="false",
+            ENABLE_TEST_PYPI_PUBLISH="true",
+            PUBLISH_OPENYUANRONG_SDK_PYPI="true",
+            SDK_PYTHON_VERSIONS="python3.11",
+        )
+        steps = index_pipeline_steps(pipeline)
+        publish_step = steps["publish-wheels-testpypi"]
+        self.assertEqual(
+            publish_step["env"]["PYPI_PUBLISH_STEPS"],
+            "build-sdk-amd64-cp311",
+        )
+        self.assertEqual(
+            publish_step["env"]["PUBLISH_OPENYUANRONG_SDK_PYPI"],
+            "true",
+        )
+        self.assertEqual(
+            publish_step["depends_on"],
+            ["build-sdk-amd64-cp311"],
+        )
+        self.assertIn(
+            "set -- --pattern 'openyuanrong_sdk*.whl'",
+            publish_step["command"],
+        )
+        self.assertNotIn("--pattern 'openyuanrong_sandbox*.whl'", publish_step["command"])
+
+    def test_tag_pypi_uploader_filters_sdk_wheel_by_default(self):
+        upload_script = REPO_ROOT / ".buildkite/upload_test_pypi_wheels.sh"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = pathlib.Path(temp_dir)
+            wheel_dir = temp_path / "wheels"
+            wheel_dir.mkdir()
+            sdk_wheel = wheel_dir / "openyuanrong_sdk-0.9.11-py3-none-any.whl"
+            sandbox_wheel = wheel_dir / "openyuanrong_sandbox-0.9.11-py3-none-any.whl"
+            sdk_wheel.touch()
+            sandbox_wheel.touch()
+
+            fake_python = temp_path / "python3"
+            fake_python.write_text(
+                "#!/bin/sh\n"
+                "if [ \"$1\" = \"-m\" ] && [ \"$2\" = \"pip\" ]; then exit 0; fi\n"
+                "printf '%s\\n' \"$@\" > \"$TWINE_ARGS_FILE\"\n"
+            )
+            fake_python.chmod(fake_python.stat().st_mode | stat.S_IXUSR)
+            twine_args = temp_path / "twine-args.txt"
+            env = os.environ.copy()
+            env.update(
+                {
+                    "PATH": f"{temp_path}:{env['PATH']}",
+                    "BUILDKITE_TAG": "0.9.11",
+                    "PYPI_API_TOKEN": "test-token",
+                    "TWINE_ARGS_FILE": str(twine_args),
+                }
+            )
+
+            subprocess.run(
+                [str(BASH_BIN), str(upload_script), str(wheel_dir)],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            uploaded_args = twine_args.read_text()
+            self.assertIn(str(sandbox_wheel), uploaded_args)
+            self.assertNotIn(str(sdk_wheel), uploaded_args)
 
 
 if __name__ == "__main__":

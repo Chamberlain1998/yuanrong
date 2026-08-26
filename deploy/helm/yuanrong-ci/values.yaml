@@ -137,14 +137,14 @@ secrets:
     secretName: sandbox-target-kubeconfig
     kubeconfig: ""
 
-  # TestPyPI token used to publish only openyuanrong_sdk wheels.
+  # TestPyPI token used to publish pre-release openyuanrong-sandbox wheels.
   # kubectl create secret generic test-pypi-credentials \
   #   --from-literal=api-token=<TEST_PYPI_API_TOKEN>
   testPypiCredentials:
     create: false
     apiToken: ""
 
-  # PyPI token used to publish stable release openyuanrong_sdk wheels.
+  # PyPI token used to publish stable release openyuanrong-sandbox wheels.
   # kubectl create secret generic pypi-credentials \
   #   --from-literal=api-token=<PYPI_API_TOKEN>
   pypiCredentials:
