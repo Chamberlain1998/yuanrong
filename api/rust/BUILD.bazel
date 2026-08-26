@@ -22,7 +22,10 @@ filegroup(
 
 genrule(
     name = "yr_rust_pkg",
-    srcs = [":rust_sources"],
+    srcs = [
+        ":rust_sources",
+        "//:scripts/build_rrt_runtime.sh",
+    ],
     outs = ["yr_rust_pkg.out"],
     cmd = """
         BASE_DIR="$$(pwd)" &&
@@ -31,32 +34,12 @@ genrule(
         export PROTOC="$${PROTOC:-$$(command -v protoc)}" &&
         RUST_SRC_DIR="$$(realpath $$BASE_DIR/api/rust)" &&
         WORKSPACE_DIR="$$(dirname "$$(dirname "$$RUST_SRC_DIR")")" &&
-        TARGET_DIR="$${CARGO_TARGET_DIR:-$$RUST_SRC_DIR/target}" &&
         RUST_OUT_DIR="$$WORKSPACE_DIR/build/output/runtime/service/rust/bin" &&
         mkdir -p "$$RUST_OUT_DIR" &&
-        RRT_TARGET="$${RRT_TARGET:-x86_64-unknown-linux-musl}" &&
-        RRT_STATIC="$${RRT_STATIC:-true}" &&
-        cd "$$RUST_SRC_DIR" &&
-        if [ "$$RRT_STATIC" = "true" ]; then
-            if ! rustup target list --installed 2>/dev/null | grep -qx "$$RRT_TARGET"; then
-                echo "Rust target $$RRT_TARGET missing; attempting 'rustup target add $$RRT_TARGET'..." >&2
-                rustup target add "$$RRT_TARGET" 2>/dev/null || true
-            fi
-            if rustup target list --installed 2>/dev/null | grep -qx "$$RRT_TARGET" \
-                && cargo build --release --target "$$RRT_TARGET" --bin rrt-runtime; then
-                RRT_BIN="$$TARGET_DIR/$$RRT_TARGET/release/rrt-runtime"
-            else
-                echo "WARNING: static target $$RRT_TARGET unavailable; falling back to dynamic (gnu) rrt-runtime — binary is NOT portable across libc versions." >&2
-                cargo build --release --bin rrt-runtime &&
-                RRT_BIN="$$TARGET_DIR/release/rrt-runtime"
-            fi
-        else
-            cargo build --release --bin rrt-runtime &&
-            RRT_BIN="$$TARGET_DIR/release/rrt-runtime"
-        fi &&
+        RRT_WORKSPACE="$$RUST_SRC_DIR" \
+        RRT_OUTPUT="$$RUST_OUT_DIR/rrt-runtime" \
+            bash "$$(realpath $$BASE_DIR/scripts/build_rrt_runtime.sh)" &&
         cd "$$BASE_DIR" &&
-        cp "$$RRT_BIN" "$$RUST_OUT_DIR/rrt-runtime" &&
-        chmod 750 "$$RUST_OUT_DIR/rrt-runtime" &&
         echo "$$RUST_OUT_DIR/rrt-runtime" > "$@"
     """,
     local = True,

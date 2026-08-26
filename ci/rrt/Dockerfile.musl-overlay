@@ -1,0 +1,20 @@
+# syntax=docker/dockerfile:1
+
+ARG BASE_IMAGE=swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/rrt-rust-builder:v20260806_rust1851_sccache082_arm64
+FROM ${BASE_IMAGE}
+
+ARG RRT_TARGET=aarch64-unknown-linux-musl
+ARG RUSTUP_DIST_SERVER=https://rsproxy.cn
+
+# Download the target while publishing the builder image. RRT jobs must only
+# consume this preinstalled component and never depend on static.rust-lang.org.
+RUN set -eux; \
+    RUSTUP_DIST_SERVER="${RUSTUP_DIST_SERVER}" rustup target add "${RRT_TARGET}"; \
+    rustup target list --installed | grep -Fx "${RRT_TARGET}"; \
+    rustc --version; \
+    cargo --version; \
+    readelf --version | head -n 1; \
+    if command -v sccache >/dev/null 2>&1; then sccache --version; fi
+
+LABEL org.opencontainers.image.title="openyuanrong-rrt-rust-builder" \
+      org.opencontainers.image.description="RRT builder with preinstalled musl target"
