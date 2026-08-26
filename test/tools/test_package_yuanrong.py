@@ -399,7 +399,7 @@ class PackageYuanrongLayoutTest(unittest.TestCase):
         self.assertIn('ld_library_path = "{{ ld_library_path }}"', values)
         self.assertIn('python_path = "{{ python_path }}"', values)
         self.assertIn("[values.fs.metrics]", values)
-        self.assertIn('exec_grpc_port = "{{ 22774|check_port() }}"', values)
+        self.assertIn('component_grpc_port = "{{ 22774|check_port() }}"', values)
         self.assertIn("[values.runtime_launcher]", values)
         self.assertIn("[values.auth.casdoor]", values)
         self.assertIn("[values.auth.keycloak]", values)

@@ -15,6 +15,7 @@
 # limitations under the License.
 
 from types import SimpleNamespace
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -37,6 +38,18 @@ class TestableSystemLauncher(SystemLauncher):
 class TestCliSystemLauncher(unittest.TestCase):
     def make_launcher(self, name: str):
         return SimpleNamespace(component_config=ComponentConfig(name=name))
+
+    def test_component_log_dir_uses_configured_fs_log_path(self):
+        launcher = SystemLauncher.__new__(SystemLauncher)
+        launcher.resolver = SimpleNamespace(
+            rendered_config={
+                "values": {"fs": {"log": {"path": "/custom/component-log"}}}
+            }
+        )
+
+        self.assertEqual(
+            launcher._get_component_log_dir(), Path("/custom/component-log")
+        )
 
     def test_disabled_ds_worker_dependency_is_optional_for_function_proxy(self):
         system_launcher = TestableSystemLauncher.__new__(TestableSystemLauncher)
@@ -154,6 +167,28 @@ class TestCliSystemLauncher(unittest.TestCase):
             )
 
         self.assertEqual(config_resolver.call_args.kwargs["port_policy"], "FIX")
+
+    def test_monitor_marks_shutdown_complete_after_stopping_components(self):
+        system_launcher = TestableSystemLauncher.__new__(TestableSystemLauncher)
+        system_launcher._stopped = True
+        system_launcher._monitor_interval = 0
+        system_launcher.components = {}
+        system_launcher.session_manager = SimpleNamespace(clear_session=lambda: None)
+        system_launcher._shutdown_complete = threading.Event()
+
+        system_launcher._monitor_loop()
+
+        self.assertTrue(system_launcher._shutdown_complete.is_set())
+
+    def test_parent_waits_for_daemon_exit(self):
+        system_launcher = TestableSystemLauncher.__new__(TestableSystemLauncher)
+        system_launcher._monitor_thread = None
+        system_launcher._daemon_pid = 123
+
+        with mock.patch("yr.cli.system_launcher.wait_pid_exit", return_value=True) as wait_pid:
+            system_launcher.wait_for_shutdown()
+
+        wait_pid.assert_called_once_with(123, float("inf"))
 
 
 if __name__ == "__main__":

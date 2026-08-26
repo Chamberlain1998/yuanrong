@@ -51,7 +51,7 @@ enable_iam_server:,iam_server_port:,iam_token_expired_time_span:,iam_credential_
 function_agent_port:,function_proxy_port:,data_system_enable:,ssh_enable:,enable_tcp_tunnel:,ssh_backend_public_key_dir:,frontend_ssh_auth_enable:,frontend_ssh_address:,\
 frontend_ssh_host_key:,frontend_ssh_authorized_keys:,frontend_ssh_backend_key:,frontend_ssh_max_connections:,\
 tcp_tunnel_port:,tcp_tunnel_max_connections:,\
-function_proxy_grpc_port:,global_scheduler_port:,runtime_init_port:,\
+function_proxy_grpc_port:,function_proxy_component_grpc_port:,global_scheduler_port:,runtime_init_port:,\
 function_agent_litebus_thread:,function_master_litebus_thread:,function_proxy_litebus_thread:,\
 meta_store_mode:,\
 metrics_collector_type:,runtime_heartbeat_enable:,runtime_heartbeat_timeout_ms:,port_policy:,ds_worker_port:,\
@@ -226,7 +226,7 @@ DRIVER_GATEWAY_ENABLE="false"
 FUNCTION_AGENT_PORT=58866
 FUNCTION_PROXY_PORT=22772
 FUNCTION_PROXY_GRPC_PORT=22773
-FUNCTION_PROXY_EXEC_GRPC_PORT=22774
+FUNCTION_PROXY_COMPONENT_GRPC_PORT=22774
 LOCAL_IP=""
 ENABLE_DPOSIX_UDS=false
 DPOSIX_UDS_PATH=""
@@ -552,7 +552,7 @@ function usage() {
   echo -e "     --frontend_ssh_max_connections                      frontend concurrent SSH connection limit (default 1024)"
   echo -e "     --tcp_tunnel_port                                   function proxy TCP tunnel port (default 22775)"
   echo -e "     --tcp_tunnel_max_connections                        function proxy concurrent TCP tunnel connection limit (default 1024)"
-  echo -e "     --function_proxy_exec_grpc_port                     session gRPC port for ExecStream (default 22774)"
+  echo -e "     --function_proxy_component_grpc_port                 component gRPC port for Function Proxy services (default 22774)"
   echo -e "     --global_scheduler_port                             global scheduler port (default 22770)"
   echo -e "     --runtime_init_port                                 runtime init port (default 21006)"
   echo -e "     --dashboard_port                                    dashboard port (default 9080)"
@@ -846,7 +846,7 @@ function parse_opt() {
     --frontend_ssh_max_connections) FRONTEND_SSH_MAX_CONNECTIONS=$2 && shift 2 ;;
     --tcp_tunnel_port) TCP_TUNNEL_PORT=$2 && port_policy_table["tcp_tunnel_port"]="FIX" && shift 2 ;;
     --tcp_tunnel_max_connections) TCP_TUNNEL_MAX_CONNECTIONS=$2 && shift 2 ;;
-    --function_proxy_exec_grpc_port) FUNCTION_PROXY_EXEC_GRPC_PORT=$2 && port_policy_table["function_proxy_exec_grpc_port"]="FIX" && shift 2 ;;
+    --function_proxy_component_grpc_port) FUNCTION_PROXY_COMPONENT_GRPC_PORT=$2 && port_policy_table["function_proxy_component_grpc_port"]="FIX" && shift 2 ;;
     --runtime_init_port) RUNTIME_INIT_PORT=$2 && port_policy_table["runtime_init_port"]="FIX" && shift 2 ;;
     --global_scheduler_port) GLOBAL_SCHEDULER_PORT=$2 && port_policy_table["global_scheduler_port"]="FIX" && shift 2 ;;
     --metrics_collector_type) METRICS_COLLECTOR_TYPE=$2 && shift 2 ;;
@@ -1161,7 +1161,7 @@ function check_number_input() {
   check_port_range "function_proxy_port" $FUNCTION_PROXY_PORT
   check_port_range "function_proxy_grpc_port" $FUNCTION_PROXY_GRPC_PORT
   check_port_range "tcp_tunnel_port" $TCP_TUNNEL_PORT
-  check_port_range "function_proxy_exec_grpc_port" $FUNCTION_PROXY_EXEC_GRPC_PORT
+  check_port_range "function_proxy_component_grpc_port" $FUNCTION_PROXY_COMPONENT_GRPC_PORT
   check_port_range "global_scheduler_port" $GLOBAL_SCHEDULER_PORT
   check_port_range "ds_master_port" $DS_MASTER_PORT
   check_port_range "ds_worker_port" $DS_WORKER_PORT
@@ -1834,7 +1834,7 @@ function export_config() {
   export LOG_ROOT DS_LOG_PATH ETCD_LOG_PATH STD_LOG_SUFFIX CPU_RESERVED_FOR_DS_WORKER MAX_INSTANCE_CPU_SIZE MAX_INSTANCE_MEMORY_SIZE
   export DS_LOG_ROLLING_MAX_SIZE DS_LOG_ROLLING_MAX_FILES DS_RPC_THREAD_NUM DS_CLIENT_DEAD_TIMEOUT_S DS_NODE_DEAD_TIMEOUT_S
   export RUNTIME_LOG_PATH RUNTIME_LOG_LEVEL DS_LOG_LEVEL_STR MIN_INSTANCE_CPU_SIZE MIN_INSTANCE_MEMORY_SIZE
-  export ACCESSOR_HTTP_PORT ACCESSOR_GRPC_PORT FUNCTION_AGENT_PORT FUNCTION_PROXY_PORT FUNCTION_PROXY_GRPC_PORT FUNCTION_PROXY_EXEC_GRPC_PORT
+  export ACCESSOR_HTTP_PORT ACCESSOR_GRPC_PORT FUNCTION_AGENT_PORT FUNCTION_PROXY_PORT FUNCTION_PROXY_GRPC_PORT FUNCTION_PROXY_COMPONENT_GRPC_PORT
   export RUNTIME_INIT_PORT DS_WORKER_PORT RUNTIME_CONN_TIMEOUT_S
   export ENABLE_RUNTIME_LAUNCHER RUNTIME_LAUNCHER_SOCK
   export RUNTIME_INIT_CALL_TIMEOUT_SECONDS IS_SCHEDULE_TOLERATE_ABNORMAL STATE_STORAGE_TYPE
