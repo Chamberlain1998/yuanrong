@@ -37,6 +37,7 @@ ENABLE_RRT_ARM="${ENABLE_RRT_ARM:-true}"
 # image/toolchain checks from starting unrelated C++, SDK, packaging, or test jobs.
 ENABLE_RRT_ONLY="${ENABLE_RRT_ONLY:-false}"
 ENABLE_SANDBOX_MANIFEST="${ENABLE_SANDBOX_MANIFEST:-${ENABLE_LINUX_ARM}}"
+PUBLISH_OPENYUANRONG_SDK_PYPI="${PUBLISH_OPENYUANRONG_SDK_PYPI:-false}"
 SDK_PYTHON_VERSIONS="${SDK_PYTHON_VERSIONS:-python3.9 python3.10 python3.11 python3.12 python3.13 python3.14}"
 SANDBOX_RUNTIME_IMAGE_PYTHON_VERSIONS="${SANDBOX_RUNTIME_IMAGE_PYTHON_VERSIONS:-${SDK_PYTHON_VERSIONS}}"
 
@@ -187,6 +188,20 @@ if is_enabled "${ENABLE_SANDBOX_PACKAGE}"; then
   SANDBOX_SANDBOX_SDK_STEPS="test-sandbox-sdk"
   SANDBOX_MANIFEST_SANDBOX_SDK_DEPENDS=$'\n'"      - \"test-sandbox-sdk\""
   SANDBOX_TEST_PYPI_SANDBOX_SDK_DEPENDS=$'\n'"      - \"test-sandbox-sdk\""
+fi
+
+# Tag releases publish openyuanrong-sandbox by default. The legacy
+# openyuanrong-sdk upload remains available only through an explicit opt-in.
+PYPI_PUBLISH_DEPENDS="${SANDBOX_TEST_PYPI_SANDBOX_SDK_DEPENDS}"
+PYPI_PUBLISH_STEPS="${SANDBOX_SANDBOX_SDK_STEPS}"
+PYPI_DOWNLOAD_PATTERNS=""
+if is_enabled "${ENABLE_SANDBOX_PACKAGE}"; then
+  PYPI_DOWNLOAD_PATTERNS="--pattern 'openyuanrong_sandbox*.whl'"
+fi
+if is_enabled "${PUBLISH_OPENYUANRONG_SDK_PYPI}"; then
+  PYPI_PUBLISH_DEPENDS="${SANDBOX_TEST_PYPI_DEPENDS}${PYPI_PUBLISH_DEPENDS}"
+  PYPI_PUBLISH_STEPS="${SANDBOX_SDK_STEPS}${PYPI_PUBLISH_STEPS:+ ${PYPI_PUBLISH_STEPS}}"
+  PYPI_DOWNLOAD_PATTERNS="${PYPI_DOWNLOAD_PATTERNS:+${PYPI_DOWNLOAD_PATTERNS} }--pattern 'openyuanrong_sdk*.whl'"
 fi
 
 SANDBOX_FINAL_PACKAGE_STEP="publish-sandbox-release-amd64"
@@ -346,20 +361,16 @@ cat << YAML
   - label: ":snake: Publish Wheels PyPI"
     key: "publish-wheels-testpypi"
     depends_on:
-${SANDBOX_TEST_PYPI_DEPENDS}
-${SANDBOX_TEST_PYPI_SANDBOX_SDK_DEPENDS}
+${PYPI_PUBLISH_DEPENDS}
     command: |
       set -e
       rm -rf artifacts/test-pypi-wheels artifacts/test-pypi-urls
       mkdir -p artifacts/test-pypi-wheels artifacts/test-pypi-urls
-      for step_key in ${SANDBOX_SDK_STEPS} ${SANDBOX_SANDBOX_SDK_STEPS}; do
+      for step_key in ${PYPI_PUBLISH_STEPS}; do
         mkdir -p "artifacts/test-pypi-urls/\$\$step_key"
         buildkite-agent meta-data get "obs-urls.\$\$step_key" > "artifacts/test-pypi-urls/\$\$step_key/obs-urls.txt" || true
       done
-      set -- --pattern 'openyuanrong_sdk*.whl'
-      if [ -n "\$\$SANDBOX_SANDBOX_SDK_STEPS" ]; then
-        set -- "\$\$@" --pattern 'openyuanrong_sandbox*.whl'
-      fi
+      set -- ${PYPI_DOWNLOAD_PATTERNS}
       python3 .buildkite/download_obs_artifacts.py \
         --urls-root artifacts/test-pypi-urls \
         --output-dir artifacts/test-pypi-wheels \
@@ -371,8 +382,8 @@ ${SANDBOX_TEST_PYPI_SANDBOX_SDK_DEPENDS}
       bash .buildkite/upload_test_pypi_wheels.sh artifacts/test-pypi-wheels
     env:
       BUILDKITE_AGENT_NAME: "agent-stack-k8s"
-      SANDBOX_SDK_STEPS: "${SANDBOX_SDK_STEPS}"
-      SANDBOX_SANDBOX_SDK_STEPS: "${SANDBOX_SANDBOX_SDK_STEPS}"
+      PYPI_PUBLISH_STEPS: "${PYPI_PUBLISH_STEPS}"
+      PUBLISH_OPENYUANRONG_SDK_PYPI: "${PUBLISH_OPENYUANRONG_SDK_PYPI}"
     agents:
       queue: "default"
       os: "linux"
@@ -2052,6 +2063,6 @@ done
 ;;
 esac
 
-if ! is_enabled "${ENABLE_MACOS_SDK_ONLY}" && is_enabled "${ENABLE_TEST_PYPI_PUBLISH}"; then
+if ! is_enabled "${ENABLE_MACOS_SDK_ONLY}" && is_enabled "${ENABLE_TEST_PYPI_PUBLISH}" && [ -n "${PYPI_PUBLISH_STEPS}" ]; then
   emit_test_pypi_publish
 fi

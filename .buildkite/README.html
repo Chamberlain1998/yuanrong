@@ -171,7 +171,7 @@
     <div class="pipe-node spacer">spacer</div>
     <div class="pipe-node spacer">spacer</div>
     <div class="pipe-node spacer">spacer</div>
-    <div class="pipe-node pypi">🐍 Publish PyPI<br><span class="dep-note">所有 SDK macOS</span></div>
+    <div class="pipe-node pypi">🐍 Publish PyPI<br><span class="dep-note">openyuanrong-sandbox</span></div>
   </div>
 
   <div class="fan-lines">→</div>
@@ -502,12 +502,12 @@
           <span class="sum-name">Publish Wheels PyPI <span class="badge badge-k8s">K8S</span></span>
           <span class="sum-key">key: publish-wheels-testpypi</span>
         </span>
-        <span class="sum-dep">依赖 <span>所有 Build SDK</span>（linux + macOS）</span>
+        <span class="sum-dep">默认依赖 <span>Test Sandbox SDK</span></span>
         <span class="sum-chevron">▶</span>
       </summary>
       <div class="step-body">
-        <p>将所有平台 SDK wheel 发布到 TestPyPI。受 <code>ENABLE_PYPI_PUBLISH</code> 开关控制，默认不启用。</p>
-        <div class="deps-inline">所有 Linux amd64/arm64 + macOS SDK step 全部完成后才触发</div>
+        <p>Tag release 默认只发布 <code>openyuanrong-sandbox</code>；设置 <code>PUBLISH_OPENYUANRONG_SDK_PYPI=true</code> 后才额外发布 <code>openyuanrong-sdk</code>。</p>
+        <div class="deps-inline">默认只等待 Test Sandbox SDK；显式启用 SDK 上传后再等待对应 SDK step</div>
       </div>
     </details>
 
