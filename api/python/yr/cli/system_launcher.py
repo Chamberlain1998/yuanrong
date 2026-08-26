@@ -334,6 +334,8 @@ class SystemLauncher:
         self._had_uncaught_exception: bool = False
         self._monitor_thread: Optional[threading.Thread] = None
         self._monitor_interval: int = 3  # seconds between health checks
+        self._daemon_pid: Optional[int] = None
+        self._shutdown_complete = threading.Event()
 
         self._startup_complete: bool = False
         self._startup_cancel_wfd: Optional[int] = None
@@ -493,6 +495,18 @@ class SystemLauncher:
             launcher.terminate(force=force)
         self.session_manager.clear_session()
         logger.info("✅ All components stopped.")
+
+    def wait_for_shutdown(self) -> None:
+        """Wait for the process that owns component shutdown to finish.
+
+        The parent process is the service MainPID in systemd deployments. It
+        must remain alive until the daemon process has completed its signal-
+        driven cleanup instead of returning as soon as startup is ready.
+        """
+        if self._monitor_thread is not None:
+            self._shutdown_complete.wait()
+        elif self._daemon_pid is not None:
+            wait_pid_exit(self._daemon_pid, float("inf"))
 
     def stop_daemon_from_session(self, force: bool = False):
         if not Path(self.session_manager.session_file).exists():
@@ -684,6 +698,8 @@ class SystemLauncher:
             self.stop_all(force=force)
         except Exception:
             logger.exception("Error while stopping components on exit")
+        finally:
+            self._shutdown_complete.set()
 
     def _prepare_environment(self) -> None:
         deploy_path = self.resolver.runtime_context["deploy_path"]
@@ -866,11 +882,13 @@ class SystemLauncher:
                 if self.session_manager.session_file.exists():
                     session = self.session_manager.load_session()
                     if session and "cluster_info" in session:
+                        daemon_info = session["cluster_info"].get("daemon", {})
+                        self._daemon_pid = daemon_info.get("pid")
                         logger.info("✅ All components are healthy!")
                         self._print_status_from_session(session)
                         print_logger.info(
-                            "❕Check logs in %s/logs for details.",
-                            self.resolver.runtime_context["deploy_path"],
+                            "❕Check logs in %s for details.",
+                            self._get_component_log_dir(),
                         )
                         return True
                     logger.warning("Session file found but invalid, this should not happen...")
@@ -883,7 +901,10 @@ class SystemLauncher:
                             got_startup_success_signal = True
                         elif data in (b"0", b"") and not self.session_manager.session_file.exists():
                             logger.error("❌ Daemon exited or reported startup failure")
-                            logger.info(f"❕Check {self.resolver.runtime_context['deploy_path']}/logs for details.")
+                            logger.info(
+                                "❕Check %s for details.",
+                                self._get_component_log_dir(),
+                            )
                             return False
 
                 time.sleep(check_interval)
@@ -968,7 +989,10 @@ class SystemLauncher:
 
         logger.info("🔍 Monitor daemon stopped")
         # Clean shutdown: stop all components
-        self.stop_all(force=False)
+        try:
+            self.stop_all(force=False)
+        finally:
+            self._shutdown_complete.set()
 
     def _daemonize(self) -> int:
         """Fork the process to run in background.
@@ -977,8 +1001,6 @@ class SystemLauncher:
             In parent: the daemon PID (> 0)
             In child (daemon): 0
         """
-        deploy_path = self.resolver.runtime_context["deploy_path"]
-
         try:
             pid = os.fork()
             if pid > 0:
@@ -1003,7 +1025,9 @@ class SystemLauncher:
 
         sys.stdout.flush()
         sys.stderr.flush()
-        log_file = deploy_path / "logs" / "yr_daemon.log"
+        log_dir = self._get_component_log_dir()
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / "yr_daemon.log"
         with log_file.open("a") as f:
             os.dup2(f.fileno(), sys.stdout.fileno())
             os.dup2(f.fileno(), sys.stderr.fileno())
@@ -1013,6 +1037,9 @@ class SystemLauncher:
         self._register_exit_hooks(for_daemon=True)
 
         return 0  # Child returns 0
+
+    def _get_component_log_dir(self) -> Path:
+        return Path(self.resolver.rendered_config["values"]["fs"]["log"]["path"])
 
     def _get_start_order(self) -> list[str]:
         """Determine component start order based on dependency graph (topological sort).

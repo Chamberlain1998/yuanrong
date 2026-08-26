@@ -111,7 +111,7 @@ bin_path = "{{ values.yr_package_path }}/functionsystem/bin/function_proxy"
 ip = "{{ values.host_ip }}"
 port = "{{ 22772|check_port() }}"
 grpc_listen_port = "{{ 22773|check_port() }}"
-exec_grpc_port = "{{ 22774|check_port() }}"
+component_grpc_port = "{{ 22774|check_port() }}"
 # TCP tunnel (frontend SSH -> instance sshd). Listener enabled only when
 # values.frontend.ssh_enable is true. Port uses check_port() so it auto-shifts
 # on conflict; override via -s values.function_proxy.tcp_tunnel_port.

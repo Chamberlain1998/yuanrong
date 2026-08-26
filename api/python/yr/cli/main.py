@@ -16,7 +16,6 @@
 
 import logging
 import sys
-import time
 from pathlib import Path
 from typing import Optional
 
@@ -284,11 +283,7 @@ def start(ctx: click.Context, **kwargs) -> None:
     launcher.load_components()
     success = launcher.start_all()
     if success and block:
-        try:
-            while True:
-                time.sleep(3600)
-        except KeyboardInterrupt:
-            pass
+        launcher.wait_for_shutdown()
 
     ctx.exit(0 if success else 1)
 

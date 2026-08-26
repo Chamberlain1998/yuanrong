@@ -269,6 +269,7 @@ class TestCliConfig(unittest.TestCase):
         agent = config["function_agent"]
         proxy_port = values["function_proxy"]["port"]
         proxy_grpc_port = values["function_proxy"]["grpc_listen_port"]
+        component_grpc_port = values["function_proxy"]["component_grpc_port"]
         agent_port = values["function_agent"]["port"]
 
         self.assertEqual(values["local_ip"], local_ip)
@@ -281,6 +282,9 @@ class TestCliConfig(unittest.TestCase):
         self.assertEqual(proxy["args"]["proxy_ip"], local_ip)
         self.assertEqual(proxy["args"]["host_ip"], host_ip)
         self.assertEqual(proxy["args"]["agent_address"], f"{host_ip}:{proxy_port}")
+        self.assertEqual(
+            proxy["args"]["component_grpc_port"], int(component_grpc_port)
+        )
         self.assertEqual(proxy["env"]["LOCAL_IP"], local_ip)
         self.assertEqual(proxy["env"]["HOST_IP"], host_ip)
 

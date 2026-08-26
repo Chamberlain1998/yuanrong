@@ -502,10 +502,10 @@ function dump_agent_info() {
 }
 
 function start_function_proxy() {
-  update_data_plane_port "function_proxy_port function_proxy_grpc_port function_proxy_exec_grpc_port"
+  update_data_plane_port "function_proxy_port function_proxy_grpc_port function_proxy_component_grpc_port"
   FUNCTION_PROXY_PORT=${data_port_table["function_proxy_port"]}
   FUNCTION_PROXY_GRPC_PORT=${data_port_table["function_proxy_grpc_port"]}
-  FUNCTION_PROXY_EXEC_GRPC_PORT=${data_port_table["function_proxy_exec_grpc_port"]}
+  FUNCTION_PROXY_COMPONENT_GRPC_PORT=${data_port_table["function_proxy_component_grpc_port"]}
   install_function_system "function_proxy"
   check_and_set_component_checklist "function_proxy" $FUNCTION_PROXY_PID
 }

@@ -64,7 +64,7 @@ function update_control_plane_port() {
 function init_data_plane_port() {
   data_port_table["function_proxy_port"]=${FUNCTION_PROXY_PORT}
   data_port_table["function_proxy_grpc_port"]=${FUNCTION_PROXY_GRPC_PORT}
-  data_port_table["function_proxy_exec_grpc_port"]=${FUNCTION_PROXY_EXEC_GRPC_PORT}
+  data_port_table["function_proxy_component_grpc_port"]=${FUNCTION_PROXY_COMPONENT_GRPC_PORT}
   data_port_table["function_agent_port"]=${FUNCTION_AGENT_PORT}
   data_port_table["runtime_init_port"]=${RUNTIME_INIT_PORT}
   data_port_table["ds_worker_port"]=${DS_WORKER_PORT}

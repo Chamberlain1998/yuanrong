@@ -292,6 +292,16 @@ py_test(
 )
 
 py_test(
+    name = "test_cli_component_function_proxy",
+    size = "small",
+    srcs = ["test_cli_component_function_proxy.py"],
+    tags = ["smoke"],
+    imports = ["../../"],
+    deps = ["//api/python:yr_lib"],
+    env = SAN_ENV,
+)
+
+py_test(
     name = "test_cli_main",
     size = "small",
     srcs = ["test_cli_main.py"],

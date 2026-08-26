@@ -59,18 +59,21 @@ class TestCliMain(unittest.TestCase):
 
         class FakeSystemLauncher:
             calls = []
+            wait_for_shutdown_calls = 0
 
             def __init__(self, *args, **kwargs):
                 self.args = args
                 self.kwargs = kwargs
                 FakeSystemLauncher.calls.append((args, kwargs))
 
-            @staticmethod
-            def start_all():
+            def start_all(self):
                 return True
 
             def load_components(self):
                 pass
+
+            def wait_for_shutdown(self):
+                FakeSystemLauncher.wait_for_shutdown_calls += 1
 
             def health(self):
                 return True
@@ -170,6 +173,15 @@ class TestCliMain(unittest.TestCase):
         call_kwargs = main.fake_discovery.resolve_overrides_from_function_master.call_args.kwargs
         self.assertEqual(call_kwargs["function_master_addr"], "http://127.0.0.1:8080")
         self.assertEqual(main.FakeSystemLauncher.calls[-1][1]["overrides"], ("x=y",))
+
+    def test_block_start_waits_for_shutdown(self):
+        main = self.load_cli_main_with_stubbed_deps()
+        runner = CliRunner()
+
+        result = runner.invoke(main.cli, ["start", "--block", "true"], obj={})
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(main.FakeSystemLauncher.wait_for_shutdown_calls, 1)
 
     def test_start_port_policy_options(self):
         cases = [

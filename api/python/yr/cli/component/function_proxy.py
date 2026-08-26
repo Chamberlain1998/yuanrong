@@ -25,6 +25,21 @@ logger = logging.getLogger(__name__)
 
 
 class FunctionProxyLauncher(ComponentLauncher):
+    def prepare_environment(self, env: dict[str, str]) -> dict[str, str]:
+        merged_env = super().prepare_environment(env)
+        proxy_config = self.resolver.rendered_config[self.name]
+        if not proxy_config.get("args", {}).get("enable_merge_process", False):
+            return merged_env
+
+        proxy_env = proxy_config.get("env", {})
+        agent_env = self.resolver.rendered_config.get("function_agent", {}).get(
+            "env", {}
+        )
+        for key, value in agent_env.items():
+            if key not in proxy_env:
+                merged_env[key] = value
+        return merged_env
+
     def health_check(self) -> bool:
         logger.info(f"{self.name}: performing custom health check")
         args_config = self.resolver.rendered_config[self.component_config.name]["args"]
