@@ -59,6 +59,7 @@ message CreateRequest {
   // optional. if designated instanceID is not empty, the created instance id will be assigned designatedInstanceID
   string       designatedInstanceID = 7;
   map<string, string> createOptions = 8;
+  bool                failover = 10;
 }
 
 message CreateResponse {

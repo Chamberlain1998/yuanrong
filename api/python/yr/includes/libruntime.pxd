@@ -330,6 +330,10 @@ cdef extern from "src/libruntime/fsclient/protobuf/common.pb.h" nogil:
         DUMPSTATE "common::SnapType::DUMPSTATE"
         SNAPSHOT "common::SnapType::SNAPSHOT"
 
+cdef extern from "src/libruntime/fsclient/protobuf/core_service.pb.h" namespace "core_service" nogil:
+    cdef cppclass CKillResponse "core_service::KillResponse":
+        int code() const
+
 cdef extern from "src/dto/device.h" nogil:
     cdef cppclass CDevice "YR::Libruntime::Device":
         CDevice()
@@ -421,6 +425,7 @@ cdef extern from "src/dto/invoke_options.h" nogil:
         list[shared_ptr[CAffinity]] scheduleAffinities
         bool needOrder
         int recoverRetryTimes
+        bool failover
         CFunctionGroupOptions functionGroupOpts
         CResourceGroupOptions resourceGroupOpts
         string groupName
@@ -712,6 +717,8 @@ cdef extern from "src/libruntime/libruntime.h" nogil:
         void Cancel(const vector[string] & objids, bool isForce, bool isRecursive)
         void Exit()
         CErrorInfo Kill(const string & instanceId, int sigNo)
+        pair[CErrorInfo, CKillResponse] KillWithResponse(
+            const string & instanceId, const string & payload, int sigNo)
         void GroupTerminate(const string & groupName)
         pair[CErrorInfo, string] Snapshot(const string & instanceId, const CSnapOptions & snapOpts)
         pair[CErrorInfo, CSnapstartResponse] Snapstart(const string & checkpointId, const CSnapStartOptions & snapStartOpts)

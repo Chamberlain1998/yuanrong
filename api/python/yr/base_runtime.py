@@ -400,6 +400,10 @@ class Runtime(metaclass=ABCMeta):
         """
 
     @abstractmethod
+    def reload_instance(self, instance_id: str) -> bool:
+        """Reload an instance from its latest local anonymous checkpoint."""
+
+    @abstractmethod
     def delete_checkpoint(self, checkpoint_id: str) -> None:
         """
         Delete a checkpoint by checkpoint_id

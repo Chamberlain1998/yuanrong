@@ -41,6 +41,12 @@ class TestInvokeOptions(unittest.TestCase):
         with self.assertRaises(TypeError):
             self.add.options(self.opts)
 
+    def test_option_function_failover(self):
+        self.assertFalse(self.opts.failover)
+        self.opts.failover = 1
+        with self.assertRaises(TypeError):
+            self.add.options(self.opts)
+
     def test_option_function_namespace(self):
         self.opts.namespace = 11
         with self.assertRaises(TypeError):

@@ -1595,6 +1595,14 @@ ErrorInfo Libruntime::Kill(const std::string &instanceId, int sigNo)
     return KillWithRouting(instanceId, sigNo, "", "");
 }
 
+std::pair<ErrorInfo, KillResponse> Libruntime::KillWithResponse(
+    const std::string &instanceId, const std::string &payload, int sigNo)
+{
+    auto realInsId = memStore->GetInstanceId(instanceId);
+    invokeAdaptor->EraseFsIntf(realInsId);
+    return invokeAdaptor->KillWithResponse(realInsId, payload, sigNo);
+}
+
 ErrorInfo Libruntime::KillWithRouting(const std::string &instanceId, int sigNo, const std::string &routeAddress,
                                       const std::string &proxyID)
 {

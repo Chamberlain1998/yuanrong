@@ -71,7 +71,7 @@ from libc.string cimport memcpy
 
 from yr.includes.libruntime cimport (CApiType, CSignal, CBuffer, CDataObject, CElement,
 CErrorCode, CErrorInfo, CFunctionMeta, CInternalWaitResult, CInvokeArg,
-CInvokeOptions, CInvokeType, CModuleCode,
+CInvokeOptions, CInvokeType, CKillResponse, CModuleCode,
 CLanguageType, CLibruntimeConfig,
 CLibruntimeManager,move,CLibruntime, CGroupOptions,
 CProducerConf, CStreamConsumer,
@@ -1040,6 +1040,7 @@ cdef parse_invoke_opts(CInvokeOptions & opts, opt: yr.InvokeOptions, group_info:
             raise YRValueError(message="Failed to convert affinity to cpp affinity.")
         opts.scheduleAffinities.push_back(c_affinity)
     opts.recoverRetryTimes = opt.recover_retry_times
+    opts.failover = opt.failover
     if opt.need_order:
         opts.needOrder = True
     else:
@@ -1975,6 +1976,22 @@ cdef class Fnruntime:
             ret = c_libruntime.get().Kill(c_id, sigNo)
         if not ret.OK():
             raise_runtime_error_from_cpp(ret, "failed to kill instance sync")
+
+    def reload_instance(self, instance_id: str) -> bool:
+        """Reload an instance from its latest local anonymous checkpoint."""
+        cdef:
+            pair[CErrorInfo, CKillResponse] ret
+            string c_id = instance_id
+            string payload = b""
+            int sig_no = 25
+        cdef shared_ptr[CLibruntime] c_libruntime = CLibruntimeManager.Instance().GetLibRuntime()
+        if c_libruntime == nullptr:
+            raise YRRuntimeError(message="already finalized")
+        with nogil:
+            ret = c_libruntime.get().KillWithResponse(c_id, payload, sig_no)
+        if not ret.first.OK():
+            return False
+        return ret.second.code() == 0
 
     def snapshot_instance(self, instance_id: str, ttl: int = -1, leave_running: bool = False,
                           function_type: str = "") -> str:

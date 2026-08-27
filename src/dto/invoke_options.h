@@ -160,6 +160,8 @@ struct InvokeOptions {
 
     int recoverRetryTimes = 0;
 
+    bool failover = false;
+
     int timeout = 0;
 
     int acquireTimeout = 0;

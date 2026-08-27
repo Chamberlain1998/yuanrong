@@ -423,6 +423,8 @@ public:
       @return error information if the operation fails
      */
     virtual ErrorInfo Kill(const std::string &instanceId, int sigNo = libruntime::Signal::KillInstance);
+    virtual std::pair<ErrorInfo, KillResponse> KillWithResponse(
+        const std::string &instanceId, const std::string &payload, int sigNo);
     virtual ErrorInfo KillWithRouting(const std::string &instanceId, int sigNo, const std::string &routeAddress,
                                       const std::string &proxyID);
 

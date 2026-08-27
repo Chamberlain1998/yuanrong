@@ -65,6 +65,9 @@ class LocalModeRuntime(Runtime, ABC):
     def snapstart_instance(self, checkpoint_id: str) -> str:
         raise RuntimeError("not support in local mode")
 
+    def reload_instance(self, instance_id: str) -> bool:
+        return False
+
     def delete_checkpoint(self, checkpoint_id: str) -> None:
         raise RuntimeError("not support in local mode")
 

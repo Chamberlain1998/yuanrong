@@ -266,6 +266,7 @@ void InvokeSpec::BuildRequestPbScheduleOptions(InvokeOptions &opts, const Librun
 void InvokeSpec::BuildRequestPbCreateOptions(InvokeOptions &opts, const LibruntimeConfig &config,
                                              CreateRequest &request)
 {
+    request.set_failover(opts.failover);
     auto *createOptions = request.mutable_createoptions();
     createOptions->insert({"DATA_AFFINITY_ENABLED", opts.isDataAffinity ? "true" : "false"});
     for (auto &opt : opts.createOptions) {

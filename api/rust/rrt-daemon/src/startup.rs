@@ -5,6 +5,7 @@
 //! Runtime startup barrier used by fork-based warm starts.
 
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -12,7 +13,6 @@ use std::path::{Path, PathBuf};
 const SEED_FILE_ENV: &str = "YR_SEED_FILE";
 const ENV_FILE_ENV: &str = "YR_ENV_FILE";
 const CHECKPOINT_HANDOFF_FILE_ENV: &str = "YR_CHECKPOINT_HANDOFF_FILE";
-const RESTORE_ENV_FILE_ENV: &str = "YR_RESTORE_ENV_FILE";
 const GVISOR_CHECKPOINT_FILE: &str = "/proc/gvisor/checkpoint";
 const GVISOR_SPEC_ENVIRON_FILE: &str = "/proc/gvisor/spec_environ";
 
@@ -75,11 +75,27 @@ fn refresh_environment_from_file(path: &Path) {
 }
 
 pub(crate) fn restore_environment_file_path() -> Option<PathBuf> {
-    configured_or_gvisor_path(RESTORE_ENV_FILE_ENV, GVISOR_SPEC_ENVIRON_FILE)
+    configured_or_gvisor_path(ENV_FILE_ENV, GVISOR_SPEC_ENVIRON_FILE)
 }
 
 pub(crate) fn checkpoint_handoff_file_path() -> Option<PathBuf> {
-    configured_or_gvisor_path(CHECKPOINT_HANDOFF_FILE_ENV, GVISOR_CHECKPOINT_FILE)
+    let fallback = Path::new(GVISOR_CHECKPOINT_FILE);
+    select_checkpoint_handoff_path(
+        std::env::var_os(CHECKPOINT_HANDOFF_FILE_ENV).as_deref(),
+        fallback,
+        fallback.exists(),
+    )
+}
+
+fn select_checkpoint_handoff_path(
+    configured: Option<&OsStr>,
+    runtime_fallback: &Path,
+    runtime_fallback_exists: bool,
+) -> Option<PathBuf> {
+    if let Some(path) = configured.filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(path));
+    }
+    runtime_fallback_exists.then(|| runtime_fallback.to_path_buf())
 }
 
 pub(crate) fn open_checkpoint_handoff() -> io::Result<Option<CheckpointHandoff>> {
@@ -200,7 +216,9 @@ fn strip_quotes(value: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::strip_quotes;
+    use super::{select_checkpoint_handoff_path, strip_quotes};
+    use std::ffi::OsStr;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn strip_matching_quotes_only() {
@@ -208,5 +226,25 @@ mod tests {
         assert_eq!(strip_quotes("'quoted value'"), "quoted value");
         assert_eq!(strip_quotes("\"unmatched'"), "\"unmatched'");
         assert_eq!(strip_quotes("plain"), "plain");
+    }
+
+    #[test]
+    fn dedicated_checkpoint_handoff_path_wins_over_runtime_fallback() {
+        assert_eq!(
+            select_checkpoint_handoff_path(
+                Some(OsStr::new("/run/sandboxd/checkpoint")),
+                Path::new("/proc/gvisor/checkpoint"),
+                true,
+            ),
+            Some(PathBuf::from("/run/sandboxd/checkpoint")),
+        );
+        assert_eq!(
+            select_checkpoint_handoff_path(
+                Some(OsStr::new("")),
+                Path::new("/proc/gvisor/checkpoint"),
+                true,
+            ),
+            Some(PathBuf::from("/proc/gvisor/checkpoint")),
+        );
     }
 }

@@ -20,16 +20,19 @@
 //! No new dependencies: use raw tokio TcpListener plus handwritten HTTP/1.1 with connection-level close.
 
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::process::Command;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, oneshot, watch};
+
+use crate::posix::runtime_rpc::StreamingMessage;
 
 const IO_BUFFER_SIZE: usize = 256 * 1024;
 struct CachedResponse {
@@ -1246,12 +1249,384 @@ fn hex_encode(b: &[u8]) -> String {
     s
 }
 
+pub(crate) const RRT_CONTROL_SOCKET_PATH_ENV: &str = "YR_RRT_CONTROL_SOCKET_PATH";
+const CHECKPOINT_SOCKET_NAME: &str = "rrt.sock";
+
+pub(crate) fn checkpoint_socket_path_from_control_directory(
+    configured_directory: Option<&OsStr>,
+) -> Option<PathBuf> {
+    configured_directory
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .map(|directory| directory.join(CHECKPOINT_SOCKET_NAME))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CheckpointHttpResponse {
+    pub status: u16,
+    pub body: String,
+}
+
+#[derive(Debug)]
+struct PendingCheckpointRequest {
+    request_id: String,
+    proxy_acked: bool,
+    handoff_complete: bool,
+    completion: Option<oneshot::Sender<Result<(), String>>>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CheckpointRequestCoordinator {
+    pending: Arc<Mutex<Option<PendingCheckpointRequest>>>,
+}
+
+impl CheckpointRequestCoordinator {
+    fn begin(&self, request_id: String) -> Result<oneshot::Receiver<Result<(), String>>, String> {
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| "checkpoint coordinator lock is poisoned".to_string())?;
+        if pending.is_some() {
+            return Err("checkpoint is already in progress".to_string());
+        }
+        let (completion, receiver) = oneshot::channel();
+        *pending = Some(PendingCheckpointRequest {
+            request_id,
+            proxy_acked: false,
+            handoff_complete: false,
+            completion: Some(completion),
+        });
+        Ok(receiver)
+    }
+
+    fn fail(&self, request_id: &str, message: String) {
+        let Ok(mut pending) = self.pending.lock() else {
+            return;
+        };
+        if pending.as_ref().map(|value| value.request_id.as_str()) != Some(request_id) {
+            return;
+        }
+        if let Some(mut request) = pending.take() {
+            if let Some(completion) = request.completion.take() {
+                let _ = completion.send(Err(message));
+            }
+        }
+    }
+
+    pub(crate) fn record_proxy_ack(&self, request_id: &str, code: i32, message: String) {
+        if code != crate::posix::common::ErrorCode::ErrNone as i32 {
+            self.fail(request_id, format!("proxy rejected checkpoint: {message}"));
+            return;
+        }
+        let Ok(mut pending) = self.pending.lock() else {
+            return;
+        };
+        let should_complete = if let Some(request) = pending.as_mut() {
+            if request.request_id != request_id {
+                return;
+            }
+            request.proxy_acked = true;
+            request.handoff_complete
+        } else {
+            false
+        };
+        if should_complete {
+            complete_pending_checkpoint(&mut pending);
+        }
+    }
+
+    pub(crate) fn record_handoff(&self, outcome: crate::startup::CheckpointOutcome) {
+        if outcome == crate::startup::CheckpointOutcome::Error {
+            self.record_handoff_error("checkpoint handoff reported error".to_string());
+            return;
+        }
+        let Ok(mut pending) = self.pending.lock() else {
+            return;
+        };
+        let should_complete = if let Some(request) = pending.as_mut() {
+            request.handoff_complete = true;
+            request.proxy_acked
+        } else {
+            false
+        };
+        if should_complete {
+            complete_pending_checkpoint(&mut pending);
+        }
+    }
+
+    pub(crate) fn record_handoff_error(&self, message: String) {
+        let request_id = self
+            .pending
+            .lock()
+            .ok()
+            .and_then(|pending| pending.as_ref().map(|request| request.request_id.clone()));
+        if let Some(request_id) = request_id {
+            self.fail(&request_id, message);
+        }
+    }
+}
+
+fn complete_pending_checkpoint(pending: &mut Option<PendingCheckpointRequest>) {
+    if let Some(mut request) = pending.take() {
+        if let Some(completion) = request.completion.take() {
+            let _ = completion.send(Ok(()));
+        }
+    }
+}
+
+pub(crate) async fn invoke_checkpoint_handler(
+    instance_id: &str,
+    tx: mpsc::Sender<StreamingMessage>,
+    coordinator: CheckpointRequestCoordinator,
+) -> CheckpointHttpResponse {
+    let message = super::checkpoint_request_msg(instance_id);
+    let request_id = message.message_id.clone();
+    let completion = match coordinator.begin(request_id.clone()) {
+        Ok(completion) => completion,
+        Err(error) => {
+            return CheckpointHttpResponse {
+                status: 409,
+                body: err_json(&error),
+            };
+        }
+    };
+    if let Err(error) = tx.send(message).await {
+        coordinator.fail(
+            &request_id,
+            format!("checkpoint channel unavailable: {error}"),
+        );
+        return CheckpointHttpResponse {
+            status: 503,
+            body: err_json(&format!("checkpoint channel unavailable: {error}")),
+        };
+    }
+    match completion.await {
+        Ok(Ok(())) => CheckpointHttpResponse {
+            status: 200,
+            body: r#"{"status":"completed"}"#.to_string(),
+        },
+        Ok(Err(error)) => CheckpointHttpResponse {
+            status: 500,
+            body: err_json(&error),
+        },
+        Err(error) => CheckpointHttpResponse {
+            status: 500,
+            body: err_json(&format!("checkpoint completion was canceled: {error}")),
+        },
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CheckpointServerControl {
+    inner: Arc<CheckpointServerControlInner>,
+}
+
+#[derive(Debug)]
+struct CheckpointServerControlInner {
+    listener: std::os::unix::net::UnixListener,
+    instance_id: RwLock<String>,
+    tx: mpsc::Sender<StreamingMessage>,
+    accept_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    generation: AtomicU64,
+    ready_tx: watch::Sender<super::RuntimeReadyState>,
+    coordinator: CheckpointRequestCoordinator,
+}
+
+impl CheckpointServerControl {
+    pub(crate) fn start(
+        listener: UnixListener,
+        instance_id: String,
+        tx: mpsc::Sender<StreamingMessage>,
+        ready_tx: watch::Sender<super::RuntimeReadyState>,
+    ) -> std::io::Result<Self> {
+        let listener = listener.into_std()?;
+        listener.set_nonblocking(true)?;
+        let control = Self {
+            inner: Arc::new(CheckpointServerControlInner {
+                listener,
+                instance_id: RwLock::new(instance_id),
+                tx,
+                accept_task: Mutex::new(None),
+                generation: AtomicU64::new(0),
+                ready_tx,
+                coordinator: CheckpointRequestCoordinator::default(),
+            }),
+        };
+        control.rearm()?;
+        Ok(control)
+    }
+
+    pub(crate) fn rebind_instance_id(&self, instance_id: &str) {
+        *self
+            .inner
+            .instance_id
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = instance_id.to_string();
+    }
+
+    pub(crate) fn record_proxy_ack(&self, request_id: &str, code: i32, message: String) {
+        self.inner
+            .coordinator
+            .record_proxy_ack(request_id, code, message);
+    }
+
+    pub(crate) fn record_handoff(&self, outcome: crate::startup::CheckpointOutcome) {
+        self.inner.coordinator.record_handoff(outcome);
+    }
+
+    pub(crate) fn record_handoff_error(&self, message: String) {
+        self.inner.coordinator.record_handoff_error(message);
+    }
+
+    pub(crate) fn rearm(&self) -> std::io::Result<u64> {
+        let mut accept_task = self
+            .inner
+            .accept_task
+            .lock()
+            .map_err(|_| std::io::Error::other("checkpoint listener lock is poisoned"))?;
+        let listener = self.inner.listener.try_clone()?;
+        listener.set_nonblocking(true)?;
+        let listener = UnixListener::from_std(listener)?;
+        let generation = self.inner.generation.load(Ordering::Relaxed) + 1;
+        self.inner.generation.store(generation, Ordering::Release);
+        let _ = self.inner.ready_tx.send(super::RuntimeReadyState::Ready);
+        let inner = Arc::downgrade(&self.inner);
+        let task = tokio::spawn(async move {
+            if let Err(error) = serve_checkpoint_listener(listener, inner.clone()).await {
+                if let Some(inner) = inner.upgrade() {
+                    if inner.generation.load(Ordering::Acquire) == generation {
+                        let _ = inner
+                            .ready_tx
+                            .send(super::RuntimeReadyState::Failed(format!(
+                                "checkpoint listener generation {generation} stopped: {error}"
+                            )));
+                    }
+                }
+            }
+        });
+        if let Some(previous) = accept_task.replace(task) {
+            previous.abort();
+        }
+        Ok(generation)
+    }
+}
+
+pub(crate) async fn bind_checkpoint_socket(path: &Path) -> std::io::Result<UnixListener> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let listener = UnixListener::bind(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666))?;
+    }
+    Ok(listener)
+}
+
+async fn serve_checkpoint_listener(
+    listener: UnixListener,
+    inner: std::sync::Weak<CheckpointServerControlInner>,
+) -> std::io::Result<()> {
+    loop {
+        let (mut stream, _) = listener.accept().await?;
+        let Some(inner) = inner.upgrade() else {
+            return Ok(());
+        };
+        let instance_id = inner
+            .instance_id
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let tx = inner.tx.clone();
+        let coordinator = inner.coordinator.clone();
+        tokio::spawn(async move {
+            let _ = handle_checkpoint_connection(&mut stream, &instance_id, tx, coordinator).await;
+        });
+    }
+}
+
+async fn handle_checkpoint_connection(
+    stream: &mut UnixStream,
+    instance_id: &str,
+    tx: mpsc::Sender<StreamingMessage>,
+    coordinator: CheckpointRequestCoordinator,
+) -> std::io::Result<()> {
+    let mut request = Vec::with_capacity(512);
+    let mut buffer = [0u8; 512];
+    loop {
+        let count = stream.read(&mut buffer).await?;
+        if count == 0 {
+            return Ok(());
+        }
+        request.extend_from_slice(&buffer[..count]);
+        if find_subslice(&request, b"\r\n\r\n").is_some() {
+            break;
+        }
+        if request.len() > 8192 {
+            return write_checkpoint_response(stream, 431, r#"{"error":"headers too large"}"#)
+                .await;
+        }
+    }
+    let head = String::from_utf8_lossy(&request);
+    let (method, path) = parse_request_line(&head);
+    let response = if method != "POST" {
+        CheckpointHttpResponse {
+            status: 405,
+            body: r#"{"error":"method not allowed"}"#.to_string(),
+        }
+    } else if request_path(&path) != "/checkpoint" {
+        CheckpointHttpResponse {
+            status: 404,
+            body: r#"{"error":"not found"}"#.to_string(),
+        }
+    } else {
+        invoke_checkpoint_handler(instance_id, tx, coordinator).await
+    };
+    write_checkpoint_response(stream, response.status, &response.body).await
+}
+
+async fn write_checkpoint_response(
+    stream: &mut UnixStream,
+    status: u16,
+    body: &str,
+) -> std::io::Result<()> {
+    let reason = match status {
+        200 => "OK",
+        409 => "Conflict",
+        500 => "Internal Server Error",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        431 => "Request Header Fields Too Large",
+        503 => "Service Unavailable",
+        _ => "Error",
+    };
+    let response = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).await?;
+    stream.flush().await
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
+        checkpoint_socket_path_from_control_directory, invoke_checkpoint_handler,
         parse_range_header, percent_decode, query_param, request_path, upload_part_path,
-        upload_type,
+        upload_type, CheckpointRequestCoordinator,
     };
+
+    use std::ffi::OsStr;
+    use std::path::PathBuf;
+
+    use crate::posix::runtime_rpc::streaming_message;
+    use crate::startup::CheckpointOutcome;
 
     #[test]
     fn parses_binary_stream_request_targets() {
@@ -1283,5 +1658,55 @@ mod tests {
         assert_eq!(parse_range_header(head, 20), Some((5, 9)));
         let head = "GET /download HTTP/1.1\r\nRange: bytes=5-\r\n\r\n";
         assert_eq!(parse_range_header(head, 20), Some((5, 19)));
+    }
+
+    #[tokio::test]
+    async fn checkpoint_endpoint_waits_for_proxy_ack_and_handoff() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let coordinator = CheckpointRequestCoordinator::default();
+
+        let request = tokio::spawn(invoke_checkpoint_handler(
+            "sandbox-a",
+            tx,
+            coordinator.clone(),
+        ));
+
+        let message = rx.recv().await.expect("checkpoint signal");
+        assert!(!request.is_finished(), "HTTP completed before proxy ACK");
+        coordinator.record_proxy_ack(
+            &message.message_id,
+            crate::posix::common::ErrorCode::ErrNone as i32,
+            String::new(),
+        );
+        tokio::task::yield_now().await;
+        assert!(
+            !request.is_finished(),
+            "HTTP completed before checkpoint handoff"
+        );
+
+        coordinator.record_handoff(CheckpointOutcome::Resume);
+        let response = request.await.expect("checkpoint HTTP task");
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, r#"{"status":"completed"}"#);
+        let Some(streaming_message::Body::KillReq(kill)) = message.body else {
+            panic!("unexpected checkpoint message body")
+        };
+        assert_eq!(kill.instance_id, "sandbox-a");
+        assert_eq!(kill.signal, 24);
+        assert!(!kill.request_id.is_empty());
+    }
+
+    #[test]
+    fn checkpoint_socket_uses_configured_control_directory() {
+        assert_eq!(
+            checkpoint_socket_path_from_control_directory(Some(OsStr::new("/run/yr-control"))),
+            Some(PathBuf::from("/run/yr-control/rrt.sock")),
+        );
+        assert_eq!(checkpoint_socket_path_from_control_directory(None), None);
+        assert_eq!(
+            checkpoint_socket_path_from_control_directory(Some(OsStr::new(""))),
+            None,
+        );
     }
 }

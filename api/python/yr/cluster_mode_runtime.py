@@ -340,6 +340,9 @@ class ClusterModeRuntime(Runtime):
         """
         return self.libruntime.snapstart_instance(checkpoint_id)
 
+    def reload_instance(self, instance_id: str) -> bool:
+        return self.libruntime.reload_instance(instance_id)
+
     def delete_checkpoint(self, checkpoint_id: str) -> None:
         """
         Delete a checkpoint by checkpoint_id

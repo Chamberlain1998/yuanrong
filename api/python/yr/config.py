@@ -510,6 +510,8 @@ class InvokeOptions:
     #: The number of instance recovery times (when an instance abnormally exits, the instance is automatically restored
     #: to the latest state). If the value is ``0``, the instance is not automatically restored when it abnormally exits.
     recover_retry_times: int = 0
+    #: Opt in to same-node recovery from the latest local anonymous checkpoint.
+    failover: bool = False
     #: Whether to enable order-preserving. Only effective for stateful functions.
     #: ``None`` means auto: synchronous stateful instances with concurrency=1 enable order-preserving by default.
     need_order: Optional[bool] = None
@@ -707,6 +709,7 @@ class InvokeOptions:
             ("namespace", str),
             ("preferred_anti_other_labels", bool),
             ("preferred_priority", bool),
+            ("failover", bool),
             ("trace_id", str),
             ("custom_resources", Dict[str, float]),
             ("custom_extensions", Dict[str, str]),
