@@ -610,6 +610,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restored_checkpoint_requests_runtime_stream_reconnect() {
+        let (reconnect_tx, mut reconnect_rx) = mpsc::channel(1);
+
+        assert!(request_checkpoint_reconnect(Some(&reconnect_tx)));
+        assert_eq!(reconnect_rx.recv().await, Some(()));
+    }
+
+    #[test]
+    fn restored_checkpoint_reconnect_fails_when_loop_is_closed() {
+        let (reconnect_tx, reconnect_rx) = mpsc::channel(1);
+        drop(reconnect_rx);
+
+        assert!(!request_checkpoint_reconnect(Some(&reconnect_tx)));
+    }
+
+    #[tokio::test]
     async fn trusted_clone_dispatch_uses_validated_target_logical_identity() {
         let source = Args {
             instance_id: "source-sandbox".to_string(),
@@ -1320,6 +1336,7 @@ async fn run_message_stream_loop(
     let mut reconnect_seq: u64 = 0;
     let mut pending: Option<StreamingMessage> = None;
     let mut reconnect_control = ReconnectControlState::new(args);
+    let (checkpoint_reconnect_tx, mut checkpoint_reconnect_rx) = mpsc::channel(1);
 
     loop {
         reconnect_seq += 1;
@@ -1434,6 +1451,7 @@ async fn run_message_stream_loop(
                                 runtime_ready.clone(),
                                 Some(&stream_tx),
                                 Some(&service_controls),
+                                Some(&checkpoint_reconnect_tx),
                             ).await {
                                 return Ok(());
                             }
@@ -1441,6 +1459,12 @@ async fn run_message_stream_loop(
                         Ok(None) => break "remote_closed".to_string(),
                         Err(e) => break format!("inbound_error={e}"),
                     }
+                }
+                checkpoint_reconnect = checkpoint_reconnect_rx.recv() => {
+                    if checkpoint_reconnect.is_none() {
+                        return Ok(());
+                    }
+                    break "checkpoint_restore".to_string();
                 }
             }
         };
@@ -1537,6 +1561,7 @@ fn call_response_msg(message_id: String) -> StreamingMessage {
 async fn handle_prepare_snap_request(
     message_id: String,
     response_tx: &mpsc::Sender<StreamingMessage>,
+    checkpoint_reconnect_tx: Option<&mpsc::Sender<()>>,
 ) -> bool {
     // Open before acknowledging PrepareSnap. gVisor binds an open descriptor
     // to the next checkpoint generation; opening after the response would race
@@ -1548,13 +1573,20 @@ async fn handle_prepare_snap_request(
             None
         }
     };
-    handle_prepare_snap_request_with_handoff(message_id, response_tx, checkpoint_handoff).await
+    handle_prepare_snap_request_with_handoff(
+        message_id,
+        response_tx,
+        checkpoint_handoff,
+        checkpoint_reconnect_tx,
+    )
+    .await
 }
 
 async fn handle_prepare_snap_request_with_handoff(
     message_id: String,
     response_tx: &mpsc::Sender<StreamingMessage>,
     checkpoint_handoff: Option<crate::startup::CheckpointHandoff>,
+    checkpoint_reconnect_tx: Option<&mpsc::Sender<()>>,
 ) -> bool {
     let barrier_ready = checkpoint_handoff.is_some();
     let (code, message) = if barrier_ready {
@@ -1594,6 +1626,9 @@ async fn handle_prepare_snap_request_with_handoff(
             rrt_info!(
                 "[rrt-runtime] checkpoint handoff outcome=restore; target physical identity will be loaded before reconnect"
             );
+            if !request_checkpoint_reconnect(checkpoint_reconnect_tx) {
+                return false;
+            }
         }
         Ok(crate::startup::CheckpointOutcome::Resume) => {
             rrt_warn!(
@@ -1612,6 +1647,16 @@ async fn handle_prepare_snap_request_with_handoff(
     true
 }
 
+fn request_checkpoint_reconnect(reconnect_tx: Option<&mpsc::Sender<()>>) -> bool {
+    let Some(reconnect_tx) = reconnect_tx else {
+        return true;
+    };
+    match reconnect_tx.try_send(()) {
+        Ok(()) | Err(mpsc::error::TrySendError::Full(())) => true,
+        Err(mpsc::error::TrySendError::Closed(())) => false,
+    }
+}
+
 #[cfg(test)]
 async fn handle_inbound_message(
     msg: StreamingMessage,
@@ -1620,8 +1665,17 @@ async fn handle_inbound_message(
     tx: mpsc::Sender<StreamingMessage>,
     runtime_ready: watch::Receiver<RuntimeReadyState>,
 ) -> bool {
-    handle_inbound_message_with_control_sender(msg, instance_id, ctx, tx, runtime_ready, None, None)
-        .await
+    handle_inbound_message_with_control_sender(
+        msg,
+        instance_id,
+        ctx,
+        tx,
+        runtime_ready,
+        None,
+        None,
+        None,
+    )
+    .await
 }
 
 async fn handle_inbound_message_with_control_sender(
@@ -1632,6 +1686,7 @@ async fn handle_inbound_message_with_control_sender(
     runtime_ready: watch::Receiver<RuntimeReadyState>,
     control_tx: Option<&mpsc::Sender<StreamingMessage>>,
     service_controls: Option<&RuntimeServiceControls>,
+    checkpoint_reconnect_tx: Option<&mpsc::Sender<()>>,
 ) -> bool {
     let mid = msg.message_id.clone();
     match msg.body {
@@ -1743,7 +1798,7 @@ async fn handle_inbound_message_with_control_sender(
         Some(streaming_message::Body::PrepareSnapReq(_)) => {
             rrt_info!("[rrt-runtime] PrepareSnapReq accepted");
             let response_tx = control_tx.unwrap_or(&tx);
-            if !handle_prepare_snap_request(mid, response_tx).await {
+            if !handle_prepare_snap_request(mid, response_tx, checkpoint_reconnect_tx).await {
                 return false;
             }
         }

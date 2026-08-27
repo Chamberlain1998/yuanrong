@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 
 const SEED_FILE_ENV: &str = "YR_SEED_FILE";
 const ENV_FILE_ENV: &str = "YR_ENV_FILE";
+const CHECKPOINT_HANDOFF_FILE_ENV: &str = "YR_CHECKPOINT_HANDOFF_FILE";
+const RESTORE_ENV_FILE_ENV: &str = "YR_RESTORE_ENV_FILE";
 const GVISOR_CHECKPOINT_FILE: &str = "/proc/gvisor/checkpoint";
 const GVISOR_SPEC_ENVIRON_FILE: &str = "/proc/gvisor/spec_environ";
 
@@ -73,11 +75,11 @@ fn refresh_environment_from_file(path: &Path) {
 }
 
 pub(crate) fn restore_environment_file_path() -> Option<PathBuf> {
-    configured_or_gvisor_path(ENV_FILE_ENV, GVISOR_SPEC_ENVIRON_FILE)
+    configured_or_gvisor_path(RESTORE_ENV_FILE_ENV, GVISOR_SPEC_ENVIRON_FILE)
 }
 
 pub(crate) fn checkpoint_handoff_file_path() -> Option<PathBuf> {
-    configured_or_gvisor_path(SEED_FILE_ENV, GVISOR_CHECKPOINT_FILE)
+    configured_or_gvisor_path(CHECKPOINT_HANDOFF_FILE_ENV, GVISOR_CHECKPOINT_FILE)
 }
 
 pub(crate) fn open_checkpoint_handoff() -> io::Result<Option<CheckpointHandoff>> {
